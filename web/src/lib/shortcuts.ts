@@ -30,6 +30,7 @@ export interface ShortcutActions {
   onToggleSidebar: () => void;
   onToggleRightPanel: () => void;
   onToggleTerminalFocus: () => void;
+  onSessionSearch: () => void;
 }
 
 export type ShortcutId =
@@ -42,7 +43,8 @@ export type ShortcutId =
   | "diff"
   | "settings"
   | "escape"
-  | "help";
+  | "help"
+  | "sessionSearch";
 
 /** The display model: which modifier glyphs to show, plus the base label. */
 export interface ShortcutChord {
@@ -114,6 +116,25 @@ export const SHORTCUTS: readonly ShortcutDef[] = [
       shift: false,
       alt: false,
       code: "KeyB",
+      preventDefault: true,
+      stopPropagation: true,
+    },
+  },
+  {
+    id: "sessionSearch",
+    action: "onSessionSearch",
+    description: "Search sessions",
+    chord: { mod: true, base: "F" },
+    // e.code because Option+F on Mac produces "ƒ" instead of "f".
+    // preventDefault + stopPropagation override the browser's native
+    // find-in-page; the capture-phase handler in useKeyboardShortcuts
+    // sees the keydown before the browser acts on it.
+    trigger: {
+      scope: "global",
+      mod: true,
+      shift: false,
+      alt: false,
+      code: "KeyF",
       preventDefault: true,
       stopPropagation: true,
     },

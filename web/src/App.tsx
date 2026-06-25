@@ -386,6 +386,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // before a pending consent modal.
   const [telemetryConsentKnown, setTelemetryConsentKnown] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
+  const [sessionSearchOpen, setSessionSearchOpen] = useState(false);
+  const [sessionSearchQuery, setSessionSearchQuery] = useState("");
+  const closeSessionSearch = useCallback(() => {
+    setSessionSearchOpen(false);
+    setSessionSearchQuery("");
+  }, []);
   const keyboardProxyRef = useRef<HTMLTextAreaElement>(null);
 
   const activeWorkspace = useMemo(() => {
@@ -544,6 +550,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     }
     if (window.innerWidth < 768) {
       setSidebarOpen(false);
+      // Closing the off-canvas sidebar on a phone hides the search UI; reset
+      // it so reopening the sidebar shows the full list rather than a stale
+      // filtered view with the search input still open.
+      closeSessionSearch();
     }
   };
 
@@ -995,6 +1005,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         // abort. Cancel/stop must stay behind an explicit gesture
         // (the assistant-ui Stop button in the composer).
         onEscape: () => {
+          if (sessionSearchOpen) {
+            closeSessionSearch();
+            return;
+          }
           if (deletingWorkspaceId) {
             setDeletingWorkspaceId(null);
             return;
@@ -1017,12 +1031,27 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         onSettings: () => (showSettings ? handleCloseSettings() : navigate("/settings")),
         onPalette: () => setShowPalette((p) => !p),
         onToggleSidebar: () => setSidebarOpen((o) => !o),
+        onSessionSearch: () =>
+          setSessionSearchOpen((o) => {
+            const next = !o;
+            if (next) {
+              // The search input mounts inside the sidebar; if the sidebar is
+              // closed (desktop closed branch is display:none) autoFocus is a
+              // no-op, so open the sidebar first.
+              setSidebarOpen(true);
+            } else {
+              setSessionSearchQuery("");
+            }
+            return next;
+          }),
         onToggleRightPanel: () => toggleDiff(),
         onToggleTerminalFocus: handleToggleTerminalFocus,
       }),
       [
         toggleDiff,
         showPalette,
+        sessionSearchOpen,
+        closeSessionSearch,
         deletingWorkspaceId,
         stoppingWorkspaceId,
         showSettings,
@@ -1421,6 +1450,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               onReorderGroups={reorderRepoGroups}
               activeId={activeWorkspace?.id ?? null}
               open={sidebarOpen}
+              searchOpen={sessionSearchOpen}
+              searchQuery={sessionSearchQuery}
+              onSearchQueryChange={setSessionSearchQuery}
+              onSearchClose={closeSessionSearch}
+              onSearchOpen={() => setSessionSearchOpen(true)}
               onToggle={() => setSidebarOpen(false)}
               onSelect={handleSelectWorkspace}
               onToggleGroup={toggleSidebarGroup}

@@ -168,6 +168,41 @@ impl ServeArgs {
         self.port
             .unwrap_or(if cfg!(debug_assertions) { 8081 } else { 8080 })
     }
+
+    /// Construct a `ServeArgs` suitable for auto-spawning the scheduler daemon:
+    /// localhost binding, daemon mode, all other fields at their natural defaults.
+    pub fn scheduler_defaults() -> Self {
+        Self {
+            port: None,
+            host: "127.0.0.1".to_string(),
+            auth: None,
+            no_auth: false,
+            behind_proxy: false,
+            read_only: false,
+            remote: false,
+            tunnel_name: None,
+            no_tailscale: false,
+            tunnel_url: None,
+            daemon: true,
+            stop: false,
+            status: false,
+            passphrase: None,
+            open: false,
+            daemon_child: false,
+            restart: false,
+        }
+    }
+}
+
+/// Spawn the background daemon with scheduler-friendly defaults (local host,
+/// default port). Used by `aoe automation add` to guarantee a scheduler host.
+pub fn ensure_daemon_spawned(profile: &str) -> anyhow::Result<()> {
+    let args = ServeArgs::scheduler_defaults();
+    // `_AOE_TEST_BIN` lets integration tests redirect the spawned binary to the
+    // real `aoe` binary (since `current_exe()` returns the test runner in that
+    // context). Normal production runs never set this variable.
+    let exe = std::env::var_os("_AOE_TEST_BIN").map(std::path::PathBuf::from);
+    start_daemon(profile, &args, exe)
 }
 
 /// Pure check used by both the CLI validator and its unit tests.
@@ -707,7 +742,7 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
     }
 
     if args.daemon {
-        return start_daemon(profile, &args);
+        return start_daemon(profile, &args, None);
     }
 
     tracing::info!(
@@ -781,10 +816,10 @@ pub fn stdio_redirect_path() -> Result<PathBuf> {
     Ok(crate::logging::resolve_log_path(&log_cfg, &dir))
 }
 
-fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
+fn start_daemon(profile: &str, args: &ServeArgs, exe: Option<PathBuf>) -> Result<()> {
     use std::process::{Command, Stdio};
 
-    let exe = std::env::current_exe()?;
+    let exe = exe.map(Ok).unwrap_or_else(std::env::current_exe)?;
     let mut cmd = Command::new(exe);
     cmd.args([
         "serve",
@@ -982,7 +1017,7 @@ pub async fn restart_daemon() -> Result<()> {
 
     println!("Restarting aoe serve daemon (PID {pid})…");
     stop_daemon().await?;
-    start_daemon(&launch.profile, &args)
+    start_daemon(&launch.profile, &args, None)
 }
 
 #[tracing::instrument(target = "serve.shutdown", skip_all)]

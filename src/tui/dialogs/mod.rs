@@ -1,5 +1,6 @@
 //! TUI dialog components
 
+mod automation_schedule;
 mod changelog;
 mod cheats;
 mod command_palette;
@@ -32,6 +33,7 @@ mod tool_picker;
 mod update_confirm;
 mod worktree_name;
 
+pub use automation_schedule::{ScheduleDialog, ScheduleOutcome};
 pub use changelog::ChangelogDialog;
 pub use command_palette::{
     builtin_commands, CommandPaletteDialog, PaletteAction, PaletteCommand, PaletteGroup,

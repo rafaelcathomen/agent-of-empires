@@ -7,6 +7,13 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe`↴](#aoe)
 * [`aoe add`↴](#aoe-add)
 * [`aoe agents`↴](#aoe-agents)
+* [`aoe automation`↴](#aoe-automation)
+* [`aoe automation add`↴](#aoe-automation-add)
+* [`aoe automation list`↴](#aoe-automation-list)
+* [`aoe automation rm`↴](#aoe-automation-rm)
+* [`aoe automation enable`↴](#aoe-automation-enable)
+* [`aoe automation disable`↴](#aoe-automation-disable)
+* [`aoe automation run-now`↴](#aoe-automation-run-now)
 * [`aoe init`↴](#aoe-init)
 * [`aoe list`↴](#aoe-list)
 * [`aoe logs`↴](#aoe-logs)
@@ -119,6 +126,7 @@ Run without arguments to launch the TUI dashboard.
 
 * `add` — Add a new session
 * `agents` — List supported agents and their install status
+* `automation` — Manage automations (scheduled agent runs)
 * `init` — Initialize .agent-of-empires/config.toml in a repository
 * `list` — List all sessions
 * `logs` — View the configured AoE log file with a pretty viewer
@@ -188,6 +196,7 @@ Add a new session
 * `--structured-view` — Render this session in the structured view (ACP-based native rendering) instead of the default terminal view. `aoe add` defaults to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this (or `--agent`) to opt into the structured rendering. Ignored for tools with no ACP adapter
 * `--agent <AGENT>` — Pick a specific ACP agent for the structured view (e.g., aoe-agent, claude-code)
 * `--model <MODEL>` — Override the model used by aoe-agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
+* `--prompt <PROMPT>` — Initial prompt to inject into the session right after launch
 * `--scratch` — Create the session in a fresh scratch directory under `<app_dir>/scratch/<id>/` instead of a project path. The directory is removed when the session is deleted (unless `aoe rm` is given `--keep-scratch`). Mutually exclusive with worktree-related flags
 
 
@@ -197,6 +206,99 @@ Add a new session
 List supported agents and their install status
 
 **Usage:** `aoe agents`
+
+
+
+## `aoe automation`
+
+Manage automations (scheduled agent runs)
+
+**Usage:** `aoe automation <COMMAND>`
+
+###### **Subcommands:**
+
+* `add` — Create an automation (trigger + what to launch)
+* `list` — List automations
+* `rm` — Remove an automation by id
+* `enable` — Enable an automation
+* `disable` — Disable an automation
+* `run-now` — Fire an automation immediately (for testing)
+
+
+
+## `aoe automation add`
+
+Create an automation (trigger + what to launch)
+
+**Usage:** `aoe automation add [OPTIONS] --name <NAME> --cron <CRON> --prompt <PROMPT>`
+
+###### **Options:**
+
+* `--name <NAME>`
+* `--cron <CRON>` — 5-field cron expression (local timezone)
+* `--path <PATH>`
+
+  Default value: `.`
+* `--tool <TOOL>`
+* `--cmd <COMMAND>`
+* `--prompt <PROMPT>`
+* `--persistent` — Reuse one session across runs instead of a fresh session each time
+
+
+
+## `aoe automation list`
+
+List automations
+
+**Usage:** `aoe automation list`
+
+
+
+## `aoe automation rm`
+
+Remove an automation by id
+
+**Usage:** `aoe automation rm <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Automation id or short id
+
+
+
+## `aoe automation enable`
+
+Enable an automation
+
+**Usage:** `aoe automation enable <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Automation id or short id
+
+
+
+## `aoe automation disable`
+
+Disable an automation
+
+**Usage:** `aoe automation disable <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Automation id or short id
+
+
+
+## `aoe automation run-now`
+
+Fire an automation immediately (for testing)
+
+**Usage:** `aoe automation run-now <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Automation id or short id
 
 
 

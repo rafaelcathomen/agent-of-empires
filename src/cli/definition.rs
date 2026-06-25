@@ -9,6 +9,7 @@ use clap_complete::Shell;
 #[cfg(feature = "serve")]
 use super::acp::AcpCommands;
 use super::add::AddArgs;
+use super::automation::AutomationCommands;
 use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
 use super::init::InitArgs;
@@ -73,6 +74,12 @@ pub enum Commands {
 
     /// List supported agents and their install status
     Agents,
+
+    /// Manage automations (scheduled agent runs)
+    Automation {
+        #[command(subcommand)]
+        command: AutomationCommands,
+    },
 
     /// Initialize .agent-of-empires/config.toml in a repository
     Init(InitArgs),
@@ -242,6 +249,7 @@ pub enum Commands {
 pub const CLI_COMMAND_NAMES: &[&str] = &[
     "add",
     "agents",
+    "automation",
     "init",
     "list",
     "logs",
@@ -284,6 +292,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
     Some(match command {
         Commands::Add(_) => "add",
         Commands::Agents => "agents",
+        Commands::Automation { .. } => "automation",
         Commands::Init(_) => "init",
         Commands::List(_) => "list",
         Commands::Logs(_) => "logs",

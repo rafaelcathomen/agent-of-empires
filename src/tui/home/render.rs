@@ -531,6 +531,14 @@ impl HomeView {
             return;
         }
 
+        // Automations view takes over the whole screen
+        if let Some(ref mut automations) = self.automations_view {
+            self.divider_col = None;
+            self.main_area_width = 0;
+            automations.render(frame, area, theme);
+            return;
+        }
+
         // Diff view takes over the whole screen
         if self.diff_view.is_some() {
             self.preview_area = Rect::default();
@@ -703,6 +711,7 @@ impl HomeView {
 
         render_dialogs!(
             new_dialog,
+            automation_schedule_dialog,
             confirm_dialog,
             unified_delete_dialog,
             group_delete_options_dialog,

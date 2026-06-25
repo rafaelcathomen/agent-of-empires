@@ -49,6 +49,7 @@ pub enum ActionId {
     Diff,
     Serve,
     Settings,
+    Automations,
     Profiles,
     Projects,
     Restart,
@@ -667,6 +668,22 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    Binding {
+        id: ActionId::Automations,
+        non_strict: &[k('a')],
+        strict: &[k('A')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Other,
+            desc: "Automations",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Open automations",
+            keywords: &["schedule", "cron", "automation", "recurring"],
+            group: PaletteGroup::Settings,
+            serve_only: false,
+        }),
+    },
     // Pin toggle shares `p` (Shift+P in strict) with Projects, but only fires
     // when a project header is selected, so it must precede the Projects
     // binding. On a project header `p` pins/unpins; everywhere else `p` still
@@ -913,6 +930,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Diff => "diff",
         ActionId::Serve => "serve",
         ActionId::Settings => "settings",
+        ActionId::Automations => "automations",
         ActionId::Profiles => "profiles",
         ActionId::Projects => "projects",
         ActionId::Restart => "restart",

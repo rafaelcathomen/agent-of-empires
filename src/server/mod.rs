@@ -1176,6 +1176,28 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         },
     );
 
+    {
+        let automation_state = state.clone();
+        crate::task_util::spawn_supervised(
+            "server.automation_poll_loop",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                crate::automation::scheduler::automation_poll_loop(automation_state).await;
+            },
+        );
+    }
+
+    {
+        let completion_state = state.clone();
+        crate::task_util::spawn_supervised(
+            "server.automation_completion_loop",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                crate::automation::scheduler::automation_completion_loop(completion_state).await;
+            },
+        );
+    }
+
     // File-watch wire-up: register the initial per-profile subscriptions
     // BEFORE the server starts serving requests so cold-start writes do not
     // rely solely on the 2s polling fallback. Per-profile subscribe errors

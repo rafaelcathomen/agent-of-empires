@@ -3,6 +3,7 @@
 #[cfg(feature = "serve")]
 pub mod acp;
 pub mod agents;
+pub mod automation;
 pub mod build_info;
 pub mod claude_settings;
 pub mod cli;

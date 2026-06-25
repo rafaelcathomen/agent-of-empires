@@ -553,6 +553,43 @@ impl NewSessionDialog {
         self.reload_tool_config();
     }
 
+    /// Build the dialog pre-populated from an automation's launch spec, so a
+    /// user editing an automation sees its current launch parameters. Starts
+    /// from `new()` (for config-resolved widget state) and overrides the fields
+    /// the spec carries. `set_path` is called first because it reloads
+    /// config-derived defaults; spec-specific overrides come after so they win.
+    pub fn from_launch_spec(
+        spec: &crate::automation::model::LaunchSpec,
+        tools: AvailableTools,
+        existing_groups: Vec<String>,
+        profile: &str,
+        available_profiles: Vec<String>,
+    ) -> Self {
+        let mut dialog = Self::new(tools, existing_groups, profile, available_profiles);
+        if !spec.project_path.is_empty() {
+            dialog.set_path(spec.project_path.clone());
+        }
+        dialog.set_group(spec.group_path.clone());
+        if let Some(tool) = &spec.tool {
+            if let Some(idx) = dialog.available_tools.iter().position(|t| t == tool) {
+                dialog.tool_index = idx;
+            }
+        }
+        dialog.extra_args = Input::new(spec.extra_args.clone());
+        dialog.command_override = Input::new(spec.command.clone().unwrap_or_default());
+        match &spec.worktree_branch {
+            Some(branch) => {
+                dialog.worktree_enabled = true;
+                dialog.worktree_branch = Input::new(branch.clone());
+                dialog.create_new_branch = false;
+            }
+            None => dialog.worktree_enabled = false,
+        }
+        dialog.sandbox_enabled = spec.sandbox;
+        dialog.yolo_mode = spec.auto_approve;
+        dialog
+    }
+
     /// Move focus to the title field. Used by "new from selection", where the
     /// path is pre-filled so the user lands directly on naming the session.
     pub fn focus_title(&mut self) {

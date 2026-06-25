@@ -39,8 +39,8 @@ use super::dialogs::{
     GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
     NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
     ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
-    SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
-    WorktreeNameDialog,
+    ScheduleDialog, SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog,
+    UpdateConfirmDialog, WorktreeNameDialog,
 };
 use super::diff::DiffView;
 use super::restart_poller::RestartPoller;
@@ -407,6 +407,16 @@ struct RecoveryUpdate {
     /// freshly-set `last_start_time` (which is `#[serde(skip)]`).
     instance: Box<crate::session::Instance>,
     result: Result<crate::session::StartOutcome, String>,
+}
+
+/// Why the new-session wizard is open: a normal session launch, or collecting
+/// a launch spec for a new automation (its submit routes to the schedule
+/// dialog instead of `create_session`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NewSessionPurpose {
+    #[default]
+    Session,
+    Automation,
 }
 
 pub struct HomeView {
@@ -814,6 +824,20 @@ pub struct HomeView {
     pub(super) settings_view: Option<SettingsView>,
     /// Flag to indicate we're confirming settings close (unsaved changes)
     pub(super) settings_close_confirm: bool,
+
+    /// Automations management view (full-screen takeover)
+    pub(super) automations_view: Option<crate::tui::automations::AutomationsView>,
+    /// Schedule dialog for creating/editing an automation (add: opened after
+    /// the new-session wizard collects a launch spec; edit: opened directly).
+    pub(super) automation_schedule_dialog: Option<ScheduleDialog>,
+    /// What the active new-session wizard is collecting for: a real session
+    /// (the default) or an automation launch spec (routes submit to the
+    /// schedule dialog instead of `create_session`).
+    pub(super) new_session_purpose: NewSessionPurpose,
+    /// The automation being edited while the wizard collects a new launch spec
+    /// (the Ctrl+E detour from the schedule dialog). Carries the id/state and
+    /// in-progress schedule fields so the schedule dialog can resume.
+    pub(super) pending_automation_edit: Option<crate::automation::model::Automation>,
 
     // Diff view
     pub(super) diff_view: Option<DiffView>,
@@ -2120,6 +2144,10 @@ impl HomeView {
             active_tui_count: 1,
             idle_decay_window,
             settings_view: None,
+            automations_view: None,
+            automation_schedule_dialog: None,
+            new_session_purpose: NewSessionPurpose::Session,
+            pending_automation_edit: None,
             settings_close_confirm: false,
             diff_view: None,
             list_width: user_config
@@ -3860,6 +3888,8 @@ impl HomeView {
             || serve_open
             || self.settings_view.is_some()
             || self.diff_view.is_some()
+            || self.automations_view.is_some()
+            || self.automation_schedule_dialog.is_some()
     }
 
     pub fn has_dialog(&self) -> bool {
@@ -3900,6 +3930,8 @@ impl HomeView {
             || serve_open
             || self.settings_view.is_some()
             || self.diff_view.is_some()
+            || self.automations_view.is_some()
+            || self.automation_schedule_dialog.is_some()
     }
 
     /// Whether the paste-burst detector should fire for incoming key events.

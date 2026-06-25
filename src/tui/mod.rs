@@ -2,6 +2,7 @@
 
 mod app;
 mod attached_status_hooks;
+mod automations;
 pub(crate) mod clipboard;
 mod components;
 mod creation_poller;

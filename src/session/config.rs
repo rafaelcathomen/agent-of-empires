@@ -65,6 +65,9 @@ pub struct Config {
     pub acp: AcpConfig,
 
     #[serde(default)]
+    pub automation: AutomationConfig,
+
+    #[serde(default)]
     pub logging: LoggingConfig,
 
     /// Environment variables injected into the host command line for every
@@ -647,6 +650,93 @@ fn default_replay_events() -> u32 {
 }
 fn default_replay_bytes() -> u64 {
     5_242_880
+}
+
+fn default_max_concurrent_runs() -> u32 {
+    3
+}
+fn default_automation_keep_last() -> u32 {
+    5
+}
+fn default_automation_max_runtime_secs() -> u64 {
+    1800
+}
+fn default_consecutive_failure_limit() -> u32 {
+    5
+}
+fn default_scheduler_tick_secs() -> u64 {
+    30
+}
+
+/// Automation scheduler configuration.
+///
+/// Controls concurrency, retention, runtime limits, and failure tolerance for
+/// scheduled automations.
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "automation", category = "Automation")]
+pub struct AutomationConfig {
+    /// Maximum automation runs executing at once. Extra fires queue.
+    #[serde(default = "default_max_concurrent_runs")]
+    #[setting(
+        label = "Max concurrent runs",
+        widget = "number",
+        min = 1,
+        validate = "range:1"
+    )]
+    pub max_concurrent_runs: u32,
+
+    /// Default number of recent fresh-mode run sessions kept per automation.
+    #[serde(default = "default_automation_keep_last")]
+    #[setting(
+        label = "Keep last N runs",
+        widget = "number",
+        min = 1,
+        validate = "range:1"
+    )]
+    pub default_keep_last: u32,
+
+    /// Default max wall-clock seconds a run may take before it is stopped.
+    #[serde(default = "default_automation_max_runtime_secs")]
+    #[setting(
+        label = "Default max runtime (s)",
+        widget = "number",
+        min = 60,
+        validate = "range:60"
+    )]
+    pub default_max_runtime_secs: u64,
+
+    /// Consecutive failed runs before an automation auto-disables itself.
+    #[serde(default = "default_consecutive_failure_limit")]
+    #[setting(
+        label = "Auto-disable after N failures",
+        widget = "number",
+        min = 1,
+        validate = "range:1"
+    )]
+    pub consecutive_failure_limit: u32,
+
+    /// How often the scheduler checks for due automations.
+    #[serde(default = "default_scheduler_tick_secs")]
+    #[setting(
+        label = "Scheduler tick (s)",
+        widget = "number",
+        min = 5,
+        validate = "range:5",
+        advanced
+    )]
+    pub scheduler_tick_secs: u64,
+}
+
+impl Default for AutomationConfig {
+    fn default() -> Self {
+        AutomationConfig {
+            max_concurrent_runs: default_max_concurrent_runs(),
+            default_keep_last: default_automation_keep_last(),
+            default_max_runtime_secs: default_automation_max_runtime_secs(),
+            consecutive_failure_limit: default_consecutive_failure_limit(),
+            scheduler_tick_secs: default_scheduler_tick_secs(),
+        }
+    }
 }
 
 /// Session list sort order
@@ -3637,5 +3727,15 @@ volume_ignores_strategy = "named"
             config.volume_ignores_strategy,
             VolumeIgnoresStrategy::Anonymous
         );
+    }
+
+    #[test]
+    fn automation_config_defaults() {
+        let c = Config::default();
+        assert_eq!(c.automation.max_concurrent_runs, 3);
+        assert_eq!(c.automation.default_keep_last, 5);
+        assert_eq!(c.automation.consecutive_failure_limit, 5);
+        assert_eq!(c.automation.default_max_runtime_secs, 1800);
+        assert_eq!(c.automation.scheduler_tick_secs, 30);
     }
 }

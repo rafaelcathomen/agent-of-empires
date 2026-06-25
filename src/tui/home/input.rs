@@ -17,8 +17,8 @@ use crate::tui::dialogs::{
     DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HooksInstallDialog, InfoDialog,
     IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction, PaletteAction, PaletteCommand,
     PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog, RenameMode, RepoTrustAction,
-    RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome, UnifiedDeleteDialog,
-    WorktreeNameDialog,
+    RestartDialog, ScheduleDialog, ScheduleOutcome, SendMessageDialog, TipsDialog, TipsOutcome,
+    UnifiedDeleteDialog, WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
@@ -1563,6 +1563,25 @@ impl HomeView {
             }
         }
 
+        // Handle automations view (full-screen takeover)
+        if let Some(ref mut automations) = self.automations_view {
+            match automations.handle_key(key) {
+                crate::tui::automations::AutomationsAction::Continue => return None,
+                crate::tui::automations::AutomationsAction::Close => {
+                    self.automations_view = None;
+                    return None;
+                }
+                crate::tui::automations::AutomationsAction::StartAdd => {
+                    self.start_automation_add();
+                    return None;
+                }
+                crate::tui::automations::AutomationsAction::StartEdit(automation) => {
+                    self.start_automation_edit(*automation);
+                    return None;
+                }
+            }
+        }
+
         // Handle diff view (full-screen takeover)
         if let Some(ref mut diff_view) = self.diff_view {
             let action = diff_view.handle_key(key);
@@ -1902,6 +1921,35 @@ impl HomeView {
             return None;
         }
 
+        // Automation schedule dialog (add/edit). Sits ahead of the new-session
+        // wizard handler so its keys aren't swallowed by it.
+        if let Some(dialog) = &mut self.automation_schedule_dialog {
+            match dialog.handle_key(key) {
+                ScheduleOutcome::Continue => {}
+                ScheduleOutcome::Cancel => {
+                    self.automation_schedule_dialog = None;
+                    self.pending_automation_edit = None;
+                    self.open_automations_view();
+                }
+                ScheduleOutcome::Submit(automation) => {
+                    self.automation_schedule_dialog = None;
+                    self.pending_automation_edit = None;
+                    self.commit_automation(*automation);
+                }
+                ScheduleOutcome::EditSpec(automation) => {
+                    // Detour through the wizard to edit the launch spec. Stash
+                    // the in-progress automation; the wizard's submit rebuilds
+                    // the schedule dialog from it plus the new spec.
+                    self.automation_schedule_dialog = None;
+                    let spec = automation.spec.clone();
+                    self.pending_automation_edit = Some(*automation);
+                    self.new_session_purpose = crate::tui::home::NewSessionPurpose::Automation;
+                    self.open_new_session_dialog_from_spec(&spec);
+                }
+            }
+            return None;
+        }
+
         let dialog_result = self
             .new_dialog
             .as_mut()
@@ -1914,6 +1962,22 @@ impl HomeView {
                     // If creation is pending, mark it as cancelled
                     if self.is_creation_pending() {
                         self.cancel_creation();
+                    } else if self.new_session_purpose
+                        == crate::tui::home::NewSessionPurpose::Automation
+                    {
+                        // Backed out of the automation wizard: drop it. If this
+                        // was a launch-spec edit detour, resume the schedule
+                        // dialog with the (unchanged) automation; otherwise
+                        // return to the Automations view.
+                        self.new_dialog = None;
+                        self.new_session_purpose = crate::tui::home::NewSessionPurpose::Session;
+                        match self.pending_automation_edit.take() {
+                            Some(existing) => {
+                                self.automation_schedule_dialog =
+                                    Some(ScheduleDialog::new_edit(existing));
+                            }
+                            None => self.open_automations_view(),
+                        }
                     } else {
                         self.new_dialog = None;
                         // Backing out of `n` with a selection is the most
@@ -1925,6 +1989,22 @@ impl HomeView {
                     }
                 }
                 DialogResult::Submit(data) => {
+                    // Automation add: the wizard only collects the launch spec;
+                    // hand off to the schedule dialog instead of launching a
+                    // session (no hooks/volume confirm, no `create_session`).
+                    if self.new_session_purpose == crate::tui::home::NewSessionPurpose::Automation {
+                        self.new_session_purpose = crate::tui::home::NewSessionPurpose::Session;
+                        self.new_dialog = None;
+                        // Editing an existing automation's spec round-trips back
+                        // into the schedule dialog with the new spec; a fresh
+                        // add starts a blank schedule dialog.
+                        let dialog = match self.pending_automation_edit.take() {
+                            Some(existing) => ScheduleDialog::new_edit_with_spec(existing, data),
+                            None => ScheduleDialog::new_add(data),
+                        };
+                        self.automation_schedule_dialog = Some(dialog);
+                        return None;
+                    }
                     // Check if the tool uses hooks and user hasn't acknowledged yet
                     let tool_name = if data.tool.is_empty() {
                         "claude".to_string()
@@ -2542,6 +2622,7 @@ impl HomeView {
             ActionId::Diff => self.open_diff_for_selected(),
             ActionId::Serve => self.open_serve(),
             ActionId::Settings => self.open_settings(),
+            ActionId::Automations => self.open_automations_view(),
             ActionId::Profiles => self.show_profile_picker(),
             ActionId::Projects => {
                 let profile = self.config_profile();
@@ -3009,6 +3090,73 @@ impl HomeView {
                 ));
             }
         }
+    }
+
+    pub(super) fn open_automations_view(&mut self) {
+        match crate::tui::automations::AutomationsView::new(&self.config_profile()) {
+            Ok(view) => self.automations_view = Some(view),
+            Err(e) => {
+                tracing::error!(target: "tui.input", "Failed to open automations: {}", e);
+                self.info_dialog = Some(InfoDialog::new(
+                    "Error",
+                    &format!("Failed to open automations: {}", e),
+                ));
+            }
+        }
+    }
+
+    /// Begin adding an automation from the Automations view: close the view and
+    /// open the new-session wizard tagged with the automation purpose, so its
+    /// submit routes to the schedule dialog instead of launching a session.
+    fn start_automation_add(&mut self) {
+        self.automations_view = None;
+        self.new_session_purpose = crate::tui::home::NewSessionPurpose::Automation;
+        self.open_new_session_dialog();
+        // If no agent is configured, `open_new_session_dialog` shows the
+        // no-agents dialog instead and leaves `new_dialog` unset; reopening
+        // the automations view on cancel still does the right thing.
+    }
+
+    /// Open the schedule dialog to edit the selected automation. Called from
+    /// the Automations view's edit action.
+    pub(super) fn start_automation_edit(
+        &mut self,
+        automation: crate::automation::model::Automation,
+    ) {
+        self.automations_view = None;
+        self.automation_schedule_dialog = Some(ScheduleDialog::new_edit(automation));
+    }
+
+    /// Persist an automation built by the schedule dialog (upsert by id), then
+    /// reopen the Automations view with it visible.
+    fn commit_automation(&mut self, automation: crate::automation::model::Automation) {
+        let profile = self.config_profile();
+        let result = crate::automation::store::AutomationStore::new(&profile).and_then(|store| {
+            store.update(|list| {
+                if let Some(slot) = list.iter_mut().find(|a| a.id == automation.id) {
+                    *slot = automation.clone();
+                } else {
+                    list.push(automation.clone());
+                }
+                Ok(())
+            })
+        });
+        match result {
+            Ok(()) => {
+                if crate::automation::lifecycle::ensure_scheduler_running(&profile).unwrap_or(false)
+                {
+                    tracing::info!(target: "tui.input", "auto-spawned scheduler daemon for new automation");
+                }
+            }
+            Err(e) => {
+                tracing::error!(target: "tui.input", "Failed to save automation: {}", e);
+                self.info_dialog = Some(InfoDialog::new(
+                    "Error",
+                    &format!("Failed to save automation: {}", e),
+                ));
+            }
+        }
+        self.open_automations_view();
     }
 
     fn run_update(&mut self, update_info: Option<&crate::update::UpdateInfo>) -> Option<Action> {
@@ -4095,6 +4243,30 @@ impl HomeView {
         let current_profile = self.config_profile();
         let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
         self.new_dialog = Some(NewSessionDialog::new(
+            self.available_tools.clone(),
+            existing_groups,
+            &current_profile,
+            profiles,
+        ));
+    }
+
+    /// Open the new-session wizard pre-populated from an automation's launch
+    /// spec (the launch-spec edit detour). Mirrors `open_new_session_dialog`'s
+    /// gating; falls back to the no-agents dialog when no tool is available.
+    pub(super) fn open_new_session_dialog_from_spec(
+        &mut self,
+        spec: &crate::automation::model::LaunchSpec,
+    ) {
+        if !self.available_tools.any_available() {
+            self.show_no_agents();
+            return;
+        }
+        let existing_groups: Vec<String> =
+            self.all_groups().iter().map(|g| g.path.clone()).collect();
+        let current_profile = self.config_profile();
+        let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+        self.new_dialog = Some(NewSessionDialog::from_launch_spec(
+            spec,
             self.available_tools.clone(),
             existing_groups,
             &current_profile,

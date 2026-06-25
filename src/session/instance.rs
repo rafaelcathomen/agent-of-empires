@@ -686,6 +686,18 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_pending: Option<String>,
 
+    /// One-shot prompt injected right after launch (the Automations initial
+    /// prompt, also usable via `aoe add --prompt`). Empty means inject nothing.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub initial_prompt: String,
+
+    /// When set, this session was launched by the automation with this id.
+    /// Used by the scheduler to attribute running/completed sessions to their
+    /// automation (concurrency cap, completion finalization) without relying
+    /// on a fragile title suffix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_id: Option<String>,
+
     // Runtime state (not serialized)
     #[serde(skip)]
     pub last_error_check: Option<std::time::Instant>,
@@ -1058,6 +1070,9 @@ impl Instance {
             import_pending: None,
             #[cfg(feature = "serve")]
             fork_pending: None,
+
+            initial_prompt: String::new(),
+            automation_id: None,
             last_error_check: None,
             last_start_time: None,
             last_error: None,
@@ -1088,6 +1103,19 @@ impl Instance {
         self.file_watch
             .clone()
             .unwrap_or_else(crate::file_watch::FileWatchService::noop)
+    }
+
+    /// Inject the initial prompt into a just-launched terminal session.
+    /// No-op when empty or for structured sessions (the ACP path injects).
+    pub fn inject_initial_prompt(&self) -> anyhow::Result<()> {
+        if self.initial_prompt.is_empty() || self.is_structured() {
+            return Ok(());
+        }
+        let session = crate::tmux::Session::new(&self.id, &self.title)?;
+        // Brief readiness wait so the agent's REPL is accepting input.
+        std::thread::sleep(std::time::Duration::from_millis(600));
+        session.send_keys(&self.initial_prompt)?;
+        Ok(())
     }
 
     /// Whether a title rename should also move the worktree directory leaf,

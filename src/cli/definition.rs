@@ -11,6 +11,7 @@ use super::acp::AcpCommands;
 use super::add::AddArgs;
 use super::automation::AutomationCommands;
 use super::context::ContextCommands;
+use super::curator::CuratorCommands;
 use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
 use super::init::InitArgs;
@@ -138,6 +139,12 @@ pub enum Commands {
     Context {
         #[command(subcommand)]
         command: ContextCommands,
+    },
+
+    /// Run and inspect the headless group context curator
+    Curator {
+        #[command(subcommand)]
+        command: CuratorCommands,
     },
 
     /// Manage groups for organizing sessions
@@ -272,6 +279,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "killall",
     "session",
     "context",
+    "curator",
     "group",
     "plugin",
     "profile",
@@ -320,6 +328,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Stop { .. } => return None,
         Commands::Session { .. } => "session",
         Commands::Context { .. } => "context",
+        Commands::Curator { .. } => "curator",
         Commands::Group { .. } => "group",
         Commands::Plugin { .. } => "plugin",
         Commands::Profile { .. } => "profile",

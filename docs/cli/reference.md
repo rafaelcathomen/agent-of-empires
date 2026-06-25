@@ -40,9 +40,12 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session unfavorite`↴](#aoe-session-unfavorite)
 * [`aoe session archive`↴](#aoe-session-archive)
 * [`aoe session unarchive`↴](#aoe-session-unarchive)
-* [`aoe session restore`↴](#aoe-session-restore)
-* [`aoe session list-trash`↴](#aoe-session-list-trash)
-* [`aoe session empty-trash`↴](#aoe-session-empty-trash)
+* [`aoe context`↴](#aoe-context)
+* [`aoe context add`↴](#aoe-context-add)
+* [`aoe context show`↴](#aoe-context-show)
+* [`aoe context summary`↴](#aoe-context-summary)
+* [`aoe context summaries`↴](#aoe-context-summaries)
+* [`aoe context path`↴](#aoe-context-path)
 * [`aoe group`↴](#aoe-group)
 * [`aoe group list`↴](#aoe-group-list)
 * [`aoe group create`↴](#aoe-group-create)
@@ -53,12 +56,6 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe plugin info`↴](#aoe-plugin-info)
 * [`aoe plugin enable`↴](#aoe-plugin-enable)
 * [`aoe plugin disable`↴](#aoe-plugin-disable)
-* [`aoe plugin install`↴](#aoe-plugin-install)
-* [`aoe plugin update`↴](#aoe-plugin-update)
-* [`aoe plugin uninstall`↴](#aoe-plugin-uninstall)
-* [`aoe plugin hash`↴](#aoe-plugin-hash)
-* [`aoe plugin discover`↴](#aoe-plugin-discover)
-* [`aoe plugin outdated`↴](#aoe-plugin-outdated)
 * [`aoe profile`↴](#aoe-profile)
 * [`aoe profile list`↴](#aoe-profile-list)
 * [`aoe profile create`↴](#aoe-profile-create)
@@ -83,8 +80,6 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe theme list`↴](#aoe-theme-list)
 * [`aoe theme export`↴](#aoe-theme-export)
 * [`aoe theme dir`↴](#aoe-theme-dir)
-* [`aoe settings`↴](#aoe-settings)
-* [`aoe settings explain`↴](#aoe-settings-explain)
 * [`aoe telemetry`↴](#aoe-telemetry)
 * [`aoe telemetry status`↴](#aoe-telemetry-status)
 * [`aoe telemetry enable`↴](#aoe-telemetry-enable)
@@ -136,15 +131,15 @@ Run without arguments to launch the TUI dashboard.
 * `status` — Show session status summary
 * `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
+* `context` — Read and update per-group shared context
 * `group` — Manage groups for organizing sessions
-* `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
+* `plugin` — Manage plugins (list, info, enable, disable)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
 * `theme` — Manage color themes (list, export, customize)
-* `settings` — Inspect resolved settings and their provenance
 * `telemetry` — Manage anonymous opt-in usage telemetry
 * `mcp` — Inspect the effective MCP server set (provenance, conflicts, drift)
 * `serve` — Start a web dashboard for remote session access
@@ -377,7 +372,6 @@ Remove a session
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)
 * `--keep-scratch` — For scratch sessions, keep the scratch directory on disk instead of removing it. The session record is still deleted; the kept path is logged so you can find the files later. No effect on non-scratch sessions
-* `--purge` — Permanently delete instead of moving to trash. By default `rm` moves the session to the trash (when `session.delete_to_trash` is enabled, the default) so it can be restored; `--purge` forces the irreversible teardown (worktree/branch/container cleanup per the other flags, plus transcript removal)
 
 
 
@@ -452,9 +446,6 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `unfavorite` — Clear the favorite flag on a session
 * `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 * `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
-* `restore` — Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
-* `list-trash` — List the sessions currently in the trash
-* `empty-trash` — Permanently purge every trashed session in the profile (irreversible)
 
 
 
@@ -707,31 +698,79 @@ Unarchive a session (restores it to its tier in the Attention sort)
 
 
 
-## `aoe session restore`
+## `aoe context`
 
-Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
+Read and update per-group shared context
 
-**Usage:** `aoe session restore <IDENTIFIER>`
+**Usage:** `aoe context <COMMAND>`
+
+###### **Subcommands:**
+
+* `add` — Append a note to the current group's shared context
+* `show` — Print a group's context.md
+* `summary` — Print a group's outward-facing summary.md
+* `summaries` — List all groups with a one-line summary digest
+* `path` — Print canonical file paths for a group
+
+
+
+## `aoe context add`
+
+Append a note to the current group's shared context
+
+**Usage:** `aoe context add [OPTIONS] <TEXT>`
 
 ###### **Arguments:**
 
-* `<IDENTIFIER>` — Session ID or title
+* `<TEXT>` — The note text to append
+
+###### **Options:**
+
+* `--group <GROUP>` — Group path; inferred from the current directory when omitted
 
 
 
-## `aoe session list-trash`
+## `aoe context show`
 
-List the sessions currently in the trash
+Print a group's context.md
 
-**Usage:** `aoe session list-trash`
+**Usage:** `aoe context show [OPTIONS]`
+
+###### **Options:**
+
+* `--group <GROUP>` — Group path; inferred from the current directory when omitted
 
 
 
-## `aoe session empty-trash`
+## `aoe context summary`
 
-Permanently purge every trashed session in the profile (irreversible)
+Print a group's outward-facing summary.md
 
-**Usage:** `aoe session empty-trash`
+**Usage:** `aoe context summary [OPTIONS]`
+
+###### **Options:**
+
+* `--group <GROUP>` — Group path; inferred from the current directory when omitted
+
+
+
+## `aoe context summaries`
+
+List all groups with a one-line summary digest
+
+**Usage:** `aoe context summaries`
+
+
+
+## `aoe context path`
+
+Print canonical file paths for a group
+
+**Usage:** `aoe context path [OPTIONS]`
+
+###### **Options:**
+
+* `--group <GROUP>` — Group path; inferred from the current directory when omitted
 
 
 
@@ -809,28 +848,22 @@ Move session to group
 
 ## `aoe plugin`
 
-Manage plugins (list, info, enable, disable, install, update, uninstall)
+Manage plugins (list, info, enable, disable)
 
 **Usage:** `aoe plugin <COMMAND>`
 
 ###### **Subcommands:**
 
-* `list` — List every known plugin with version, validation, and state
+* `list` — List every known plugin with version and state
 * `info` — Show one plugin's manifest details
 * `enable` — Enable a plugin's contributions
 * `disable` — Disable a plugin; its settings stay on disk for re-enabling
-* `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
-* `update` — Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
-* `uninstall` — Uninstall an external plugin, removing its files and capability grant
-* `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
-* `discover` — Search GitHub's `aoe-plugin` topic for installable plugins
-* `outdated` — List installed external plugins that have an update available
 
 
 
 ## `aoe plugin list`
 
-List every known plugin with version, validation, and state
+List every known plugin with version and state
 
 **Usage:** `aoe plugin list`
 
@@ -869,78 +902,6 @@ Disable a plugin; its settings stay on disk for re-enabling
 ###### **Arguments:**
 
 * `<ID>` — Plugin id
-
-
-
-## `aoe plugin install`
-
-Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
-
-**Usage:** `aoe plugin install [OPTIONS] <SOURCE>`
-
-###### **Arguments:**
-
-* `<SOURCE>` — `gh:owner/repo` (latest release) or `gh:owner/repo@ref` (unverified) or a local directory path
-
-###### **Options:**
-
-* `--yes` — Grant all requested capabilities without prompting
-
-
-
-## `aoe plugin update`
-
-Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
-
-**Usage:** `aoe plugin update <ID>`
-
-###### **Arguments:**
-
-* `<ID>` — Plugin id
-
-
-
-## `aoe plugin uninstall`
-
-Uninstall an external plugin, removing its files and capability grant
-
-**Usage:** `aoe plugin uninstall <ID>`
-
-###### **Arguments:**
-
-* `<ID>` — Plugin id
-
-
-
-## `aoe plugin hash`
-
-Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
-
-**Usage:** `aoe plugin hash <PATH>`
-
-###### **Arguments:**
-
-* `<PATH>` — Path to the plugin directory
-
-
-
-## `aoe plugin discover`
-
-Search GitHub's `aoe-plugin` topic for installable plugins
-
-**Usage:** `aoe plugin discover [QUERY]`
-
-###### **Arguments:**
-
-* `<QUERY>` — Optional free-text term to narrow the search
-
-
-
-## `aoe plugin outdated`
-
-List installed external plugins that have an update available
-
-**Usage:** `aoe plugin outdated`
 
 
 
@@ -1240,7 +1201,7 @@ Export a built-in theme as a TOML file for customization
 
 ###### **Options:**
 
-* `-o`, `--output <OUTPUT>` — Output file path (defaults to `<name>.toml` in the themes directory)
+* `-o`, `--output <OUTPUT>` — Output file path (defaults to <name>.toml in the themes directory)
 
 
 
@@ -1249,30 +1210,6 @@ Export a built-in theme as a TOML file for customization
 Show the custom themes directory path
 
 **Usage:** `aoe theme dir`
-
-
-
-## `aoe settings`
-
-Inspect resolved settings and their provenance
-
-**Usage:** `aoe settings <COMMAND>`
-
-###### **Subcommands:**
-
-* `explain` — Explain where a setting's effective value comes from. KEY is a core `section.field` (e.g. `acp.default_agent`) or a plugin `plugin:<id>.<field>` (e.g. `plugin:acme.kit.retries`)
-
-
-
-## `aoe settings explain`
-
-Explain where a setting's effective value comes from. KEY is a core `section.field` (e.g. `acp.default_agent`) or a plugin `plugin:<id>.<field>` (e.g. `plugin:acme.kit.retries`)
-
-**Usage:** `aoe settings explain <KEY>`
-
-###### **Arguments:**
-
-* `<KEY>` — The setting key to explain
 
 
 

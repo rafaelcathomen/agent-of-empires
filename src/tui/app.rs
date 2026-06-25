@@ -1148,6 +1148,10 @@ impl App {
                             // it and write to the user's clipboard.
                             if let Some(text) = self.home.take_preview_copy_text() {
                                 crate::tui::clipboard::copy_to_clipboard(&text);
+                                // Also publish to the PRIMARY selection so a
+                                // middle-click pastes it into other windows
+                                // (the standard X11 mouse-select flow).
+                                crate::tui::clipboard::copy_to_primary(&text);
                             }
                             if let Some(action) = click_action {
                                 self.execute_action(action, terminal)?;

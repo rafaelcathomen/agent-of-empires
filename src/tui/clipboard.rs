@@ -57,6 +57,35 @@ pub fn copy_to_clipboard(text: &str) -> usize {
     truncated.len()
 }
 
+/// Push `text` to the PRIMARY selection (the X11/Wayland mouse-selection
+/// buffer that a middle-click pastes). This is what makes "drag-select in
+/// the preview, then middle-click to paste elsewhere" work, since AoE owns
+/// the mouse and the terminal never sets PRIMARY itself. No-op on platforms
+/// without a primary selection (macOS). Best-effort, same truncation as
+/// `copy_to_clipboard`; logged at `tracing::info`.
+pub fn copy_to_primary(text: &str) -> usize {
+    let truncated_str = truncate_to_limit(text);
+    let subprocess = try_primary_subprocess(truncated_str);
+    tracing::info!(
+        target: "tui.clipboard",
+        bytes = truncated_str.len(),
+        subprocess = format!("{:?}", subprocess).as_str(),
+        "preview drag-select copy to primary"
+    );
+    truncated_str.len()
+}
+
+/// Truncate `text` to `MAX_BYTES` on a UTF-8 boundary.
+fn truncate_to_limit(text: &str) -> &str {
+    if text.len() <= MAX_BYTES {
+        return text;
+    }
+    match std::str::from_utf8(&text.as_bytes()[..MAX_BYTES]) {
+        Ok(s) => s,
+        Err(e) => std::str::from_utf8(&text.as_bytes()[..e.valid_up_to()]).unwrap_or(""),
+    }
+}
+
 /// Run a platform-specific clipboard subprocess. `Ok(cmd_name)` on
 /// success so the caller can show which one landed; `Err(reason)`
 /// otherwise.
@@ -88,6 +117,34 @@ fn try_subprocess(text: &str) -> Result<&'static str, String> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn try_subprocess(_text: &str) -> Result<&'static str, String> {
     Err("no subprocess clipboard for this platform".to_string())
+}
+
+/// Run a platform-specific PRIMARY-selection subprocess. Linux only; the
+/// PRIMARY selection is an X11/Wayland concept with no macOS/Windows
+/// equivalent.
+#[cfg(target_os = "linux")]
+fn try_primary_subprocess(text: &str) -> Result<&'static str, String> {
+    let mut last_err: Option<String> = None;
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        match run_subprocess("wl-copy", &["--primary"], text) {
+            Ok(name) => return Ok(name),
+            Err(reason) => last_err = Some(reason),
+        }
+    }
+    match run_subprocess("xclip", &["-selection", "primary"], text) {
+        Ok(name) => Ok(name),
+        Err(xclip_err) => match run_subprocess("xsel", &["--primary", "--input"], text) {
+            Ok(name) => Ok(name),
+            Err(xsel_err) => Err(last_err
+                .map(|e| format!("{e}; {xclip_err}; {xsel_err}"))
+                .unwrap_or_else(|| format!("{xclip_err}; {xsel_err}"))),
+        },
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_primary_subprocess(_text: &str) -> Result<&'static str, String> {
+    Err("no primary selection on this platform".to_string())
 }
 
 /// Upper bound on how long we wait for a clipboard subprocess to

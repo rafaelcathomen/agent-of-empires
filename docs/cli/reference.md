@@ -726,7 +726,7 @@ Append a note to the current group's shared context
 
 ###### **Options:**
 
-* `--group <GROUP>` — Group path; inferred from the current directory when omitted
+* `-g`, `--group <GROUP>` — Group path; inferred from the current directory when omitted
 
 
 
@@ -738,7 +738,7 @@ Print a group's context.md
 
 ###### **Options:**
 
-* `--group <GROUP>` — Group path; inferred from the current directory when omitted
+* `-g`, `--group <GROUP>` — Group path; inferred from the current directory when omitted
 
 
 
@@ -750,7 +750,7 @@ Print a group's outward-facing summary.md
 
 ###### **Options:**
 
-* `--group <GROUP>` — Group path; inferred from the current directory when omitted
+* `-g`, `--group <GROUP>` — Group path; inferred from the current directory when omitted
 
 
 
@@ -770,7 +770,7 @@ Print canonical file paths for a group
 
 ###### **Options:**
 
-* `--group <GROUP>` — Group path; inferred from the current directory when omitted
+* `-g`, `--group <GROUP>` — Group path; inferred from the current directory when omitted
 
 
 

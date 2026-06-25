@@ -2674,6 +2674,19 @@ impl Instance {
         }
     }
 
+    /// Install the agent's status hooks into its host config without launching
+    /// the session. A natively launched session installs these during
+    /// `build_launch_command`; `aoe register` adopts an already-running session
+    /// and skips that path, so the hooks (which the status poller and the
+    /// tmux-env fallback in `src/hooks/mod.rs` rely on) must be installed
+    /// explicitly. Resolves the agent the same way the launch path does,
+    /// respects the `session.agent_status_hooks` toggle, and is idempotent.
+    pub(crate) fn install_status_hooks(&self) {
+        let agent = crate::agents::get_agent(&self.tool)
+            .or_else(|| crate::agents::get_agent(&self.detect_as));
+        self.install_agent_status_hooks(agent);
+    }
+
     /// Build the tmux command for a host (non-sandboxed) session.
     ///
     /// Runs on_launch hooks on the host, then constructs the command from either

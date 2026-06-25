@@ -234,6 +234,27 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Current working directory of a session's first pane. Used when adopting an
+/// externally-started tmux session (`aoe register`) to seed the instance's
+/// project path. Targets `^.0` for the same base-index-agnostic reasons as
+/// [`pane_current_command`].
+pub(crate) fn pane_current_path(session_name: &str) -> Option<String> {
+    let target = format!("{session_name}:^.0");
+    Command::new("tmux")
+        .args([
+            "display-message",
+            "-t",
+            &target,
+            "-p",
+            "#{pane_current_path}",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 // Shells that indicate the agent is not running (the pane was restored by
 // tmux-resurrect, the agent crashed back to a prompt, or the user exited).
 const KNOWN_SHELLS: &[&str] = &[

@@ -328,8 +328,23 @@ fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -
         HookInstallTarget::Host => "[ \"$3\" = \"$ME\" ] || exit 0; ",
         HookInstallTarget::Sandbox => "",
     };
+    // Adopted sessions (`aoe register`) attach to an already-running agent whose
+    // process env has no AOE_INSTANCE_ID, so fall back to the tmux session's
+    // hidden env (which `register` stamps). Host-only: a sandboxed agent has no
+    // tmux and is always aoe-launched with the env already set. Gated on an
+    // empty env var so aoe-launched sessions keep the zero-subprocess fast path.
+    // No single quotes (would close the outer `sh -c '...'`); grep pins the
+    // exact key so tmux's `-VAR` unset marker is ignored, then cut takes the
+    // value. The allowlist `case` below still sanitizes the resolved id.
+    let resolve_id = match target {
+        HookInstallTarget::Host => {
+            "[ -n \"$AOE_INSTANCE_ID\" ] || AOE_INSTANCE_ID=$(tmux show-environment -h AOE_INSTANCE_ID 2>/dev/null | grep \"^AOE_INSTANCE_ID=\" | cut -d= -f2-); "
+        }
+        HookInstallTarget::Sandbox => "",
+    };
     format!(
         "sh -c 'unset IFS; set -f; umask 077; \
+         {resolve_id}\
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
          B={base}; {parent_check}\
@@ -379,8 +394,13 @@ pub(crate) fn canonical_session_id_command(target: HookInstallTarget) -> String 
 }
 
 fn hook_command_session_id_host() -> String {
+    // Same adopted-session fallback as the status hook (see `hook_command_with_base`):
+    // resolve AOE_INSTANCE_ID from the tmux hidden env when the process env
+    // lacks it. `aoe __extract-session-id` reads the id from ITS OWN env, so a
+    // value resolved into a shell variable must be exported to reach the child.
     format!(
-        "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+        "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || AOE_INSTANCE_ID=$(tmux show-environment -h AOE_INSTANCE_ID 2>/dev/null | grep \"^AOE_INSTANCE_ID=\" | cut -d= -f2-); \
+         [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; export AOE_INSTANCE_ID; \
          command -v aoe >/dev/null 2>&1 || exit 0; \
          aoe __extract-session-id 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
     )
@@ -3894,6 +3914,61 @@ hooks_auto_accept: false
         assert!(
             !cmd.contains("grep -oE"),
             "legacy grep pipeline must be gone: {cmd}"
+        );
+    }
+
+    // Adopted sessions (`aoe register`) attach to an already-running agent
+    // whose process env has no AOE_INSTANCE_ID (it can't be injected after the
+    // fact). The host hooks fall back to reading the id from the tmux session's
+    // hidden env, which `register` stamps. The fast path (env present) must be
+    // preserved, and the fallback must never appear in the sandbox variants
+    // (no tmux in a container, and sandbox sessions are always aoe-launched).
+    #[test]
+    fn host_status_hook_resolves_instance_id_from_tmux_when_env_absent() {
+        let cmd = canonical_status_command("running", HookInstallTarget::Host);
+        assert!(
+            cmd.contains("tmux show-environment -h AOE_INSTANCE_ID"),
+            "host status hook should fall back to tmux hidden env: {cmd}"
+        );
+        // Fallback only fires when the env var is empty (fast path preserved
+        // for aoe-launched sessions: no extra subprocess).
+        assert!(
+            cmd.contains("[ -n \"$AOE_INSTANCE_ID\" ] || AOE_INSTANCE_ID=$(tmux"),
+            "tmux fallback must be gated on an empty env var: {cmd}"
+        );
+        // The post-resolve allowlist still sanitizes whatever tmux returns.
+        assert!(
+            cmd.contains("case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac"),
+            "instance-id allowlist must still guard the resolved id: {cmd}"
+        );
+    }
+
+    #[test]
+    fn host_session_id_hook_resolves_and_exports_instance_id_from_tmux() {
+        let cmd = canonical_session_id_command(HookInstallTarget::Host);
+        assert!(
+            cmd.contains("tmux show-environment -h AOE_INSTANCE_ID"),
+            "host session-id hook should fall back to tmux hidden env: {cmd}"
+        );
+        // `aoe __extract-session-id` reads AOE_INSTANCE_ID from ITS OWN env, so
+        // a value resolved into a shell variable must be exported to reach it.
+        assert!(
+            cmd.contains("export AOE_INSTANCE_ID"),
+            "resolved id must be exported for the aoe child: {cmd}"
+        );
+    }
+
+    #[test]
+    fn sandbox_hooks_have_no_tmux_fallback() {
+        let status = canonical_status_command("running", HookInstallTarget::Sandbox);
+        assert!(
+            !status.contains("tmux"),
+            "sandbox status hook must not reference tmux: {status}"
+        );
+        let sid = canonical_session_id_command(HookInstallTarget::Sandbox);
+        assert!(
+            !sid.contains("tmux"),
+            "sandbox session-id hook must not reference tmux: {sid}"
         );
     }
 

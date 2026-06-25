@@ -5796,11 +5796,51 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
         idle_entered_at: Some(now),
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
     assert_eq!(inst.status, Status::Idle);
     assert_eq!(inst.idle_entered_at, Some(now));
+}
+
+#[test]
+#[serial]
+fn apply_status_update_tracks_subagent_active_while_running() {
+    use crate::session::Status;
+    use crate::tui::status_poller::StatusUpdate;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+
+    // A subagent spawns while the main agent is Running.
+    env.view.apply_one_status_update(StatusUpdate {
+        id: id.clone(),
+        status: Status::Running,
+        last_error: None,
+        idle_entered_at: None,
+        last_accessed_at: None,
+        pane_dead: false,
+        subagent_active: true,
+    });
+    assert!(env.view.get_instance(&id).unwrap().subagent_active);
+
+    // Status stays Running but the subagent finished: the flag must clear.
+    // This specifically guards the should_update branch wiring (without it
+    // the blue spinner would stick on).
+    env.view.apply_one_status_update(StatusUpdate {
+        id: id.clone(),
+        status: Status::Running,
+        last_error: None,
+        idle_entered_at: None,
+        last_accessed_at: None,
+        pane_dead: false,
+        subagent_active: false,
+    });
+    assert!(!env.view.get_instance(&id).unwrap().subagent_active);
 }
 
 #[test]
@@ -5824,6 +5864,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         idle_entered_at: Some(stop_time),
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
     });
     assert_eq!(
         env.view.get_instance(&id).unwrap().idle_entered_at,
@@ -5841,6 +5882,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         idle_entered_at: None,
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -5938,6 +5980,7 @@ fn apply_status_update_skips_terminal_states() {
         idle_entered_at: Some(stale_ts),
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
     });
 
     // Status and timestamp should both stay untouched.
@@ -6013,6 +6056,7 @@ fn apply_status_update_runs_status_hook_on_transition() {
         idle_entered_at: None,
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
     });
 
     let launches = take_recorded_launches();
@@ -6078,6 +6122,7 @@ fn apply_status_update_does_not_run_status_hook_for_same_status() {
         idle_entered_at: None,
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
     });
 
     assert!(take_recorded_launches().is_empty());
@@ -6111,6 +6156,7 @@ fn apply_status_updates_without_hooks_does_not_run_status_hook() {
             idle_entered_at: None,
             last_accessed_at: None,
             pane_dead: false,
+            subagent_active: false,
         }]);
 
     assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Waiting);

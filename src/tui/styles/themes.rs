@@ -99,6 +99,12 @@ pub struct Theme {
     pub error: Color,
     #[serde(with = "hex_color")]
     pub terminal_active: Color,
+    /// Spinner color for a session whose Claude Code main agent is working
+    /// (`Status::Running`) AND has one or more Task subagents running. Distinct
+    /// from `running` (green, main agent only) and the bluish `terminal_active`
+    /// so a parallel subagent reads as its own state. User picked blue.
+    #[serde(with = "hex_color")]
+    pub subagent_active: Color,
 
     // UI elements
     #[serde(with = "hex_color")]
@@ -175,6 +181,8 @@ struct RawThemeDefaults {
     #[serde(with = "hex_color")]
     terminal_active: Color,
     #[serde(with = "hex_color")]
+    subagent_active: Color,
+    #[serde(with = "hex_color")]
     group: Color,
     #[serde(with = "hex_color")]
     search: Color,
@@ -215,6 +223,7 @@ impl From<RawThemeDefaults> for Theme {
             unread: raw.unread,
             error: raw.error,
             terminal_active: raw.terminal_active,
+            subagent_active: raw.subagent_active,
             group: raw.group,
             search: raw.search,
             accent: raw.accent,
@@ -270,7 +279,7 @@ impl Theme {
     /// single authoritative list shared by `downsample_to_palette` and the
     /// structural guard test. New `Color` fields added to `Theme` must be
     /// added here too; non-color metadata (appearance, syntax, etc.) must not.
-    pub fn color_fields_mut(&mut self) -> [&mut Color; 26] {
+    pub fn color_fields_mut(&mut self) -> [&mut Color; 27] {
         [
             &mut self.background,
             &mut self.border,
@@ -288,6 +297,7 @@ impl Theme {
             &mut self.unread,
             &mut self.error,
             &mut self.terminal_active,
+            &mut self.subagent_active,
             &mut self.group,
             &mut self.search,
             &mut self.accent,
@@ -302,7 +312,7 @@ impl Theme {
     }
 
     /// Read-only counterpart to `color_fields_mut`.
-    pub fn color_fields(&self) -> [Color; 26] {
+    pub fn color_fields(&self) -> [Color; 27] {
         [
             self.background,
             self.border,
@@ -320,6 +330,7 @@ impl Theme {
             self.unread,
             self.error,
             self.terminal_active,
+            self.subagent_active,
             self.group,
             self.search,
             self.accent,
@@ -547,6 +558,18 @@ mod tests {
             // intentionally unconstrained: themes may tie them.
             cmp("waiting", w, "unread", u);
             cmp("unread", u, "idle", i);
+        }
+    }
+
+    #[test]
+    fn subagent_active_is_distinct_from_running_and_terminal() {
+        // The blue subagent spinner only reads as a separate state if its
+        // color differs from the green main-agent spinner (`running`) and the
+        // bluish `terminal_active` it can replace in the Terminal branch.
+        for name in builtin_theme_names() {
+            let theme = load_theme(name);
+            assert_ne!(theme.subagent_active, theme.running, "{name}");
+            assert_ne!(theme.subagent_active, theme.terminal_active, "{name}");
         }
     }
 }

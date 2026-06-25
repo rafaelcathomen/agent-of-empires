@@ -1127,7 +1127,16 @@ impl HomeView {
                                 && inst.is_unread()
                                 && matches!(inst.status, Status::Idle | Status::Unknown);
                             let color = match inst.status {
-                                Status::Running => theme.running,
+                                Status::Running => {
+                                    // A live Task subagent paints the same
+                                    // spinner in blue; the green running color
+                                    // means the main agent only.
+                                    if inst.subagent_active {
+                                        theme.subagent_active
+                                    } else {
+                                        theme.running
+                                    }
+                                }
                                 Status::Waiting => theme.waiting,
                                 Status::Idle if unread_resting => theme.unread,
                                 Status::Idle => {
@@ -1229,7 +1238,17 @@ impl HomeView {
                             let unread_overlay =
                                 crate::session::unread_enabled() && inst.is_unread();
                             let (mut icon, color) = if terminal_running {
-                                (spinner_running(&inst.created_at), theme.terminal_active)
+                                (
+                                    spinner_running(&inst.created_at),
+                                    // A live Task subagent recolors the active
+                                    // terminal spinner blue; see the Structured
+                                    // branch for the same override.
+                                    if inst.subagent_active {
+                                        theme.subagent_active
+                                    } else {
+                                        theme.terminal_active
+                                    },
+                                )
                             } else if unread_overlay {
                                 (ICON_UNREAD, theme.unread)
                             } else {

@@ -2571,6 +2571,7 @@ impl HomeView {
 
         let new_last_accessed = update.last_accessed_at;
         let new_pane_dead = update.pane_dead;
+        let new_subagent_active = update.subagent_active;
 
         if should_update {
             let new_status = update.status;
@@ -2587,6 +2588,10 @@ impl HomeView {
                     inst.last_accessed_at = new_last_accessed;
                 }
                 inst.pane_dead_observed = new_pane_dead;
+                // Written in all three branches: subagent_active flips while
+                // status stays Running, so wiring it only here would leave the
+                // blue spinner stuck on after a subagent finishes mid-turn.
+                inst.subagent_active = new_subagent_active;
             });
 
             if let Some(old) = old_status {
@@ -2627,6 +2632,7 @@ impl HomeView {
             self.mutate_instance(&update.id, |inst| {
                 inst.last_accessed_at = new_last_accessed;
                 inst.pane_dead_observed = new_pane_dead;
+                inst.subagent_active = new_subagent_active;
             });
         } else {
             // No status change AND no fresh activity stamp. We still
@@ -2635,6 +2641,7 @@ impl HomeView {
             // current reality. Cheap mutate (one bool write).
             self.mutate_instance(&update.id, |inst| {
                 inst.pane_dead_observed = new_pane_dead;
+                inst.subagent_active = new_subagent_active;
             });
         }
     }

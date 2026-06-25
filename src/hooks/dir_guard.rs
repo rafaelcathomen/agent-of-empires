@@ -77,6 +77,7 @@ use std::sync::OnceLock;
 use std::os::fd::AsRawFd;
 
 use anyhow::{anyhow, bail, Context, Result};
+use fs2::FileExt as _;
 use nix::errno::Errno;
 use nix::fcntl::{open, openat, renameat, OFlag};
 use nix::libc;
@@ -505,6 +506,44 @@ pub(crate) fn write_session_id_via_guard(instance_id: &str, session_id: &str) ->
     write_atomic(dir.as_fd(), "session_id", session_id.as_bytes())
 }
 
+/// Atomic read-modify-write of the per-instance `subagent_active` counter.
+///
+/// Uses an exclusive `flock` for the read-modify-write window rather than
+/// `write_atomic`: `write_atomic` is last-writer-wins via rename and would
+/// lose increments when parallel Task subagents spawn at once. The counter
+/// must be a true running total (increment on Task PreToolUse, decrement on
+/// SubagentStop), so concurrent adjusters have to serialize.
+///
+/// Clamps the stored value at `>= 0` so a stray SubagentStop (one missing its
+/// paired PreToolUse) can never drive the count negative. The mtime updated by
+/// this write is the freshness anchor the reader's staleness TTL keys off.
+pub(crate) fn adjust_subagent_counter_via_guard(instance_id: &str, delta: i64) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    validate_hook_leaf("subagent_active")?;
+    let dir = open_instance_dir(instance_id)?;
+    let fd = openat(
+        dir.as_fd(),
+        "subagent_active",
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::S_IRUSR | Mode::S_IWUSR,
+    )
+    .with_context(|| "openat subagent_active".to_string())?;
+    let mut file = std::fs::File::from(fd);
+    file.lock_exclusive()?;
+    let result = (|| -> Result<()> {
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        let cur: i64 = buf.trim().parse().unwrap_or(0);
+        let next = (cur + delta).max(0);
+        file.seek(SeekFrom::Start(0))?;
+        file.set_len(0)?;
+        write!(file, "{next}")?;
+        Ok(())
+    })();
+    let _ = fs2::FileExt::unlock(&file);
+    result
+}
+
 /// Symlink-safe deletion of the `session_id` sidecar via `unlinkat` against
 /// a `dir_guard`-verified per-instance dirfd. Replaces path-based
 /// `std::fs::remove_file(dir.join("session_id"))` so deletion participates
@@ -690,6 +729,9 @@ mod tests {
     use serial_test::serial;
     use std::io::Read;
     use std::os::unix::fs::PermissionsExt;
+    // Only the macOS-gated prefix-symlink test names the type directly; on
+    // other targets the import would be unused and trip the clippy gate.
+    #[cfg(target_os = "macos")]
     use tempfile::TempDir;
 
     #[test]
@@ -1067,6 +1109,60 @@ mod tests {
             })
             .collect();
         assert!(leaked.is_empty(), "tmp files leaked: {leaked:?}");
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn adjust_subagent_counter_increment_decrement_clamp() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let read = |id: &str| -> i64 {
+            std::fs::read_to_string(base.join(id).join("subagent_active"))
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        adjust_subagent_counter_via_guard("counter", 1).unwrap();
+        assert_eq!(read("counter"), 1);
+        adjust_subagent_counter_via_guard("counter", 1).unwrap();
+        assert_eq!(read("counter"), 2);
+        adjust_subagent_counter_via_guard("counter", -1).unwrap();
+        assert_eq!(read("counter"), 1);
+        adjust_subagent_counter_via_guard("counter", -1).unwrap();
+        assert_eq!(read("counter"), 0);
+        // Clamp: an extra decrement at zero stays zero, never negative.
+        adjust_subagent_counter_via_guard("counter", -1).unwrap();
+        assert_eq!(read("counter"), 0);
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn adjust_subagent_counter_parallel_increments_accumulate() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                let b = barrier.clone();
+                // The hook base is a thread-local override in tests, so each
+                // spawned thread must point at the same tempdir base before it
+                // touches the counter (production threads share one process
+                // base, so this only matters for the test harness).
+                let thread_base = base.clone();
+                s.spawn(move || {
+                    override_base_for_test(thread_base);
+                    reset_for_test();
+                    b.wait();
+                    for _ in 0..50 {
+                        adjust_subagent_counter_via_guard("par", 1).unwrap();
+                    }
+                });
+            }
+        });
+        let got: i64 = std::fs::read_to_string(base.join("par").join("subagent_active"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(got, 400, "flock must not lose parallel increments");
     }
 
     #[cfg(target_os = "macos")]

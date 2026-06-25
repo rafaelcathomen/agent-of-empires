@@ -58,6 +58,10 @@ pub struct StatusUpdate {
     /// Attention sort can treat dead panes as tier 99 without re-querying
     /// tmux per sort.
     pub pane_dead: bool,
+    /// Mirrors `Instance.subagent_active` off the polling clone. The poller
+    /// mutates a clone, so a field not projected here is dropped on the floor
+    /// (same rationale as `idle_entered_at`/`last_accessed_at` above).
+    pub subagent_active: bool,
 }
 
 pub(super) struct StatusPollState {
@@ -154,6 +158,7 @@ pub(super) fn poll_statuses_once(
                                 // Sandboxed sessions don't have a tmux pane in the
                                 // usual sense; the Error tier itself sinks the row.
                                 pane_dead: false,
+                                subagent_active: false,
                             });
                         }
                     }
@@ -174,6 +179,7 @@ pub(super) fn poll_statuses_once(
                 idle_entered_at: inst.idle_entered_at,
                 last_accessed_at: inst.last_accessed_at,
                 pane_dead,
+                subagent_active: inst.subagent_active,
             })
         })
         .collect()
@@ -255,6 +261,7 @@ mod tests {
             idle_entered_at: Some(ts),
             last_accessed_at: None,
             pane_dead: false,
+            subagent_active: false,
         };
         assert_eq!(update.idle_entered_at, Some(ts));
     }

@@ -373,6 +373,13 @@ pub struct Instance {
     pub yolo_mode: bool,
     #[serde(default)]
     pub status: Status,
+    /// Hook-driven flag, true while one or more Claude Code Task subagents are
+    /// running for this session. Refreshed from the `subagent_active` counter
+    /// sidecar on every status poll; consumed only by the TUI row spinner
+    /// (blue). Not meaningfully persisted; `#[serde(default)]` keeps old
+    /// session JSON loadable.
+    #[serde(default)]
+    pub subagent_active: bool,
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_accessed_at: Option<DateTime<Utc>>,
@@ -843,6 +850,7 @@ impl Instance {
             detect_as: String::new(),
             yolo_mode: false,
             status: Status::Idle,
+            subagent_active: false,
             created_at: Utc::now(),
             last_accessed_at: None,
             idle_entered_at: None,
@@ -3560,6 +3568,14 @@ impl Instance {
         } else {
             &self.detect_as
         };
+
+        // Mirror the subagent counter sidecar onto the instance for the blue
+        // TUI spinner. Set unconditionally from the sidecar (the renderer gates
+        // on Status::Running); non-claude/non-hook rows have no sidecar so this
+        // reads false. The reader's TTL self-clears a crashed subagent that
+        // never emitted SubagentStop. This runs after the Stopped/archived/acp
+        // early returns above, so frozen rows never flip it.
+        self.subagent_active = crate::hooks::read_hook_subagent_active(&self.id);
 
         if let Some(hook_status) = crate::hooks::read_hook_status(&self.id) {
             tracing::trace!(target: "session.store",

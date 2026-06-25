@@ -19,15 +19,15 @@ use anyhow::{Context, Result};
 use fs2::FileExt as _;
 use serde_json::Value;
 
+pub(crate) use dir_guard::{
+    adjust_subagent_counter_via_guard, ensure_instance_dir_path, hook_base_path,
+    unlink_session_id_via_guard, write_session_id_via_guard,
+};
 #[cfg(test)]
 pub(crate) use dir_guard::{clear_base_override_for_test, override_base_for_test, reset_for_test};
-pub(crate) use dir_guard::{
-    ensure_instance_dir_path, hook_base_path, unlink_session_id_via_guard,
-    write_session_id_via_guard,
-};
 pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
-    read_hook_urgent,
+    read_hook_subagent_active, read_hook_urgent,
 };
 
 /// Single source of truth for the `aoe-hooks` identity token. Defined as a
@@ -386,6 +386,13 @@ pub(crate) fn canonical_session_id_command(target: HookInstallTarget) -> String 
     hook_command_session_id(target)
 }
 
+/// Test-only sibling of [`canonical_status_command`] for the
+/// `subagent_delta` branch, used by migration canonical-shape checkers.
+#[cfg(test)]
+pub(crate) fn canonical_subagent_command(delta: i64, target: HookInstallTarget) -> String {
+    hook_command_subagent(delta, target)
+}
+
 fn hook_command_session_id_host() -> String {
     // Same adopted-session fallback as the status hook (see `hook_command_with_base`):
     // resolve AOE_INSTANCE_ID from the tmux hidden env when the process env
@@ -397,6 +404,26 @@ fn hook_command_session_id_host() -> String {
          command -v aoe >/dev/null 2>&1 || exit 0; \
          aoe __extract-session-id 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
     )
+}
+
+/// Host command for the subagent counter hook. `delta` is baked at install
+/// time: `+1` on PreToolUse (the subcommand re-reads the hook stdin to confirm
+/// `tool_name == "Task"` before counting), `-1` on SubagentStop. Mirrors
+/// [`hook_command_session_id_host`]; ends with the marker so uninstall finds
+/// it.
+fn hook_command_subagent(delta: i64, target: HookInstallTarget) -> String {
+    match target {
+        HookInstallTarget::Host => format!(
+            "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+             command -v aoe >/dev/null 2>&1 || exit 0; \
+             aoe __hook-subagent --delta {delta} 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
+        ),
+        // Sandbox sessions install with the Host target in practice; `aoe` is
+        // absent inside the container, so subagent tracking is intentionally a
+        // no-op for v1. Emit a marker-terminated no-op so uninstall still
+        // recognises the command.
+        HookInstallTarget::Sandbox => format!("sh -c 'exit 0 # {AOE_HOOK_MARKER}'"),
+    }
 }
 
 fn hook_command_session_id_sandbox(base: &str) -> String {
@@ -774,6 +801,9 @@ fn kiro_config_has_aoe_marker(path: &Path) -> bool {
 /// - `event.session_id_capture` → session-id-extractor command (placed
 ///   first so it gets stdin first if the agent only delivers stdin to the
 ///   leading command in a matcher block).
+/// - `event.subagent_delta.is_some()` → subagent counter command (reads
+///   stdin to confirm `tool_name` on the +1 path; placed before the status
+///   writer for the same stdin-first reason).
 /// - `event.status.is_some()` → status-writer command (does not read
 ///   stdin).
 ///
@@ -785,6 +815,12 @@ fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarge
         let mut commands: Vec<String> = Vec::new();
         if event.session_id_capture {
             commands.push(hook_command_session_id(target));
+        }
+        // Subagent counter command precedes the status writer so the
+        // stdin-reading +1 command runs first (same stdin-first rationale as
+        // the session-id extractor above).
+        if let Some(delta) = event.subagent_delta {
+            commands.push(hook_command_subagent(delta, target));
         }
         if let Some(status) = event.status {
             commands.push(hook_command(status, target));
@@ -3137,11 +3173,22 @@ command = "echo user-hook"
             .flat_map(|m| m["hooks"].as_array().unwrap())
             .filter_map(|h| h["command"].as_str().map(|s| s.to_string()))
             .collect();
+        // PreToolUse now installs two AoE commands: the subagent counter (+1)
+        // and the status writer. The reinstall must REPLACE the single legacy
+        // command with exactly those two, not append to it.
         assert_eq!(
             all_cmds.len(),
-            1,
-            "Expected exactly 1 hook after reinstall, got: {:?}",
+            2,
+            "Expected exactly 2 hooks after reinstall, got: {:?}",
             all_cmds
+        );
+        assert!(
+            all_cmds.iter().any(|c| c.contains("__hook-subagent")),
+            "subagent counter command must be present: {all_cmds:?}"
+        );
+        assert!(
+            all_cmds.iter().any(|c| c.contains("$D/status")),
+            "status writer must be present: {all_cmds:?}"
         );
     }
 
@@ -3763,7 +3810,9 @@ hooks_auto_accept: false
     fn test_build_aoe_hooks_status_only_events_unchanged() {
         let events = claude_events();
         let hooks = build_aoe_hooks(events, HookInstallTarget::Sandbox);
-        for event_name in &["PreToolUse", "Stop", "Notification", "ElicitationResult"] {
+        // PreToolUse is no longer status-only: it also carries the subagent
+        // counter command (asserted separately below), so it is excluded here.
+        for event_name in &["Stop", "Notification", "ElicitationResult"] {
             let block = hooks
                 .get(*event_name)
                 .unwrap_or_else(|| panic!("expected {event_name}"))
@@ -3776,6 +3825,33 @@ hooks_auto_accept: false
                 "status-only event {event_name} should emit 1 hook"
             );
         }
+        // PreToolUse emits the subagent counter command (first, stdin-first)
+        // plus the status writer; SubagentStop emits only the counter command.
+        let pre = hooks.get("PreToolUse").unwrap().as_array().unwrap();
+        assert_eq!(
+            pre[0]["hooks"].as_array().unwrap().len(),
+            2,
+            "PreToolUse should emit subagent counter + status writer"
+        );
+        let sub = hooks.get("SubagentStop").unwrap().as_array().unwrap();
+        let sub_entries = sub[0]["hooks"].as_array().unwrap();
+        assert_eq!(
+            sub_entries.len(),
+            1,
+            "SubagentStop should emit only the subagent counter command"
+        );
+        // The decrement delta is baked into the Host command; the Sandbox
+        // variant is an intentional marker-terminated no-op, so check the Host
+        // build for the -1.
+        let host = build_aoe_hooks(events, HookInstallTarget::Host);
+        let host_sub = host.get("SubagentStop").unwrap().as_array().unwrap();
+        assert!(
+            host_sub[0]["hooks"].as_array().unwrap()[0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("__hook-subagent --delta -1"),
+            "SubagentStop must decrement on the Host target"
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ use super::add::AddArgs;
 use super::automation::AutomationCommands;
 use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
+use super::hook_subagent::HookSubagentArgs;
 use super::init::InitArgs;
 use super::killall::KillallArgs;
 use super::list::ListArgs;
@@ -220,6 +221,12 @@ pub enum Commands {
     #[command(name = "__extract-session-id", hide = true)]
     ExtractSessionId(ExtractSessionIdArgs),
 
+    /// Internal: machine-spawned by the Claude Code PreToolUse(Task) and
+    /// SubagentStop hooks to track running Task subagents for the blue TUI
+    /// spinner. Hidden from help.
+    #[command(name = "__hook-subagent", hide = true)]
+    HookSubagent(HookSubagentArgs),
+
     /// Uninstall Agent of Empires
     Uninstall(UninstallArgs),
 
@@ -323,6 +330,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         #[cfg(feature = "serve")]
         Commands::AcpRunner(_) => return None,
         Commands::ExtractSessionId(_) => return None,
+        Commands::HookSubagent(_) => return None,
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",
         Commands::Completion { .. } => "completion",

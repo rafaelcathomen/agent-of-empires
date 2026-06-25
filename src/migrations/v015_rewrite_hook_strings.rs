@@ -287,7 +287,8 @@ mod tests {
     /// criterion #4 (byte-for-byte, not "contains the guard substring").
     fn assert_claude_canonical(claude: &Path) {
         use crate::hooks::{
-            canonical_session_id_command, canonical_status_command, HookInstallTarget,
+            canonical_session_id_command, canonical_status_command, canonical_subagent_command,
+            HookInstallTarget,
         };
         let parsed: Value = serde_json::from_str(&fs::read_to_string(claude).unwrap()).unwrap();
         let hooks = parsed["hooks"].as_object().expect("hooks present");
@@ -324,6 +325,10 @@ mod tests {
                     let mut canonical_set: Vec<String> = Vec::new();
                     if event_def.session_id_capture {
                         canonical_set.push(canonical_session_id_command(HookInstallTarget::Host));
+                    }
+                    if let Some(delta) = event_def.subagent_delta {
+                        canonical_set
+                            .push(canonical_subagent_command(delta, HookInstallTarget::Host));
                     }
                     if let Some(status) = event_def.status {
                         canonical_set
@@ -832,12 +837,18 @@ mod tests {
             &fs::read_to_string(claude_override.join("settings.json")).unwrap(),
         )
         .unwrap();
-        let cmd = parsed["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-            .as_str()
-            .expect("AoE command must be present at the override path");
+        // PreToolUse now carries two AoE commands (subagent counter first,
+        // then the status writer); scan all of them for the rewritten status
+        // writer rather than assuming a fixed index.
+        let cmds: Vec<&str> = parsed["hooks"]["PreToolUse"][0]["hooks"]
+            .as_array()
+            .expect("AoE commands must be present at the override path")
+            .iter()
+            .filter_map(|h| h["command"].as_str())
+            .collect();
         assert!(
-            cmd.contains("case \"$AOE_INSTANCE_ID\""),
-            "profile-overridden Claude path must be reached and rewritten; got: {cmd}"
+            cmds.iter().any(|c| c.contains("case \"$AOE_INSTANCE_ID\"")),
+            "profile-overridden Claude path must be reached and rewritten; got: {cmds:?}"
         );
         assert!(
             !home.join(".claude/settings.json").exists(),

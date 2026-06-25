@@ -57,6 +57,13 @@ pub struct HookEvent {
     /// `session_id` from the agent's stdin JSON payload and writes it to
     /// `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id`.
     pub session_id_capture: bool,
+    /// When `Some(n)`, install an `aoe __hook-subagent --delta n` command on
+    /// this event: `Some(1)` (PreToolUse) increments the per-instance subagent
+    /// counter after the subcommand confirms `tool_name == "Task"`; `Some(-1)`
+    /// (SubagentStop) decrements it. Drives the blue TUI spinner; consumed by
+    /// `crate::hooks` `build_aoe_hooks`. Detection analogue of
+    /// `session_id_capture`.
+    pub subagent_delta: Option<i64>,
 }
 
 /// On-disk format an agent uses for its status-detection hooks. Each variant
@@ -207,36 +214,49 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: None,
         session_id_capture: true,
+        subagent_delta: None,
     },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: Some(1),
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
         session_id_capture: true,
+        subagent_delta: None,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
         session_id_capture: false,
+        subagent_delta: None,
+    },
+    HookEvent {
+        name: "SubagentStop",
+        matcher: None,
+        status: None,
+        session_id_capture: false,
+        subagent_delta: Some(-1),
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
     },
 ];
 
@@ -250,30 +270,35 @@ const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
     },
 ];
 
@@ -287,30 +312,35 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
         session_id_capture: false,
+        subagent_delta: None,
     },
 ];
 
@@ -321,36 +351,42 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: Some("idle"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "PermissionRequest",
         matcher: None,
         status: Some("waiting"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
         session_id_capture: false,
+        subagent_delta: None,
     },
 ];
 
@@ -467,24 +503,28 @@ pub const AGENTS: &[AgentDef] = &[
                     matcher: None,
                     status: Some("running"),
                     session_id_capture: false,
+                    subagent_delta: None,
                 },
                 HookEvent {
                     name: "BeforeAgent",
                     matcher: None,
                     status: Some("running"),
                     session_id_capture: false,
+                    subagent_delta: None,
                 },
                 HookEvent {
                     name: "AfterAgent",
                     matcher: None,
                     status: Some("idle"),
                     session_id_capture: false,
+                    subagent_delta: None,
                 },
                 HookEvent {
                     name: "Notification",
                     matcher: Some("ToolPermission"),
                     status: Some("waiting"),
                     session_id_capture: false,
+                    subagent_delta: None,
                 },
             ],
             format: HookFormat::JsonSettings,

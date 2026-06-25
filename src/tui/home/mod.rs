@@ -355,23 +355,6 @@ pub(super) struct PreviewTimings {
     pub(super) parse: std::time::Duration,
 }
 
-pub(super) const INDENTS: [&str; 10] = [
-    "",
-    " ",
-    "  ",
-    "   ",
-    "    ",
-    "     ",
-    "      ",
-    "       ",
-    "        ",
-    "         ",
-];
-
-pub(super) fn get_indent(depth: usize) -> &'static str {
-    INDENTS.get(depth).copied().unwrap_or(INDENTS[9])
-}
-
 pub(super) const ICON_IDLE: &str = "⠒";
 /// Unread rows swap the muted idle braille dot for a solid filled circle so
 /// the marker reads at a glance (and matches the web sidebar's unread dot).

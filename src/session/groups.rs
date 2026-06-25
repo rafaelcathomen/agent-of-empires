@@ -42,6 +42,78 @@ pub fn archived_project_sub_path(project_name: &str) -> String {
     format!("{}/{}", ARCHIVED_SECTION_PATH, project_name)
 }
 
+/// Fixed 6-color palette for tinting a session group's header and gutter
+/// spine. Snake_case wire values mirror the web `RepoColor`
+/// (web/src/lib/repoAppearance.ts) so groups.json round-trips with a future
+/// web picker. RGB is pinned to tailwind-named hexes, NOT web's overlapping
+/// CSS tokens (web maps violet and teal both to #0d9488 and sky to a gray),
+/// so all six stay visually distinct from each other.
+///
+/// These hexes do overlap some status colors in the default Empire theme:
+/// `Amber` (#fbbf24) equals `waiting`, `Slate` (#94a3b8) equals `sandbox`,
+/// and `Teal` (#14b8a6) is close to `terminal_active` (#0d9488). We keep the
+/// tailwind values rather than dodging every theme's status palette because
+/// the folder color lives in a different row region than the status it could
+/// be confused with: the spine is a 1-cell bar in the far-left gutter and the
+/// tint applies to the bold folder-header label, whereas a waiting spinner is
+/// a glyph mid-row on a session line and the sandbox hue is a bracketed badge.
+/// Distinct column, distinct glyph, so the shared hue does not read as the
+/// same signal. Light themes redefine these status colors anyway (latte's
+/// waiting is orange, sandbox is mauve), so the overlap is Empire-specific.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FolderColor {
+    Amber,
+    Teal,
+    Sky,
+    Violet,
+    Rose,
+    Slate,
+}
+
+impl FolderColor {
+    /// All variants in palette order; mirrors web REPO_COLOR_OPTIONS.
+    pub const ALL: [FolderColor; 6] = [
+        FolderColor::Amber,
+        FolderColor::Teal,
+        FolderColor::Sky,
+        FolderColor::Violet,
+        FolderColor::Rose,
+        FolderColor::Slate,
+    ];
+
+    /// snake_case wire/CLI name (matches groups.json + web RepoColor).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FolderColor::Amber => "amber",
+            FolderColor::Teal => "teal",
+            FolderColor::Sky => "sky",
+            FolderColor::Violet => "violet",
+            FolderColor::Rose => "rose",
+            FolderColor::Slate => "slate",
+        }
+    }
+
+    /// Parse a CLI/wire name; None when unrecognized (CLI maps to an error).
+    pub fn from_str_opt(s: &str) -> Option<FolderColor> {
+        FolderColor::ALL.into_iter().find(|c| c.as_str() == s)
+    }
+
+    /// Fixed RGB for the spine bar and header tint. The render layer wraps
+    /// this in ratatui's Color::Rgb; kept as a raw triple here so the data
+    /// module stays free of a ratatui dependency.
+    pub fn rgb(self) -> (u8, u8, u8) {
+        match self {
+            FolderColor::Amber => (0xfb, 0xbf, 0x24),
+            FolderColor::Teal => (0x14, 0xb8, 0xa6),
+            FolderColor::Sky => (0x38, 0xbd, 0xf8),
+            FolderColor::Violet => (0xa7, 0x8b, 0xfa),
+            FolderColor::Rose => (0xfb, 0x71, 0x85),
+            FolderColor::Slate => (0x94, 0xa3, 0xb8),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Group {
     pub name: String,
@@ -50,6 +122,8 @@ pub struct Group {
     pub collapsed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<FolderColor>,
     #[serde(skip)]
     pub children: Vec<Group>,
 }
@@ -61,6 +135,7 @@ impl Group {
             path: path.to_string(),
             collapsed: false,
             archived_at: None,
+            color: None,
             children: Vec::new(),
         }
     }
@@ -234,6 +309,19 @@ impl GroupTree {
         }
     }
 
+    /// Set or clear a group's color. Returns true when the group existed.
+    pub fn set_color(&mut self, path: &str, color: Option<FolderColor>) -> bool {
+        if let Some(group) = self.groups_by_path.get_mut(path) {
+            if group.color != color {
+                group.color = color;
+                self.rebuild_tree();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Toggle the archived state on the group itself. Returns the new
     /// archived state (true = now archived, false = now unarchived), or
     /// None if the group does not exist. Note: this does NOT cascade to
@@ -345,10 +433,22 @@ pub enum Item {
         /// renderer to apply italic+dim styling. Sort behavior is handled
         /// upstream in `attention_group_key` based on member archive state.
         archived_at: Option<DateTime<Utc>>,
+        /// The group's OWN color (header tint). None = default theme.group.
+        color: Option<FolderColor>,
+        /// Colors of the ancestor folders root..parent, one entry per depth
+        /// level: index L holds the color of the folder at depth L (None if
+        /// that folder is uncolored or archived). Invariant: len() == depth.
+        /// The renderer draws one gutter bar per Some(_) entry at its column.
+        ancestor_colors: Vec<Option<FolderColor>>,
     },
     Session {
         id: String,
         depth: usize,
+        /// Colors of the ancestor folders root..parent, one entry per depth
+        /// level: index L holds the color of the folder at depth L (None if
+        /// that folder is uncolored or archived). Invariant: len() == depth.
+        /// The renderer draws one gutter bar per Some(_) entry at its column.
+        ancestor_colors: Vec<Option<FolderColor>>,
     },
 }
 
@@ -357,6 +457,17 @@ impl Item {
         match self {
             Item::Group { depth, .. } => *depth,
             Item::Session { depth, .. } => *depth,
+        }
+    }
+
+    pub fn ancestor_colors(&self) -> &[Option<FolderColor>] {
+        match self {
+            Item::Group {
+                ancestor_colors, ..
+            } => ancestor_colors,
+            Item::Session {
+                ancestor_colors, ..
+            } => ancestor_colors,
         }
     }
 }
@@ -738,6 +849,7 @@ pub fn flatten_tree_all_profiles(
         items.push(Item::Session {
             id: inst.id.clone(),
             depth: 0,
+            ancestor_colors: Vec::new(),
         });
     }
 
@@ -784,6 +896,7 @@ pub fn flatten_tree_all_profiles(
             0,
             sort_order,
             Some(profile_name),
+            Vec::new(),
         );
     }
 
@@ -808,6 +921,7 @@ pub fn flatten_sessions_by_attention(instances: &[Instance]) -> Vec<Item> {
         .map(|inst| Item::Session {
             id: inst.id.clone(),
             depth: 0,
+            ancestor_colors: Vec::new(),
         })
         .collect()
 }
@@ -833,6 +947,7 @@ pub fn flatten_tree(
         items.push(Item::Session {
             id: inst.id.clone(),
             depth: 0,
+            ancestor_colors: Vec::new(),
         });
     }
 
@@ -849,7 +964,7 @@ pub fn flatten_tree(
     );
 
     for root in roots_to_iterate {
-        flatten_group(root, instances, &mut items, 0, sort_order, None);
+        flatten_group(root, instances, &mut items, 0, sort_order, None, Vec::new());
     }
 
     items
@@ -862,8 +977,27 @@ fn flatten_group(
     depth: usize,
     sort_order: SortOrder,
     profile: Option<&str>,
+    ancestors: Vec<Option<FolderColor>>,
 ) {
     let session_count = count_sessions_in_group(&group.path, instances);
+
+    // The color this folder contributes to its OWN descendants' gutter: its
+    // own color, unless archived. Archived folders render italic+dim with the
+    // header tint dropped, so we drop their bar on descendants too; a
+    // full-saturation bar would read louder than the muted header. Ancestors
+    // still propagate, so an archived mid-tree folder cannot erase a colored
+    // grandparent's bar on the rows below it.
+    let own_for_children = if group.archived_at.is_some() {
+        None
+    } else {
+        group.color
+    };
+
+    // The header sits at `depth`, so its ancestors are exactly `ancestors`
+    // (len == depth). Descendants sit one level deeper and gain this folder's
+    // own contribution at index `depth`.
+    let mut child_ancestors = ancestors.clone();
+    child_ancestors.push(own_for_children);
 
     items.push(Item::Group {
         path: group.path.clone(),
@@ -873,6 +1007,8 @@ fn flatten_group(
         session_count,
         profile: profile.map(|s| s.to_string()),
         archived_at: group.archived_at,
+        color: group.color,
+        ancestor_colors: ancestors,
     });
 
     if group.collapsed {
@@ -893,6 +1029,7 @@ fn flatten_group(
         items.push(Item::Session {
             id: inst.id.clone(),
             depth: depth + 1,
+            ancestor_colors: child_ancestors.clone(),
         });
     }
 
@@ -908,7 +1045,15 @@ fn flatten_group(
     );
 
     for child in children_to_iterate {
-        flatten_group(child, instances, items, depth + 1, sort_order, profile);
+        flatten_group(
+            child,
+            instances,
+            items,
+            depth + 1,
+            sort_order,
+            profile,
+            child_ancestors.clone(),
+        );
     }
 }
 
@@ -944,6 +1089,8 @@ pub fn append_archived_section(items: &mut Vec<Item>, instances: &[Instance], co
         session_count: archived.len(),
         profile: None,
         archived_at: None,
+        color: None,
+        ancestor_colors: Vec::new(),
     });
 
     if collapsed {
@@ -954,6 +1101,8 @@ pub fn append_archived_section(items: &mut Vec<Item>, instances: &[Instance], co
         items.push(Item::Session {
             id: inst.id.clone(),
             depth: 1,
+            // Synthetic Archived parent is uncolored; len must equal depth.
+            ancestor_colors: vec![None],
         });
     }
 }
@@ -1001,6 +1150,8 @@ pub fn append_archived_section_by_project(
         session_count: archived.len(),
         profile: None,
         archived_at: None,
+        color: None,
+        ancestor_colors: Vec::new(),
     });
 
     if section_collapsed {
@@ -1030,6 +1181,9 @@ pub fn append_archived_section_by_project(
             session_count: sessions.len(),
             profile: None,
             archived_at: None,
+            color: None,
+            // Synthetic Archived parent (depth 0) is uncolored; len == depth.
+            ancestor_colors: vec![None],
         });
         if sub_collapsed {
             continue;
@@ -1038,6 +1192,8 @@ pub fn append_archived_section_by_project(
             items.push(Item::Session {
                 id: inst.id.clone(),
                 depth: 2,
+                // Both synthetic Archived ancestors are uncolored; len == depth.
+                ancestor_colors: vec![None, None],
             });
         }
     }
@@ -1329,7 +1485,7 @@ mod tests {
 
         for item in &items {
             match item {
-                Item::Session { id, depth } if !id.is_empty() => {
+                Item::Session { id, depth, .. } if !id.is_empty() => {
                     if *depth == 0 {
                         continue;
                     }
@@ -2378,5 +2534,393 @@ mod tests {
         let inst: Instance = serde_json::from_str(legacy).unwrap();
         assert!(!inst.is_archived());
         assert!(inst.archived_at.is_none());
+    }
+
+    // --- Per-folder color: serde + flatten propagation -------------------
+
+    /// Per-level ancestor color list of a group header row by path.
+    /// Outer Option = row found; inner Vec = colors of folders root..parent.
+    fn group_ancestors(items: &[Item], path: &str) -> Option<Vec<Option<FolderColor>>> {
+        items.iter().find_map(|i| match i {
+            Item::Group {
+                path: p,
+                ancestor_colors,
+                ..
+            } if p == path => Some(ancestor_colors.clone()),
+            _ => None,
+        })
+    }
+
+    /// Look up a group row's OWN color by path.
+    fn group_own(items: &[Item], path: &str) -> Option<Option<FolderColor>> {
+        items.iter().find_map(|i| match i {
+            Item::Group { path: p, color, .. } if p == path => Some(*color),
+            _ => None,
+        })
+    }
+
+    /// Per-level ancestor color lists of all session rows for an instance id.
+    /// (A Vec because a session id can appear once per profile in all-profiles
+    /// composition; single-profile tests assert len 0 or 1.)
+    fn session_ancestors(items: &[Item], id: &str) -> Vec<Vec<Option<FolderColor>>> {
+        items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Session {
+                    id: sid,
+                    ancestor_colors,
+                    ..
+                } if sid == id => Some(ancestor_colors.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_group_color_round_trip() {
+        let mut group = Group::new("work", "work");
+        group.color = Some(FolderColor::Teal);
+        let json = serde_json::to_string(&group).unwrap();
+        assert!(json.contains("\"color\":\"teal\""), "got: {json}");
+
+        let back: Group = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.color, Some(FolderColor::Teal));
+
+        // An uncolored group omits the key entirely (skip_serializing_if).
+        let plain = Group::new("personal", "personal");
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(!plain_json.contains("color"), "got: {plain_json}");
+    }
+
+    #[test]
+    fn test_group_legacy_file_loads_color_none() {
+        let legacy = r#"{"name":"work","path":"work","collapsed":false}"#;
+        let group: Group = serde_json::from_str(legacy).unwrap();
+        assert_eq!(group.color, None);
+    }
+
+    #[test]
+    fn test_folder_color_serde_names() {
+        let expected = [
+            (FolderColor::Amber, "\"amber\""),
+            (FolderColor::Teal, "\"teal\""),
+            (FolderColor::Sky, "\"sky\""),
+            (FolderColor::Violet, "\"violet\""),
+            (FolderColor::Rose, "\"rose\""),
+            (FolderColor::Slate, "\"slate\""),
+        ];
+        for (color, wire) in expected {
+            assert_eq!(serde_json::to_string(&color).unwrap(), wire);
+            let back: FolderColor = serde_json::from_str(wire).unwrap();
+            assert_eq!(back, color);
+        }
+    }
+
+    #[test]
+    fn test_folder_color_from_str_opt() {
+        assert_eq!(FolderColor::from_str_opt("teal"), Some(FolderColor::Teal));
+        assert_eq!(FolderColor::from_str_opt("Teal"), None);
+        assert_eq!(FolderColor::from_str_opt("bogus"), None);
+        for color in FolderColor::ALL {
+            assert_eq!(FolderColor::from_str_opt(color.as_str()), Some(color));
+        }
+    }
+
+    #[test]
+    fn test_set_color_existence_and_clear() {
+        let mut inst = Instance::new("s", "/tmp/s");
+        inst.group_path = "work".to_string();
+        let instances = vec![inst];
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+
+        assert!(tree.set_color("work", Some(FolderColor::Rose)));
+        assert_eq!(
+            tree.get_all_groups()
+                .iter()
+                .find(|g| g.path == "work")
+                .and_then(|g| g.color),
+            Some(FolderColor::Rose)
+        );
+
+        assert!(!tree.set_color("missing", Some(FolderColor::Rose)));
+
+        assert!(tree.set_color("work", None));
+        assert_eq!(
+            tree.get_all_groups()
+                .iter()
+                .find(|g| g.path == "work")
+                .and_then(|g| g.color),
+            None
+        );
+    }
+
+    #[test]
+    fn test_ancestor_colors_per_level() {
+        let mut work = Instance::new("work-s", "/tmp/w");
+        work.group_path = "work".to_string();
+        let mut clients = Instance::new("clients-s", "/tmp/c");
+        clients.group_path = "work/clients".to_string();
+        let mut acme = Instance::new("acme-s", "/tmp/acme");
+        acme.group_path = "work/clients/acme".to_string();
+        // Uncolored sibling subfolder under the colored clients folder.
+        let mut bill_sess = Instance::new("bill-s", "/tmp/bill");
+        bill_sess.group_path = "work/clients/billing".to_string();
+        let instances = vec![
+            work.clone(),
+            clients.clone(),
+            acme.clone(),
+            bill_sess.clone(),
+        ];
+
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+        assert!(tree.set_color("work", Some(FolderColor::Violet)));
+        assert!(tree.set_color("work/clients", Some(FolderColor::Amber)));
+        assert!(tree.set_color("work/clients/acme", Some(FolderColor::Sky)));
+
+        let items = flatten_tree(&tree, &instances, SortOrder::AZ);
+
+        // Each header carries the colors of its ancestors, one per level.
+        assert_eq!(group_ancestors(&items, "work"), Some(vec![]));
+        assert_eq!(
+            group_ancestors(&items, "work/clients"),
+            Some(vec![Some(FolderColor::Violet)])
+        );
+        assert_eq!(
+            group_ancestors(&items, "work/clients/acme"),
+            Some(vec![Some(FolderColor::Violet), Some(FolderColor::Amber)])
+        );
+        assert_eq!(
+            group_ancestors(&items, "work/clients/billing"),
+            Some(vec![Some(FolderColor::Violet), Some(FolderColor::Amber)])
+        );
+
+        // Own colors drive the header tint independently of the ancestor list.
+        assert_eq!(group_own(&items, "work"), Some(Some(FolderColor::Violet)));
+        assert_eq!(
+            group_own(&items, "work/clients/acme"),
+            Some(Some(FolderColor::Sky))
+        );
+        assert_eq!(group_own(&items, "work/clients/billing"), Some(None));
+
+        // The deepest session shows all three ancestor bars.
+        assert_eq!(
+            session_ancestors(&items, &acme.id),
+            vec![vec![
+                Some(FolderColor::Violet),
+                Some(FolderColor::Amber),
+                Some(FolderColor::Sky)
+            ]]
+        );
+        // The uncolored billing folder contributes None at its own level, but
+        // the colored ancestors above it persist.
+        assert_eq!(
+            session_ancestors(&items, &bill_sess.id),
+            vec![vec![
+                Some(FolderColor::Violet),
+                Some(FolderColor::Amber),
+                None
+            ]]
+        );
+    }
+
+    #[test]
+    fn test_ancestor_colors_subfolder_shows_both_levels() {
+        let mut work = Instance::new("work-s", "/tmp/w");
+        work.group_path = "work".to_string();
+        let mut api = Instance::new("api-s", "/tmp/a");
+        api.group_path = "work/api".to_string();
+        let mut v2 = Instance::new("v2-s", "/tmp/v");
+        v2.group_path = "work/api/v2".to_string();
+        let instances = vec![work.clone(), api.clone(), v2.clone()];
+
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+        assert!(tree.set_color("work", Some(FolderColor::Teal)));
+        assert!(tree.set_color("work/api", Some(FolderColor::Rose)));
+
+        let items = flatten_tree(&tree, &instances, SortOrder::AZ);
+
+        // Each level is independent, so a colored subfolder under a colored
+        // parent shows BOTH bars rather than overriding the parent's.
+        assert_eq!(group_ancestors(&items, "work"), Some(vec![]));
+        assert_eq!(
+            group_ancestors(&items, "work/api"),
+            Some(vec![Some(FolderColor::Teal)])
+        );
+        assert_eq!(
+            group_ancestors(&items, "work/api/v2"),
+            Some(vec![Some(FolderColor::Teal), Some(FolderColor::Rose)])
+        );
+        assert_eq!(group_own(&items, "work/api"), Some(Some(FolderColor::Rose)));
+        // v2 is uncolored, so its own level is None while both ancestors show.
+        assert_eq!(
+            session_ancestors(&items, &v2.id),
+            vec![vec![Some(FolderColor::Teal), Some(FolderColor::Rose), None]]
+        );
+    }
+
+    #[test]
+    fn test_spine_color_uncolored_yields_none() {
+        let mut work = Instance::new("work-s", "/tmp/w");
+        work.group_path = "work".to_string();
+        let mut api = Instance::new("api-s", "/tmp/a");
+        api.group_path = "work/api".to_string();
+        let instances = vec![work.clone(), api.clone()];
+
+        let tree = GroupTree::new_with_groups(&instances, &[]);
+        let items = flatten_tree(&tree, &instances, SortOrder::AZ);
+
+        for item in &items {
+            match item {
+                Item::Group {
+                    color,
+                    ancestor_colors,
+                    ..
+                } => {
+                    assert_eq!(*color, None);
+                    assert!(ancestor_colors.iter().all(|c| c.is_none()));
+                }
+                Item::Session {
+                    ancestor_colors, ..
+                } => {
+                    assert!(ancestor_colors.iter().all(|c| c.is_none()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_spine_color_collapsed_subtree() {
+        let mut work = Instance::new("work-s", "/tmp/w");
+        work.group_path = "work".to_string();
+        let mut api = Instance::new("api-s", "/tmp/a");
+        api.group_path = "work/api".to_string();
+        let instances = vec![work.clone(), api.clone()];
+
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+        assert!(tree.set_color("work", Some(FolderColor::Teal)));
+        tree.set_collapsed("work", true);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::AZ);
+
+        assert_eq!(group_ancestors(&items, "work"), Some(vec![]));
+        // No descendant rows are emitted under a collapsed folder.
+        assert_eq!(group_ancestors(&items, "work/api"), None);
+        assert!(session_ancestors(&items, &work.id).is_empty());
+        assert!(session_ancestors(&items, &api.id).is_empty());
+    }
+
+    #[test]
+    fn test_archived_section_no_spine() {
+        let mut inst = Instance::new("shelved", "/tmp/s");
+        inst.archived_at = Some(Utc::now());
+        let instances = vec![inst];
+
+        let mut items = Vec::new();
+        append_archived_section(&mut items, &instances, false);
+
+        for item in &items {
+            match item {
+                Item::Group {
+                    color,
+                    ancestor_colors,
+                    ..
+                } => {
+                    assert_eq!(*color, None);
+                    assert!(ancestor_colors.iter().all(|c| c.is_none()));
+                }
+                Item::Session {
+                    ancestor_colors, ..
+                } => {
+                    assert!(ancestor_colors.iter().all(|c| c.is_none()));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_ancestor_colors_all_profiles_isolation() {
+        let mut work = Instance::new("work-s", "/tmp/w");
+        work.group_path = "work".to_string();
+        work.source_profile = "alpha".to_string();
+        let mut other = Instance::new("other-s", "/tmp/o");
+        other.group_path = "other".to_string();
+        other.source_profile = "beta".to_string();
+        let instances = vec![work.clone(), other.clone()];
+
+        let alpha_insts: Vec<Instance> = vec![work.clone()];
+        let beta_insts: Vec<Instance> = vec![other.clone()];
+        let mut alpha_tree = GroupTree::new_with_groups(&alpha_insts, &[]);
+        assert!(alpha_tree.set_color("work", Some(FolderColor::Sky)));
+        let beta_tree = GroupTree::new_with_groups(&beta_insts, &[]);
+
+        let mut trees = std::collections::HashMap::new();
+        trees.insert("alpha".to_string(), alpha_tree);
+        trees.insert("beta".to_string(), beta_tree);
+
+        let items = flatten_tree_all_profiles(&instances, &trees, SortOrder::AZ);
+
+        // Roots sit at depth 0 (no synthetic profile header), so headers have
+        // empty ancestor lists; the alpha color shows only on alpha rows.
+        assert_eq!(group_ancestors(&items, "work"), Some(vec![]));
+        assert_eq!(
+            session_ancestors(&items, &work.id),
+            vec![vec![Some(FolderColor::Sky)]]
+        );
+        assert_eq!(group_ancestors(&items, "other"), Some(vec![]));
+        assert_eq!(session_ancestors(&items, &other.id), vec![vec![None]]);
+    }
+
+    #[test]
+    fn test_archived_group_suppresses_spine() {
+        // An archived mid-tree folder no longer draws its OWN bar on
+        // descendants (prior-review fix), but colored ancestors above it
+        // still propagate their bars, and a colored descendant keeps its own.
+        let mut sub_sess = Instance::new("sub-s", "/tmp/sub");
+        sub_sess.group_path = "root/mid/sub".to_string();
+        let mut loud_sess = Instance::new("loud-s", "/tmp/loud");
+        loud_sess.group_path = "root/mid/loud".to_string();
+        let instances = vec![sub_sess.clone(), loud_sess.clone()];
+
+        let mut tree = GroupTree::new_with_groups(&instances, &[]);
+        assert!(tree.set_color("root", Some(FolderColor::Violet)));
+        assert!(tree.set_color("root/mid", Some(FolderColor::Teal)));
+        assert!(tree.set_color("root/mid/loud", Some(FolderColor::Rose)));
+        tree.set_archived("root/mid", true);
+
+        let items = flatten_tree(&tree, &instances, SortOrder::AZ);
+
+        // Own color still stored (round-trips, drives the disabled tint).
+        assert_eq!(group_own(&items, "root/mid"), Some(Some(FolderColor::Teal)));
+        // Ancestors of the archived folder persist.
+        assert_eq!(
+            group_ancestors(&items, "root/mid"),
+            Some(vec![Some(FolderColor::Violet)])
+        );
+        // The archived mid folder contributes None at its index for descendants.
+        assert_eq!(
+            group_ancestors(&items, "root/mid/sub"),
+            Some(vec![Some(FolderColor::Violet), None])
+        );
+        assert_eq!(
+            session_ancestors(&items, &sub_sess.id),
+            vec![vec![Some(FolderColor::Violet), None, None]]
+        );
+        // A colored descendant keeps its own bar despite the archived ancestor.
+        assert_eq!(
+            group_ancestors(&items, "root/mid/loud"),
+            Some(vec![Some(FolderColor::Violet), None])
+        );
+        assert_eq!(
+            group_own(&items, "root/mid/loud"),
+            Some(Some(FolderColor::Rose))
+        );
+        assert_eq!(
+            session_ancestors(&items, &loud_sess.id),
+            vec![vec![
+                Some(FolderColor::Violet),
+                None,
+                Some(FolderColor::Rose)
+            ]]
+        );
     }
 }

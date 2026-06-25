@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 
-use crate::session::{GroupTree, Storage};
+use crate::session::{FolderColor, GroupTree, Storage};
 
 #[derive(Subcommand)]
 pub enum GroupCommands {
@@ -20,6 +20,9 @@ pub enum GroupCommands {
 
     /// Move session to group
     Move(GroupMoveArgs),
+
+    /// Set or clear a group's color
+    Color(GroupColorArgs),
 }
 
 #[derive(Args)]
@@ -58,6 +61,20 @@ pub struct GroupMoveArgs {
     group: String,
 }
 
+#[derive(Args)]
+pub struct GroupColorArgs {
+    /// Group path (slash-separated, e.g. "work/frontend")
+    path: String,
+
+    /// Color name: amber, teal, sky, violet, rose, or slate
+    #[arg(required_unless_present = "clear")]
+    color: Option<String>,
+
+    /// Remove the group's color
+    #[arg(long, conflicts_with = "color")]
+    clear: bool,
+}
+
 #[derive(Serialize)]
 struct GroupInfo {
     name: String,
@@ -73,6 +90,7 @@ pub async fn run(profile: &str, command: GroupCommands) -> Result<()> {
         GroupCommands::Create(args) => create_group(profile, args).await,
         GroupCommands::Delete(args) => delete_group(profile, args).await,
         GroupCommands::Move(args) => move_session(profile, args).await,
+        GroupCommands::Color(args) => set_group_color(profile, args).await,
     }
 }
 
@@ -223,4 +241,180 @@ async fn move_session(profile: &str, args: GroupMoveArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn set_group_color(profile: &str, args: GroupColorArgs) -> Result<()> {
+    let storage = Storage::new_unwatched(profile)?;
+    let path = args.path.trim().to_string();
+
+    // Resolve the requested color before touching storage so an invalid
+    // name fails fast without a load/save cycle.
+    let color = if args.clear {
+        None
+    } else {
+        let name = args
+            .color
+            .as_deref()
+            .expect("clap required_unless_present guarantees color without --clear");
+        match FolderColor::from_str_opt(name) {
+            Some(c) => Some(c),
+            None => bail!(
+                "Invalid color '{}'. Valid colors: amber, teal, sky, violet, rose, slate",
+                name
+            ),
+        }
+    };
+
+    storage.update(|instances, groups| {
+        let mut group_tree = GroupTree::new_with_groups(instances, groups);
+        if !group_tree.set_color(&path, color) {
+            bail!("Group not found: {}", path);
+        }
+        *groups = group_tree.get_all_groups();
+        Ok(())
+    })?;
+
+    if args.clear {
+        println!("✓ Cleared color for group: {}", path);
+    } else {
+        println!(
+            "✓ Set group {} color to {}",
+            path,
+            color.expect("color is Some when not clearing").as_str()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+    use tempfile::tempdir;
+
+    fn setup_test_home(temp: &std::path::Path) {
+        std::env::set_var("HOME", temp);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
+    }
+
+    /// Seed a single group via the storage layer so the CLI handler has a
+    /// real groups.json to read back.
+    fn seed_group(profile: &str, path: &str) {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, groups| {
+                let mut tree = GroupTree::new_with_groups(instances, groups);
+                tree.create_group(path);
+                *groups = tree.get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn group_color(profile: &str, path: &str) -> Option<FolderColor> {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let (_, groups) = storage.load_with_groups().unwrap();
+        groups.iter().find(|g| g.path == path).and_then(|g| g.color)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_group_color_set_persists() {
+        let temp = tempdir().unwrap();
+        setup_test_home(temp.path());
+        seed_group("test-color", "work");
+
+        set_group_color(
+            "test-color",
+            GroupColorArgs {
+                path: "work".to_string(),
+                color: Some("teal".to_string()),
+                clear: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(group_color("test-color", "work"), Some(FolderColor::Teal));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_group_color_clear() {
+        let temp = tempdir().unwrap();
+        setup_test_home(temp.path());
+        seed_group("test-color", "work");
+        set_group_color(
+            "test-color",
+            GroupColorArgs {
+                path: "work".to_string(),
+                color: Some("rose".to_string()),
+                clear: false,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(group_color("test-color", "work"), Some(FolderColor::Rose));
+
+        set_group_color(
+            "test-color",
+            GroupColorArgs {
+                path: "work".to_string(),
+                color: None,
+                clear: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(group_color("test-color", "work"), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_group_color_invalid_name() {
+        let temp = tempdir().unwrap();
+        setup_test_home(temp.path());
+        seed_group("test-color", "work");
+
+        let err = set_group_color(
+            "test-color",
+            GroupColorArgs {
+                path: "work".to_string(),
+                color: Some("chartreuse".to_string()),
+                clear: false,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("Invalid color"), "got: {err}");
+        assert!(err.contains("amber"), "error lists valid names: {err}");
+        // Disk is untouched on an invalid color.
+        assert_eq!(group_color("test-color", "work"), None);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_group_color_missing_group() {
+        let temp = tempdir().unwrap();
+        setup_test_home(temp.path());
+        seed_group("test-color", "work");
+
+        let err = set_group_color(
+            "test-color",
+            GroupColorArgs {
+                path: "nope".to_string(),
+                color: Some("teal".to_string()),
+                clear: false,
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("Group not found"), "got: {err}");
+    }
 }

@@ -8534,7 +8534,7 @@ fn archived_section_nests_by_project_in_project_mode() {
     }
     // Then alpha's archived session at depth 2.
     match &tail[1] {
-        Item::Session { id, depth } => {
+        Item::Session { id, depth, .. } => {
             assert_eq!(
                 id, &alpha_id,
                 "alpha sub-folder should contain alpha-running"
@@ -8561,7 +8561,7 @@ fn archived_section_nests_by_project_in_project_mode() {
     }
     // Then beta's archived session at depth 2.
     match &tail[3] {
-        Item::Session { id, depth } => {
+        Item::Session { id, depth, .. } => {
             assert_eq!(id, &beta_id, "beta sub-folder should contain beta-error");
             assert_eq!(*depth, 2);
         }

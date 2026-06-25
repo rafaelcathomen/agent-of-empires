@@ -45,6 +45,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe group create`↴](#aoe-group-create)
 * [`aoe group delete`↴](#aoe-group-delete)
 * [`aoe group move`↴](#aoe-group-move)
+* [`aoe group color`↴](#aoe-group-color)
 * [`aoe plugin`↴](#aoe-plugin)
 * [`aoe plugin list`↴](#aoe-plugin-list)
 * [`aoe plugin info`↴](#aoe-plugin-info)
@@ -703,6 +704,7 @@ Manage groups for organizing sessions
 * `create` — Create a new group
 * `delete` — Delete a group
 * `move` — Move session to group
+* `color` — Set or clear a group's color
 
 
 
@@ -760,6 +762,23 @@ Move session to group
 
 * `<IDENTIFIER>` — Session ID or title
 * `<GROUP>` — Target group
+
+
+
+## `aoe group color`
+
+Set or clear a group's color
+
+**Usage:** `aoe group color [OPTIONS] <PATH> [COLOR]`
+
+###### **Arguments:**
+
+* `<PATH>` — Group path (slash-separated, e.g. "work/frontend")
+* `<COLOR>` — Color name: amber, teal, sky, violet, rose, or slate
+
+###### **Options:**
+
+* `--clear` — Remove the group's color
 
 
 

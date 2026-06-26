@@ -6835,7 +6835,9 @@ fn unarchive_keeps_selection() {
 fn restart_selected_session_noop_with_no_selection() {
     let mut env = create_test_env_empty();
     env.view.selected_session = None;
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     assert!(env.view.restart_cooldown_at.is_empty());
 }
@@ -6851,7 +6853,9 @@ fn restart_selected_session_skips_archived_row() {
     env.view.selected_session = Some(id.clone());
     env.view.mutate_instance(&id, |inst| inst.archive());
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     assert!(
         env.view.instances[0].is_archived(),
@@ -6874,7 +6878,9 @@ fn restart_selected_session_skips_snoozed_row_in_attention_sort() {
     env.view.sort_order = SortOrder::Attention;
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     assert!(
         env.view.instances[0].is_snoozed(),
@@ -6902,7 +6908,9 @@ fn restart_selected_session_wakes_snooze_outside_attention_sort() {
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
     assert!(env.view.instances[0].is_snoozed(), "pre-condition");
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     assert!(
         !env.view.instances[0].is_snoozed(),
@@ -6917,6 +6925,65 @@ fn restart_selected_session_wakes_snooze_outside_attention_sort() {
     );
 }
 
+/// `fresh_start = true` discards the saved conversation (resume target +
+/// failed-sid marker) before relaunching, so a session whose stored
+/// conversation the backend no longer has can recover in place. With
+/// `fresh_start = false` the resume state is left untouched.
+#[test]
+#[serial]
+fn restart_selected_session_fresh_start_clears_resume_target() {
+    use crate::session::ResumeIntent;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.mutate_instance(&id, |inst| {
+        inst.resume_intent = ResumeIntent::Use("dead-sid".to_string());
+        inst.resume_probe_failed_sid = Some("dead-sid".to_string());
+        inst.agent_session_id = Some("dead-sid".to_string());
+        // A crashed session presents a dead pane; fresh-start must still run.
+        inst.pane_dead_observed = true;
+    });
+
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, true);
+    assert!(result.is_ok());
+    assert_eq!(env.view.instances[0].resume_intent, ResumeIntent::Cleared);
+    assert_eq!(env.view.instances[0].resume_probe_failed_sid, None);
+    assert_eq!(env.view.instances[0].agent_session_id, None);
+    // The dead-pane skip was bypassed, so the restart actually proceeded
+    // (records the cooldown) rather than returning early.
+    assert!(env.view.restart_cooldown_at.contains_key(&id));
+}
+
+#[test]
+#[serial]
+fn restart_selected_session_without_fresh_start_keeps_resume_target() {
+    use crate::session::ResumeIntent;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.mutate_instance(&id, |inst| {
+        inst.resume_intent = ResumeIntent::Use("keep-sid".to_string());
+        inst.resume_probe_failed_sid = Some("keep-sid".to_string());
+    });
+
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
+    assert!(result.is_ok());
+    assert_eq!(
+        env.view.instances[0].resume_intent,
+        ResumeIntent::Use("keep-sid".to_string())
+    );
+    assert_eq!(
+        env.view.instances[0].resume_probe_failed_sid,
+        Some("keep-sid".to_string())
+    );
+}
+
 #[test]
 #[serial]
 fn restart_selected_session_skips_creating_row() {
@@ -6926,7 +6993,9 @@ fn restart_selected_session_skips_creating_row() {
     env.view
         .mutate_instance(&id, |inst| inst.status = crate::session::Status::Creating);
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     assert!(env.view.restart_cooldown_at.is_empty());
 }
@@ -6953,7 +7022,9 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     let now = std::time::Instant::now();
     env.view.restart_cooldown_at.insert(id.clone(), now);
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     let stored = env.view.restart_cooldown_at.get(&id).copied().unwrap();
     assert_eq!(
@@ -7009,7 +7080,7 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     view.update_selected();
     view.selected_session = Some(id.clone());
 
-    let result = view.restart_selected_session(None, None, None, None);
+    let result = view.restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
 
     let mut applied = false;
@@ -7153,7 +7224,9 @@ fn restart_selected_session_skips_when_already_in_flight() {
     env.view.selected_session = Some(id.clone());
     env.view.restart_in_flight.insert(id.clone());
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     assert!(
         env.view.restart_cooldown_at.is_empty(),

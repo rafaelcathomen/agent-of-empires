@@ -32,6 +32,10 @@ pub struct RestartData {
     pub extra_args: Option<String>,
     /// New command override (None means keep current).
     pub command_override: Option<String>,
+    /// When true, discard the saved conversation (resume target + failed-sid
+    /// marker) so the session relaunches with a brand-new conversation in
+    /// place, instead of trying to resume the stored one.
+    pub fresh_start: bool,
 }
 
 pub struct RestartDialog {
@@ -46,8 +50,14 @@ pub struct RestartDialog {
     available_tools: Vec<String>,
     profile_index: usize,
     tool_index: usize,
-    /// 0 = profile, 1 = tool.
+    /// 0 = profile, 1 = tool, 2 = start-fresh toggle.
     focused_field: usize,
+    /// Start-fresh toggle: discard the saved conversation and relaunch fresh.
+    /// Defaults on when the session is already in a resume-failed state, so a
+    /// dead-conversation row recovers with a plain Restart -> Enter.
+    fresh_start: bool,
+    /// Hit rect for the start-fresh row so a click can focus/toggle it.
+    fresh_selector_area: Rect,
     /// Editable command override, shown in the tool-config overlay.
     command_override: Input,
     /// Editable extra args, shown in the tool-config overlay.
@@ -96,6 +106,8 @@ impl RestartDialog {
             profile_index,
             tool_index,
             focused_field: 0,
+            fresh_start: false,
+            fresh_selector_area: Rect::default(),
             command_override: Input::new(current_command_override.to_string()),
             extra_args: Input::new(current_extra_args.to_string()),
             tool_config_mode: false,
@@ -105,6 +117,13 @@ impl RestartDialog {
             tool_selector_area: Rect::default(),
             hover: HoverState::default(),
         }
+    }
+
+    /// Pre-set the start-fresh toggle. Callers flip this on when the session is
+    /// already in a resume-failed state so recovery is a plain Restart -> Enter.
+    pub fn with_fresh_start(mut self, on: bool) -> Self {
+        self.fresh_start = on;
+        self
     }
 
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<RestartData>> {
@@ -139,6 +158,11 @@ impl RestartDialog {
                 self.tool_index = (self.tool_index + 1) % self.available_tools.len();
                 self.reload_tool_config();
             }
+            return Some(DialogResult::Continue);
+        }
+        if self.fresh_selector_area.contains(pos) {
+            self.focused_field = 2;
+            self.fresh_start = !self.fresh_start;
             return Some(DialogResult::Continue);
         }
         None
@@ -249,12 +273,14 @@ impl RestartDialog {
         self.command_override = Input::new(config.session.resolve_tool_command(&tool));
     }
 
+    const FIELD_COUNT: usize = 3;
+
     fn next_field(&mut self) {
-        self.focused_field = (self.focused_field + 1) % 2;
+        self.focused_field = (self.focused_field + 1) % Self::FIELD_COUNT;
     }
 
     fn prev_field(&mut self) {
-        self.focused_field = if self.focused_field == 0 { 1 } else { 0 };
+        self.focused_field = (self.focused_field + Self::FIELD_COUNT - 1) % Self::FIELD_COUNT;
     }
 
     fn is_profile_field(&self) -> bool {
@@ -263,6 +289,10 @@ impl RestartDialog {
 
     fn is_tool_field(&self) -> bool {
         self.focused_field == 1
+    }
+
+    fn is_fresh_field(&self) -> bool {
+        self.focused_field == 2
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<RestartData> {
@@ -321,6 +351,7 @@ impl RestartDialog {
                     tool,
                     extra_args,
                     command_override,
+                    fresh_start: self.fresh_start,
                 })
             }
             KeyCode::Tab => {
@@ -379,6 +410,10 @@ impl RestartDialog {
                 self.reload_tool_config();
                 DialogResult::Continue
             }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if self.is_fresh_field() => {
+                self.fresh_start = !self.fresh_start;
+                DialogResult::Continue
+            }
             _ => DialogResult::Continue,
         }
     }
@@ -402,7 +437,7 @@ impl RestartDialog {
     pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         // Wide enough that the Tool row's "(configured)  Ctrl+P: edit" suffix
         // isn't clipped (the cycler + suffix run past the old 54-col width).
-        let dialog_area = super::centered_rect(area, 64, 14);
+        let dialog_area = super::centered_rect(area, 64, 15);
         frame.render_widget(Clear, dialog_area);
 
         let block = Block::default()
@@ -425,6 +460,7 @@ impl RestartDialog {
                 Constraint::Length(1), // Spacer
                 Constraint::Length(1), // Profile selector
                 Constraint::Length(1), // Tool selector
+                Constraint::Length(1), // Start-fresh toggle
                 Constraint::Length(1), // Spacer
                 Constraint::Min(1),    // Hint
             ])
@@ -452,7 +488,9 @@ impl RestartDialog {
         self.profile_selector_area = chunks[4];
         self.render_tool_selector(frame, chunks[5], theme);
         self.tool_selector_area = chunks[5];
-        self.render_hints(frame, chunks[7], theme);
+        self.render_fresh_toggle(frame, chunks[6], theme);
+        self.fresh_selector_area = chunks[6];
+        self.render_hints(frame, chunks[8], theme);
 
         if let Some(rect) = self
             .hover
@@ -524,6 +562,35 @@ impl RestartDialog {
             theme,
         ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// Start-fresh toggle row. When on, the restart discards the saved
+    /// conversation so a session with a dead/missing conversation can recover
+    /// in place instead of forcing a delete + recreate.
+    fn render_fresh_toggle(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let focused = self.is_fresh_field();
+        let label_style = if focused {
+            Style::default().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.dimmed)
+        };
+        let checkbox = if self.fresh_start { "[x]" } else { "[ ]" };
+        let check_style = if focused {
+            Style::default().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Start fresh: ", label_style),
+                Span::styled(format!("{checkbox} "), check_style),
+                Span::styled(
+                    "new conversation (discard saved)",
+                    Style::default().fg(theme.dimmed),
+                ),
+            ])),
+            area,
+        );
     }
 
     fn render_hints(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -651,6 +718,8 @@ mod tests {
         d.handle_key(key(KeyCode::Tab));
         assert_eq!(d.focused_field, 1);
         d.handle_key(key(KeyCode::Tab));
+        assert_eq!(d.focused_field, 2); // start-fresh toggle
+        d.handle_key(key(KeyCode::Tab));
         assert_eq!(d.focused_field, 0);
     }
 
@@ -658,9 +727,34 @@ mod tests {
     fn test_shift_tab_cycles_focus_backwards() {
         let mut d = dialog("default", "claude");
         d.handle_key(shift_key(KeyCode::Tab));
+        assert_eq!(d.focused_field, 2); // wraps back to start-fresh toggle
+        d.handle_key(shift_key(KeyCode::Tab));
         assert_eq!(d.focused_field, 1);
         d.handle_key(shift_key(KeyCode::Tab));
         assert_eq!(d.focused_field, 0);
+    }
+
+    #[test]
+    fn fresh_start_defaults_off_toggles_and_submits() {
+        let mut d = dialog("default", "claude");
+        assert!(!d.fresh_start);
+        // Tab to the start-fresh field and toggle it on with Space.
+        d.handle_key(key(KeyCode::Tab));
+        d.handle_key(key(KeyCode::Tab));
+        assert!(d.is_fresh_field());
+        d.handle_key(key(KeyCode::Char(' ')));
+        assert!(d.fresh_start);
+        // Enter carries the flag through to the submitted data.
+        match d.handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(data) => assert!(data.fresh_start),
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
+    fn with_fresh_start_preselects_toggle() {
+        let d = dialog("default", "claude").with_fresh_start(true);
+        assert!(d.fresh_start);
     }
 
     #[test]

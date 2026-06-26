@@ -367,6 +367,7 @@ impl HomeView {
         new_tool: Option<&str>,
         new_extra_args: Option<&str>,
         new_command_override: Option<&str>,
+        fresh_start: bool,
     ) -> anyhow::Result<()> {
         let id = match &self.selected_session {
             Some(id) => id.clone(),
@@ -389,10 +390,15 @@ impl HomeView {
         let (skip, wake_snooze) = match self.get_instance(&id) {
             Some(inst) => {
                 let snoozed = inst.is_snoozed();
+                // A dead pane is normally treated as a sunk row and skipped, but
+                // a fresh-start is an explicit "revive this crashed session"
+                // gesture, so it must punch through that guard (otherwise the
+                // restart returns before the resume-clearing below ever runs,
+                // and the row stays stuck resuming its dead conversation).
                 let skip = matches!(inst.status, Status::Creating | Status::Deleting)
                     || inst.is_archived()
                     || (snoozed && in_attention)
-                    || inst.pane_dead_observed;
+                    || (inst.pane_dead_observed && !fresh_start);
                 let wake_snooze = snoozed && !in_attention;
                 (skip, wake_snooze)
             }
@@ -419,6 +425,35 @@ impl HomeView {
         // clear snooze without restarting.
         if wake_snooze {
             self.mutate_instance(&id, |inst| inst.unsnooze());
+        }
+
+        // Start-fresh: discard the saved conversation so the relaunch begins a
+        // brand-new one in place. Mirrors `aoe session set-session-id <id> ""`
+        // (ResumeIntent::Cleared + drop the failed-sid loop-breaker). This is
+        // the escape hatch for a session whose stored conversation the agent
+        // backend no longer has ("No conversation found with session ID ..."),
+        // which the resume cascade otherwise preserves and retries forever.
+        if fresh_start {
+            self.mutate_instance(&id, |inst| {
+                inst.resume_intent = crate::session::ResumeIntent::Cleared;
+                inst.resume_probe_failed_sid = None;
+                // Drop the stale conversation pointers outright too, not just
+                // the intent: the recovery/status pollers resume off
+                // `agent_session_id` (and structured sessions off
+                // `acp_session_id`), so leaving the dead id on disk lets the
+                // crash-loop keep resuming it before our Cleared launch lands.
+                // Stash the dead sid in the retroactive-capture exclusion set so
+                // a re-scan of the crashing pane can't grab it back and re-pin
+                // the very conversation we're discarding.
+                if let Some(dead) = inst.agent_session_id.take() {
+                    inst.retroactive_capture_excludes.insert(dead);
+                }
+                inst.pane_dead_observed = false;
+                #[cfg(feature = "serve")]
+                {
+                    inst.acp_session_id = None;
+                }
+            });
         }
 
         // Apply tool swap before restart so the new binary starts on the

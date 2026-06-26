@@ -78,42 +78,64 @@ pub fn resolve_group_path(input: &str, existing: &[String]) -> String {
     trimmed.to_string()
 }
 
-/// Fixed 6-color palette for tinting a session group's header and gutter
-/// spine. Snake_case wire values mirror the web `RepoColor`
-/// (web/src/lib/repoAppearance.ts) so groups.json round-trips with a future
-/// web picker. RGB is pinned to tailwind-named hexes, NOT web's overlapping
-/// CSS tokens (web maps violet and teal both to #0d9488 and sky to a gray),
-/// so all six stay visually distinct from each other.
+/// Palette for tinting a session group's header and gutter spine. A 16-color
+/// wheel (red -> orange -> ... -> rose -> slate) so a folder can carry a
+/// distinct hue. Snake_case wire values mirror the web `RepoColor`
+/// (web/src/lib/repoAppearance.ts) so groups.json round-trips with the web
+/// picker. RGB is pinned to tailwind hexes (mostly the -400 step) so every
+/// entry stays visually distinct from its neighbours.
 ///
-/// These hexes do overlap some status colors in the default Empire theme:
-/// `Amber` (#fbbf24) equals `waiting`, `Slate` (#94a3b8) equals `sandbox`,
-/// and `Teal` (#14b8a6) is close to `terminal_active` (#0d9488). We keep the
-/// tailwind values rather than dodging every theme's status palette because
-/// the folder color lives in a different row region than the status it could
-/// be confused with: the spine is a 1-cell bar in the far-left gutter and the
-/// tint applies to the bold folder-header label, whereas a waiting spinner is
-/// a glyph mid-row on a session line and the sandbox hue is a bracketed badge.
-/// Distinct column, distinct glyph, so the shared hue does not read as the
-/// same signal. Light themes redefine these status colors anyway (latte's
-/// waiting is orange, sandbox is mauve), so the overlap is Empire-specific.
+/// Hues are deliberately offset from the theme's *status* colors so a folder
+/// tint does not read as a live signal. In the default zinc theme `running`
+/// is grass-green #22c55e, `subagent_active` is blue #3b82f6, and `error` is
+/// red #ef4444 — so the palette uses softer offsets (red-400 #f87171,
+/// blue-400 #60a5fa) and skips a pure grass-green entirely, leaning on
+/// `emerald`/`lime` for the green family. `Amber` (#fbbf24 = `waiting`) and
+/// `Slate` (#94a3b8 = `sandbox`) intentionally still match their status hue;
+/// that overlap is tolerable because the folder color lives in a different
+/// row region than the status it could be confused with: the spine is a
+/// 1-cell bar in the far-left gutter and the tint applies to the bold
+/// folder-header label, whereas a waiting spinner is a glyph mid-row on a
+/// session line and the sandbox hue is a bracketed badge. Distinct column,
+/// distinct glyph, so the shared hue does not read as the same signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FolderColor {
+    Red,
+    Orange,
     Amber,
+    Yellow,
+    Lime,
+    Emerald,
     Teal,
+    Cyan,
     Sky,
+    Blue,
+    Indigo,
     Violet,
+    Fuchsia,
+    Pink,
     Rose,
     Slate,
 }
 
 impl FolderColor {
-    /// All variants in palette order; mirrors web REPO_COLOR_OPTIONS.
-    pub const ALL: [FolderColor; 6] = [
+    /// All variants in palette (cycle) order; mirrors web REPO_COLOR_OPTIONS.
+    pub const ALL: [FolderColor; 16] = [
+        FolderColor::Red,
+        FolderColor::Orange,
         FolderColor::Amber,
+        FolderColor::Yellow,
+        FolderColor::Lime,
+        FolderColor::Emerald,
         FolderColor::Teal,
+        FolderColor::Cyan,
         FolderColor::Sky,
+        FolderColor::Blue,
+        FolderColor::Indigo,
         FolderColor::Violet,
+        FolderColor::Fuchsia,
+        FolderColor::Pink,
         FolderColor::Rose,
         FolderColor::Slate,
     ];
@@ -121,10 +143,20 @@ impl FolderColor {
     /// snake_case wire/CLI name (matches groups.json + web RepoColor).
     pub fn as_str(self) -> &'static str {
         match self {
+            FolderColor::Red => "red",
+            FolderColor::Orange => "orange",
             FolderColor::Amber => "amber",
+            FolderColor::Yellow => "yellow",
+            FolderColor::Lime => "lime",
+            FolderColor::Emerald => "emerald",
             FolderColor::Teal => "teal",
+            FolderColor::Cyan => "cyan",
             FolderColor::Sky => "sky",
+            FolderColor::Blue => "blue",
+            FolderColor::Indigo => "indigo",
             FolderColor::Violet => "violet",
+            FolderColor::Fuchsia => "fuchsia",
+            FolderColor::Pink => "pink",
             FolderColor::Rose => "rose",
             FolderColor::Slate => "slate",
         }
@@ -140,10 +172,20 @@ impl FolderColor {
     /// module stays free of a ratatui dependency.
     pub fn rgb(self) -> (u8, u8, u8) {
         match self {
+            FolderColor::Red => (0xf8, 0x71, 0x71),
+            FolderColor::Orange => (0xfb, 0x92, 0x3c),
             FolderColor::Amber => (0xfb, 0xbf, 0x24),
+            FolderColor::Yellow => (0xfa, 0xcc, 0x15),
+            FolderColor::Lime => (0xa3, 0xe6, 0x35),
+            FolderColor::Emerald => (0x34, 0xd3, 0x99),
             FolderColor::Teal => (0x14, 0xb8, 0xa6),
+            FolderColor::Cyan => (0x22, 0xd3, 0xee),
             FolderColor::Sky => (0x38, 0xbd, 0xf8),
+            FolderColor::Blue => (0x60, 0xa5, 0xfa),
+            FolderColor::Indigo => (0x81, 0x8c, 0xf8),
             FolderColor::Violet => (0xa7, 0x8b, 0xfa),
+            FolderColor::Fuchsia => (0xe8, 0x79, 0xf9),
+            FolderColor::Pink => (0xf4, 0x72, 0xb6),
             FolderColor::Rose => (0xfb, 0x71, 0x85),
             FolderColor::Slate => (0x94, 0xa3, 0xb8),
         }
@@ -2638,10 +2680,20 @@ mod tests {
     #[test]
     fn test_folder_color_serde_names() {
         let expected = [
+            (FolderColor::Red, "\"red\""),
+            (FolderColor::Orange, "\"orange\""),
             (FolderColor::Amber, "\"amber\""),
+            (FolderColor::Yellow, "\"yellow\""),
+            (FolderColor::Lime, "\"lime\""),
+            (FolderColor::Emerald, "\"emerald\""),
             (FolderColor::Teal, "\"teal\""),
+            (FolderColor::Cyan, "\"cyan\""),
             (FolderColor::Sky, "\"sky\""),
+            (FolderColor::Blue, "\"blue\""),
+            (FolderColor::Indigo, "\"indigo\""),
             (FolderColor::Violet, "\"violet\""),
+            (FolderColor::Fuchsia, "\"fuchsia\""),
+            (FolderColor::Pink, "\"pink\""),
             (FolderColor::Rose, "\"rose\""),
             (FolderColor::Slate, "\"slate\""),
         ];

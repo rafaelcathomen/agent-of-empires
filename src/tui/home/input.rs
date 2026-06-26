@@ -2094,9 +2094,13 @@ impl HomeView {
                     let tool = data.tool.as_deref();
                     let extra_args = data.extra_args.as_deref();
                     let command_override = data.command_override.as_deref();
-                    if let Err(e) =
-                        self.restart_selected_session(profile, tool, extra_args, command_override)
-                    {
+                    if let Err(e) = self.restart_selected_session(
+                        profile,
+                        tool,
+                        extra_args,
+                        command_override,
+                        data.fresh_start,
+                    ) {
                         // Surface the restart error to the user via the
                         // InfoDialog rather than only the debug log; the
                         // user explicitly initiated this action and needs
@@ -4678,17 +4682,25 @@ impl HomeView {
         let current_tool = inst.tool.clone();
         let current_command = inst.command.clone();
         let current_extra_args = inst.extra_args.clone();
+        // Pre-arm "start fresh" when this session is already in a resume-failed
+        // state (its stored conversation could not be resumed). The user then
+        // just hits Enter to recover with a new conversation in place; a normal
+        // healthy row still defaults the toggle off.
+        let resume_failed = inst.resume_probe_failed_sid.is_some();
         let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
         let tools: Vec<String> = self.available_tools.available_list().to_vec();
-        self.restart_dialog = Some(RestartDialog::new(
-            &current_title,
-            &current_profile,
-            &current_tool,
-            &current_command,
-            &current_extra_args,
-            profiles,
-            tools,
-        ));
+        self.restart_dialog = Some(
+            RestartDialog::new(
+                &current_title,
+                &current_profile,
+                &current_tool,
+                &current_command,
+                &current_extra_args,
+                profiles,
+                tools,
+            )
+            .with_fresh_start(resume_failed),
+        );
     }
 
     /// Attempt to enter live-send mode against the currently-selected

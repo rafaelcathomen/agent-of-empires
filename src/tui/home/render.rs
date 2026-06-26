@@ -449,15 +449,14 @@ fn folder_color_fg(color: Option<FolderColor>, theme: &Theme) -> Color {
     }
 }
 
-/// Color for the right-aligned activity/time text. Encodes the locked
-/// precedence: a manual per-session color wins; otherwise the heat ratio (when
-/// the session has an engaged heat level) drives the continuous hot->cold ramp;
+/// Color for the right-aligned activity/time text. The time column belongs to
+/// heat alone: an engaged heat ratio drives the continuous hot->cold ramp,
 /// otherwise the neutral `theme.dimmed` (today's look). `heat` is `Some(ratio)`
-/// only for an engaged `HeatLevel::Ramp`, `None` for `Neutral`.
-fn activity_text_color(manual: Option<FolderColor>, heat: Option<f32>, theme: &Theme) -> Color {
-    if manual.is_some() {
-        return folder_color_fg(manual, theme);
-    }
+/// only for an engaged `HeatLevel::Ramp`, `None` for `Neutral`. The manual
+/// per-session color is no longer consulted here — it tints the session *name*
+/// instead (see the title-span render), so name and time carry independent
+/// signals.
+fn activity_text_color(heat: Option<f32>, theme: &Theme) -> Color {
     match heat {
         Some(ratio) => theme.heat_color_at_ratio(ratio),
         None => theme.dimmed,
@@ -1397,12 +1396,26 @@ impl HomeView {
             style
         };
         line_spans.push(Span::styled(format!("{} ", icon), icon_style));
+        // The session NAME carries the manual per-session color when one is set
+        // (the heat ramp owns the time column instead, so the two signals stay
+        // independent). Only the foreground is retinted; the status-derived
+        // modifiers (bold/blink/dim for urgent/snooze/archived) are preserved,
+        // and the icon keeps its status color. Group headers and other items
+        // are unaffected.
+        let title_style = if let Item::Session { id, .. } = item {
+            match self.get_instance(id).and_then(|inst| inst.manual_color) {
+                Some(c) => style.fg(folder_color_fg(Some(c), theme)),
+                None => style,
+            }
+        } else {
+            style
+        };
         line_spans.push(Span::styled(
             text.into_owned(),
             if is_selected {
-                selected_row_style(style, theme)
+                selected_row_style(title_style, theme)
             } else {
-                style
+                title_style
             },
         ));
 
@@ -1528,16 +1541,14 @@ impl HomeView {
                         format_relative_age(age_ts)
                     };
                     let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
-                    // Precedence: manual session color > heat ramp > dimmed.
+                    // The time column is heat-only (ramp when engaged, else
+                    // dimmed); the manual session color tints the name instead.
                     let row_heat_ratio = match inst.heat_level {
                         crate::hooks::heat::HeatLevel::Ramp(r) => Some(r),
                         crate::hooks::heat::HeatLevel::Neutral => None,
                     };
-                    let activity_style = Style::default().fg(activity_text_color(
-                        inst.manual_color,
-                        row_heat_ratio,
-                        theme,
-                    ));
+                    let activity_style =
+                        Style::default().fg(activity_text_color(row_heat_ratio, theme));
                     line_spans.push(Span::styled(
                         padded,
                         if is_selected {
@@ -3387,22 +3398,16 @@ mod tests {
     }
 
     #[test]
-    fn activity_text_color_manual_wins_over_heat() {
+    fn activity_text_color_uses_heat_ramp() {
         let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        // Manual color set: paints the folder color regardless of heat.
-        let got = activity_text_color(Some(FolderColor::Teal), Some(1.0), &theme);
-        assert_eq!(got, folder_color_fg(Some(FolderColor::Teal), &theme));
-    }
-
-    #[test]
-    fn activity_text_color_heat_when_no_manual() {
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        // The time column tracks the heat ratio across the ramp; the manual
+        // session color no longer participates (it tints the name instead).
         assert_eq!(
-            activity_text_color(None, Some(1.0), &theme),
+            activity_text_color(Some(1.0), &theme),
             theme.heat_color_at_ratio(1.0)
         );
         assert_eq!(
-            activity_text_color(None, Some(0.0), &theme),
+            activity_text_color(Some(0.0), &theme),
             theme.heat_color_at_ratio(0.0)
         );
     }
@@ -3410,7 +3415,7 @@ mod tests {
     #[test]
     fn activity_text_color_dimmed_when_neutral() {
         let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        assert_eq!(activity_text_color(None, None, &theme), theme.dimmed);
+        assert_eq!(activity_text_color(None, &theme), theme.dimmed);
     }
 
     #[test]

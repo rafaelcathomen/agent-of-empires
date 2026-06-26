@@ -80,12 +80,18 @@ pub struct RenameDialog {
     /// Current group spine color (Group mode) and its original.
     group_color: Option<FolderColor>,
     orig_group_color: Option<FolderColor>,
-    /// Whether the inline color picker overlay is open, and which swatch is
-    /// highlighted (`0..FolderColor::ALL.len()` select a color; the final index
-    /// is the "none" / clear option).
+    /// Grid color picker: whether the 4x4 swatch popup is open, and the flat
+    /// index (`0..FolderColor::ALL.len()`) of the highlighted swatch.
     color_picker_open: bool,
     color_picker_index: usize,
+    /// Per-swatch hit rects, refreshed each time the grid renders, so a mouse
+    /// click can map back to a palette index.
+    color_swatch_rects: Vec<(usize, Rect)>,
 }
+
+/// Columns in the swatch grid popup. The palette is exactly 16 entries, so a
+/// 4x4 grid wraps cleanly as a torus in both axes (see the arrow handling).
+const COLOR_GRID_COLS: usize = 4;
 
 /// Branch context for a tied worktree session's rename toggle.
 struct WorktreeBranch {
@@ -138,6 +144,7 @@ impl RenameDialog {
             orig_group_color: None,
             color_picker_open: false,
             color_picker_index: 0,
+            color_swatch_rects: Vec::new(),
         }
     }
 
@@ -224,6 +231,7 @@ impl RenameDialog {
             orig_group_color: None,
             color_picker_open: false,
             color_picker_index: 0,
+            color_swatch_rects: Vec::new(),
         }
     }
 
@@ -274,46 +282,95 @@ impl RenameDialog {
         }
     }
 
-    /// Number of swatches in the color picker overlay: the palette plus a
-    /// trailing "none" / clear slot.
-    fn color_picker_slot_count(&self) -> usize {
-        FolderColor::ALL.len() + 1
-    }
-
-    /// Apply the currently highlighted color-picker slot to the right target
-    /// (manual session color in Session mode, group spine color in Group mode).
-    /// The last slot clears the color.
-    fn commit_color_picker(&mut self) {
-        let chosen = if self.color_picker_index >= FolderColor::ALL.len() {
-            None
-        } else {
-            Some(FolderColor::ALL[self.color_picker_index])
-        };
-        match self.mode {
-            RenameMode::Session => self.manual_color = chosen,
-            RenameMode::Group => self.group_color = chosen,
-        }
-        self.color_picker_open = false;
-    }
-
-    /// Open the color picker, preselecting the swatch matching the current
-    /// color (or the "none" slot when unset).
-    fn open_color_picker(&mut self) {
+    /// Cycle the color field in place through the palette plus a trailing
+    /// "none" slot, like the profile selector. Shared between Session (manual
+    /// session color) and Group (spine color) modes. `forward` advances toward
+    /// the next palette entry; wrapping passes through the "none" slot.
+    fn cycle_color(&mut self, forward: bool) {
         let current = match self.mode {
             RenameMode::Session => self.manual_color,
             RenameMode::Group => self.group_color,
         };
-        self.color_picker_index = current
+        let n = FolderColor::ALL.len();
+        // Slot space: 0..n select a palette color, n is "none".
+        let cur = current
             .and_then(|c| FolderColor::ALL.iter().position(|x| *x == c))
-            .unwrap_or(FolderColor::ALL.len());
+            .unwrap_or(n);
+        let slots = n + 1;
+        let next = if forward {
+            (cur + 1) % slots
+        } else {
+            (cur + slots - 1) % slots
+        };
+        let chosen = (next < n).then(|| FolderColor::ALL[next]);
+        match self.mode {
+            RenameMode::Session => self.manual_color = chosen,
+            RenameMode::Group => self.group_color = chosen,
+        }
+    }
+
+    fn current_color(&self) -> Option<FolderColor> {
+        match self.mode {
+            RenameMode::Session => self.manual_color,
+            RenameMode::Group => self.group_color,
+        }
+    }
+
+    fn set_color(&mut self, chosen: Option<FolderColor>) {
+        match self.mode {
+            RenameMode::Session => self.manual_color = chosen,
+            RenameMode::Group => self.group_color = chosen,
+        }
+    }
+
+    /// Open the 4x4 swatch grid, preselecting the swatch matching the current
+    /// color (or the first swatch when unset).
+    fn open_color_picker(&mut self) {
+        self.color_picker_index = self
+            .current_color()
+            .and_then(|c| FolderColor::ALL.iter().position(|x| *x == c))
+            .unwrap_or(0);
         self.color_picker_open = true;
     }
 
+    /// Apply the highlighted swatch and close the grid.
+    fn commit_color_picker(&mut self) {
+        let chosen = FolderColor::ALL.get(self.color_picker_index).copied();
+        if chosen.is_some() {
+            self.set_color(chosen);
+        }
+        self.color_picker_open = false;
+    }
+
+    /// Move the grid highlight. The palette is a 4x4 torus: left/right step by
+    /// one with wrap, up/down step by a row (`COLOR_GRID_COLS`) with wrap.
+    fn move_color_picker(&mut self, dx: i32, dy: i32) {
+        let n = FolderColor::ALL.len() as i32;
+        let cols = COLOR_GRID_COLS as i32;
+        let mut i = self.color_picker_index as i32;
+        if dx != 0 {
+            i = (i + dx).rem_euclid(n);
+        }
+        if dy != 0 {
+            i = (i + dy * cols).rem_euclid(n);
+        }
+        self.color_picker_index = i as usize;
+    }
+
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<RenameData>> {
-        // Color picker overlay swallows clicks while open (its swatches are
-        // keyboard-driven); a click anywhere just keeps the dialog up rather
-        // than leaking through to the fields beneath.
+        // Color grid popup is modal: a click on a swatch picks it; a click
+        // anywhere else is swallowed so it neither dismisses the dialog nor
+        // leaks to the fields beneath.
         if self.color_picker_open {
+            let pos = ratatui::layout::Position::from((col, row));
+            if let Some((idx, _)) = self
+                .color_swatch_rects
+                .iter()
+                .find(|(_, rect)| rect.contains(pos))
+            {
+                self.color_picker_index = *idx;
+                self.commit_color_picker();
+            }
             return Some(DialogResult::Continue);
         }
         // Group picker overlay wins when active so a click can pick a
@@ -438,23 +495,22 @@ impl RenameDialog {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<RenameData> {
-        // Color picker overlay wins over everything else while open so its
-        // arrows/Enter/Esc do not leak into the field navigation below.
+        // Color grid popup is modal: while open it owns all keys so its arrows
+        // and Enter don't leak into field navigation underneath.
         if self.color_picker_open {
-            let slots = self.color_picker_slot_count();
             match key.code {
                 KeyCode::Esc => self.color_picker_open = false,
-                KeyCode::Left => {
-                    self.color_picker_index = if self.color_picker_index == 0 {
-                        slots - 1
-                    } else {
-                        self.color_picker_index - 1
-                    };
-                }
-                KeyCode::Right => {
-                    self.color_picker_index = (self.color_picker_index + 1) % slots;
-                }
+                KeyCode::Left | KeyCode::Char('h') => self.move_color_picker(-1, 0),
+                KeyCode::Right | KeyCode::Char('l') => self.move_color_picker(1, 0),
+                KeyCode::Up | KeyCode::Char('k') => self.move_color_picker(0, -1),
+                KeyCode::Down | KeyCode::Char('j') => self.move_color_picker(0, 1),
                 KeyCode::Enter | KeyCode::Char(' ') => self.commit_color_picker(),
+                // Clear the color outright without leaving the grid hunting for
+                // a non-existent "none" cell.
+                KeyCode::Backspace | KeyCode::Delete | KeyCode::Char('n') => {
+                    self.set_color(None);
+                    self.color_picker_open = false;
+                }
                 _ => {}
             }
             return DialogResult::Continue;
@@ -480,15 +536,27 @@ impl RenameDialog {
             return DialogResult::Continue;
         }
 
-        // Color field: Enter/Space/Right open the color picker overlay.
-        if self.is_color_field()
-            && matches!(
-                key.code,
-                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right
-            )
-        {
-            self.open_color_picker();
-            return DialogResult::Continue;
+        // Color field: Left/Right nudge the palette inline (quick one-step
+        // tweak, shown live in the row's own color); Space opens the 4x4 grid
+        // to browse the whole palette at once. Enter is deliberately NOT bound
+        // here so it keeps its dialog-wide "confirm/submit" meaning (opening the
+        // grid on Enter overloaded the same key the grid then uses to confirm).
+        if self.is_color_field() {
+            match key.code {
+                KeyCode::Char(' ') => {
+                    self.open_color_picker();
+                    return DialogResult::Continue;
+                }
+                KeyCode::Right => {
+                    self.cycle_color(true);
+                    return DialogResult::Continue;
+                }
+                KeyCode::Left => {
+                    self.cycle_color(false);
+                    return DialogResult::Continue;
+                }
+                _ => {}
+            }
         }
 
         // Ctrl+P opens group picker on group field
@@ -831,78 +899,121 @@ impl RenameDialog {
             RenameMode::Group => self.group_color,
         };
         let mut spans = vec![Span::styled("Color:      ", label_style)];
+        // A left cycle chevron when focused signals the field steps through the
+        // palette with the arrow keys (mirrors the profile selector affordance).
+        if focused {
+            spans.push(Span::styled("\u{2039} ", Style::default().fg(theme.accent)));
+        }
         match current {
             Some(c) => {
                 let (r, g, b) = c.rgb();
-                spans.push(Span::styled(
-                    "\u{2588} ",
-                    Style::default().fg(Color::Rgb(r, g, b)),
-                ));
-                spans.push(Span::styled(
-                    c.as_str(),
-                    if focused {
-                        Style::default().fg(theme.accent)
-                    } else {
-                        Style::default().fg(theme.text)
-                    },
-                ));
+                let col = Color::Rgb(r, g, b);
+                // The swatch and the name both render in the color itself, so
+                // the row reads as the thing it names.
+                spans.push(Span::styled("\u{2588} ", Style::default().fg(col)));
+                spans.push(Span::styled(c.as_str(), Style::default().fg(col)));
             }
             None => {
                 spans.push(Span::styled("none", Style::default().fg(theme.dimmed)));
             }
         }
+        if focused {
+            spans.push(Span::styled(" \u{203a}", Style::default().fg(theme.accent)));
+        }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
-    /// Inline color picker overlay: a centered row of swatches plus a trailing
-    /// "none" slot, the highlighted one bracketed.
-    fn render_color_picker(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let picker_area = super::centered_rect(area, 40, 5);
-        frame.render_widget(Clear, picker_area);
+    /// 4x4 swatch grid popup. Each cell is a block in its own color; the
+    /// highlighted cell is bracketed, and a caption names it in that color.
+    /// Drawn last (over a `Clear`) so it sits on top of the dialog. Also
+    /// records each swatch's hit rect for mouse picking.
+    fn render_color_picker(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.color_swatch_rects.clear();
+        const CELL_W: u16 = 5;
+        let cols = COLOR_GRID_COLS;
+        let rows = FolderColor::ALL.len().div_ceil(cols);
+        let grid_w = CELL_W * cols as u16;
+        // borders (2) + grid rows + blank + caption + hint.
+        let popup_w = grid_w + 14;
+        let popup_h = rows as u16 + 5;
+        let popup_area = super::centered_rect(area, popup_w, popup_h);
+        frame.render_widget(Clear, popup_area);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.accent))
             .title(" Pick Color ")
             .title_style(Style::default().fg(theme.title).bold());
-        let inner = block.inner(picker_area);
-        frame.render_widget(block, picker_area);
+        let inner = block.inner(popup_area);
+        frame.render_widget(block, popup_area);
 
-        let mut spans: Vec<Span> = Vec::new();
+        let grid_x = inner.x + inner.width.saturating_sub(grid_w) / 2;
+        let grid_y = inner.y;
         for (i, color) in FolderColor::ALL.iter().enumerate() {
-            let (r, g, b) = color.rgb();
+            let r = (i / cols) as u16;
+            let c = (i % cols) as u16;
+            let cell = Rect {
+                x: grid_x + c * CELL_W,
+                y: grid_y + r,
+                width: CELL_W,
+                height: 1,
+            };
+            self.color_swatch_rects.push((i, cell));
+            let (rr, gg, bb) = color.rgb();
             let sel = i == self.color_picker_index;
-            let glyph = if sel { "[\u{2588}]" } else { " \u{2588} " };
-            spans.push(Span::styled(
-                glyph,
-                Style::default().fg(Color::Rgb(r, g, b)),
-            ));
-        }
-        let none_sel = self.color_picker_index >= FolderColor::ALL.len();
-        spans.push(Span::styled(
-            if none_sel { "[none]" } else { " none " },
-            if none_sel {
-                Style::default().fg(theme.accent)
+            let glyph = if sel {
+                "[\u{2588}\u{2588}]"
             } else {
-                Style::default().fg(theme.dimmed)
-            },
-        ));
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .split(inner);
-        frame.render_widget(Paragraph::new(Line::from(spans)), layout[0]);
+                " \u{2588}\u{2588} "
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    glyph,
+                    Style::default().fg(Color::Rgb(rr, gg, bb)),
+                ))),
+                cell,
+            );
+        }
+
+        // Caption: the highlighted swatch's name, in its own color.
+        let cap_y = grid_y + rows as u16 + 1;
+        if let Some(color) = FolderColor::ALL.get(self.color_picker_index) {
+            let (rr, gg, bb) = color.rgb();
+            let col = Color::Rgb(rr, gg, bb);
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled("\u{2588} ", Style::default().fg(col)),
+                    Span::styled(color.as_str(), Style::default().fg(col)),
+                ])),
+                Rect {
+                    x: inner.x,
+                    y: cap_y,
+                    width: inner.width,
+                    height: 1,
+                },
+            );
+        }
+
+        // Hint line.
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("\u{2190}\u{2192}", Style::default().fg(theme.hint)),
+                Span::styled(
+                    "\u{2190}\u{2191}\u{2193}\u{2192}",
+                    Style::default().fg(theme.hint),
+                ),
                 Span::raw(" move  "),
-                Span::styled("Enter", Style::default().fg(theme.hint)),
+                Span::styled("\u{21b5}", Style::default().fg(theme.hint)),
                 Span::raw(" pick  "),
+                Span::styled("\u{232b}", Style::default().fg(theme.hint)),
+                Span::raw(" none  "),
                 Span::styled("Esc", Style::default().fg(theme.hint)),
-                Span::raw(" cancel"),
             ])),
-            layout[1],
+            Rect {
+                x: inner.x,
+                y: cap_y + 1,
+                width: inner.width,
+                height: 1,
+            },
         );
     }
 
@@ -2146,7 +2257,7 @@ mod tests {
     }
 
     #[test]
-    fn color_picker_cycles_all_palette_and_none() {
+    fn color_field_cycles_inline_through_palette_and_none() {
         let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new())
             .with_session_settings(None, None);
         // Tab to color field (title->group->profile->heat->color).
@@ -2154,18 +2265,24 @@ mod tests {
             dialog.handle_key(key(KeyCode::Tab));
         }
         assert!(dialog.is_color_field());
-        // Enter opens the picker; it preselects "none" (index == ALL.len()).
-        dialog.handle_key(key(KeyCode::Enter));
-        assert!(dialog.color_picker_open);
-        assert_eq!(dialog.color_picker_index, FolderColor::ALL.len());
-        // Right wraps to the first palette swatch.
+        assert_eq!(dialog.manual_color, None);
+        // Right steps off the "none" slot onto the first palette color in place
+        // — no popup, the field itself holds the live choice.
         dialog.handle_key(key(KeyCode::Right));
-        assert_eq!(dialog.color_picker_index, 0);
-        // Commit the first swatch (Amber).
-        dialog.handle_key(key(KeyCode::Enter));
-        assert!(!dialog.color_picker_open);
         assert_eq!(dialog.manual_color, Some(FolderColor::ALL[0]));
-        // Submit carries the change.
+        // Left steps back to "none" (wrapping through the trailing slot).
+        dialog.handle_key(key(KeyCode::Left));
+        assert_eq!(dialog.manual_color, None);
+        // Cycling Right through every palette entry then once more lands back on
+        // "none", covering the whole ring.
+        for expected in FolderColor::ALL.iter() {
+            dialog.handle_key(key(KeyCode::Right));
+            assert_eq!(dialog.manual_color, Some(*expected));
+        }
+        dialog.handle_key(key(KeyCode::Right));
+        assert_eq!(dialog.manual_color, None);
+        // Pick the first color and submit; the change is carried out.
+        dialog.handle_key(key(KeyCode::Right));
         dialog.handle_key(key(KeyCode::Tab)); // off color, back to title
         match dialog.handle_key(key(KeyCode::Enter)) {
             DialogResult::Submit(data) => {
@@ -2176,28 +2293,18 @@ mod tests {
     }
 
     #[test]
-    fn color_picker_none_clears_existing_color() {
+    fn color_field_cycles_to_none_clears_existing_color() {
         let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new())
             .with_session_settings(Some(FolderColor::Teal), None);
         for _ in 0..4 {
             dialog.handle_key(key(KeyCode::Tab));
         }
-        dialog.handle_key(key(KeyCode::Enter)); // open picker, preselects Teal
-        assert_eq!(
-            dialog.color_picker_index,
-            FolderColor::ALL
-                .iter()
-                .position(|c| *c == FolderColor::Teal)
-                .unwrap()
-        );
-        // Walk left until we hit the trailing "none" slot.
-        dialog.handle_key(key(KeyCode::Left)); // to the slot before Teal... walk to none
-                                               // Simplest: reopen by setting index directly via repeated Left to wrap
-                                               // to the none slot (index ALL.len()).
-        while dialog.color_picker_index != FolderColor::ALL.len() {
+        assert!(dialog.is_color_field());
+        assert_eq!(dialog.manual_color, Some(FolderColor::Teal));
+        // Cycle left until the field clears to "none".
+        while dialog.manual_color.is_some() {
             dialog.handle_key(key(KeyCode::Left));
         }
-        dialog.handle_key(key(KeyCode::Enter));
         assert_eq!(dialog.manual_color, None);
         dialog.handle_key(key(KeyCode::Tab));
         match dialog.handle_key(key(KeyCode::Enter)) {
@@ -2214,14 +2321,14 @@ mod tests {
         // Unchanged: no group color change reported, and an otherwise-unchanged
         // dialog cancels.
         assert_eq!(dialog.group_color_change(), None);
-        // Tab to color field (group->profile->color) and pick a different color.
+        // Tab to color field (group->profile->color) and cycle to a different
+        // color inline.
         dialog.handle_key(key(KeyCode::Tab));
         dialog.handle_key(key(KeyCode::Tab));
         assert!(dialog.is_color_field());
-        dialog.handle_key(key(KeyCode::Enter)); // open picker (preselect Sky)
-                                                // Move to first palette swatch (Amber) and commit.
-        dialog.color_picker_index = 0;
-        dialog.handle_key(key(KeyCode::Enter));
+        while dialog.group_color != Some(FolderColor::ALL[0]) {
+            dialog.handle_key(key(KeyCode::Right));
+        }
         assert_eq!(dialog.group_color_change(), Some(Some(FolderColor::ALL[0])));
     }
 
@@ -2232,14 +2339,90 @@ mod tests {
         for _ in 0..4 {
             dialog.handle_key(key(KeyCode::Tab));
         }
-        dialog.handle_key(key(KeyCode::Enter)); // open picker
-        dialog.color_picker_index = 0;
-        dialog.handle_key(key(KeyCode::Enter)); // commit Amber
+        dialog.handle_key(key(KeyCode::Right)); // cycle onto the first color
+        assert_eq!(dialog.manual_color, Some(FolderColor::ALL[0]));
         dialog.handle_key(key(KeyCode::Tab)); // off color
         match dialog.handle_key(key(KeyCode::Enter)) {
             DialogResult::Submit(_) => {}
             _ => panic!("a sole color change must submit"),
         }
+    }
+
+    #[test]
+    fn color_grid_opens_navigates_and_commits() {
+        let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new())
+            .with_session_settings(None, None);
+        for _ in 0..4 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        assert!(dialog.is_color_field());
+        // Space opens the grid; with no current color it preselects swatch 0.
+        dialog.handle_key(key(KeyCode::Char(' ')));
+        assert!(dialog.color_picker_open);
+        assert_eq!(dialog.color_picker_index, 0);
+        // Right steps one swatch; Down steps a full row.
+        dialog.handle_key(key(KeyCode::Right));
+        dialog.handle_key(key(KeyCode::Down));
+        assert_eq!(dialog.color_picker_index, 1 + COLOR_GRID_COLS);
+        // Enter commits the highlighted swatch and closes the grid.
+        dialog.handle_key(key(KeyCode::Enter));
+        assert!(!dialog.color_picker_open);
+        assert_eq!(
+            dialog.manual_color,
+            Some(FolderColor::ALL[1 + COLOR_GRID_COLS])
+        );
+    }
+
+    #[test]
+    fn color_grid_wraps_as_torus() {
+        let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new())
+            .with_session_settings(None, None);
+        for _ in 0..4 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        dialog.handle_key(key(KeyCode::Char(' '))); // open at index 0
+                                                    // Left from the first cell wraps to the last.
+        dialog.handle_key(key(KeyCode::Left));
+        assert_eq!(dialog.color_picker_index, FolderColor::ALL.len() - 1);
+        // Back to 0, then Up wraps to the bottom row of the same column.
+        dialog.handle_key(key(KeyCode::Right));
+        assert_eq!(dialog.color_picker_index, 0);
+        dialog.handle_key(key(KeyCode::Up));
+        assert_eq!(
+            dialog.color_picker_index,
+            FolderColor::ALL.len() - COLOR_GRID_COLS
+        );
+    }
+
+    #[test]
+    fn color_grid_backspace_clears_and_esc_keeps() {
+        // Backspace inside the grid clears the color outright.
+        let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new())
+            .with_session_settings(Some(FolderColor::Teal), None);
+        for _ in 0..4 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        dialog.handle_key(key(KeyCode::Char(' '))); // open, preselects Teal
+        let teal_idx = FolderColor::ALL
+            .iter()
+            .position(|c| *c == FolderColor::Teal)
+            .unwrap();
+        assert_eq!(dialog.color_picker_index, teal_idx);
+        dialog.handle_key(key(KeyCode::Backspace));
+        assert!(!dialog.color_picker_open);
+        assert_eq!(dialog.manual_color, None);
+
+        // Esc leaves the existing color untouched even after moving the cursor.
+        let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new())
+            .with_session_settings(Some(FolderColor::Teal), None);
+        for _ in 0..4 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        dialog.handle_key(key(KeyCode::Char(' ')));
+        dialog.handle_key(key(KeyCode::Right));
+        dialog.handle_key(key(KeyCode::Esc));
+        assert!(!dialog.color_picker_open);
+        assert_eq!(dialog.manual_color, Some(FolderColor::Teal));
     }
 
     #[test]

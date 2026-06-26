@@ -7,6 +7,7 @@ use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::DialogResult;
+use crate::session::FolderColor;
 use crate::tui::components::{
     render_text_field, render_text_field_with_ghost, GroupGhostCompletion, ListPicker,
     ListPickerResult,
@@ -26,6 +27,14 @@ pub struct RenameData {
     /// true for a tied aoe-managed worktree session that opted into the
     /// branch toggle; always false otherwise.
     pub rename_branch: bool,
+    /// Per-session manual color change (Session mode only). Outer `None` means
+    /// unchanged; `Some(inner)` means set the manual color to `inner`
+    /// (`Some(None)` clears it back to no manual color).
+    pub manual_color: Option<Option<FolderColor>>,
+    /// Per-session heat override change (Session mode only). Outer `None` means
+    /// unchanged; `Some(inner)` sets `heat_enabled` to `inner` (`Some(None)`
+    /// resets it to inherit the global default).
+    pub heat_enabled: Option<Option<bool>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +69,22 @@ pub struct RenameDialog {
     worktree_branch: Option<WorktreeBranch>,
     /// State of the branch toggle. Meaningless unless `worktree_branch` is set.
     rename_branch: bool,
+    /// Current manual session color (Session mode) and its original value, for
+    /// change detection. `None` = no manual color.
+    manual_color: Option<FolderColor>,
+    orig_manual_color: Option<FolderColor>,
+    /// Current per-session heat override (Session mode) and its original.
+    /// `None` = inherit global; `Some(true/false)` = forced on/off.
+    heat_enabled: Option<bool>,
+    orig_heat_enabled: Option<bool>,
+    /// Current group spine color (Group mode) and its original.
+    group_color: Option<FolderColor>,
+    orig_group_color: Option<FolderColor>,
+    /// Whether the inline color picker overlay is open, and which swatch is
+    /// highlighted (`0..FolderColor::ALL.len()` select a color; the final index
+    /// is the "none" / clear option).
+    color_picker_open: bool,
+    color_picker_index: usize,
 }
 
 /// Branch context for a tied worktree session's rename toggle.
@@ -105,6 +130,48 @@ impl RenameDialog {
             focusable_rects: Vec::new(),
             worktree_branch: None,
             rename_branch: false,
+            manual_color: None,
+            orig_manual_color: None,
+            heat_enabled: None,
+            orig_heat_enabled: None,
+            group_color: None,
+            orig_group_color: None,
+            color_picker_open: false,
+            color_picker_index: 0,
+        }
+    }
+
+    /// Seed the per-session manual color and heat override (Session mode). The
+    /// values become both the editable state and the change-detection baseline,
+    /// so an untouched dialog reports no change for these fields.
+    pub fn with_session_settings(
+        mut self,
+        manual_color: Option<FolderColor>,
+        heat_enabled: Option<bool>,
+    ) -> Self {
+        self.manual_color = manual_color;
+        self.orig_manual_color = manual_color;
+        self.heat_enabled = heat_enabled;
+        self.orig_heat_enabled = heat_enabled;
+        self
+    }
+
+    /// Seed the group spine color (Group mode). Both the editable state and the
+    /// change-detection baseline.
+    pub fn with_group_color(mut self, color: Option<FolderColor>) -> Self {
+        self.group_color = color;
+        self.orig_group_color = color;
+        self
+    }
+
+    /// The group color change to apply on submit (Group mode): `Some(value)`
+    /// when the user changed it (`Some(None)` clears the color), `None` when
+    /// unchanged.
+    pub fn group_color_change(&self) -> Option<Option<FolderColor>> {
+        if self.group_color != self.orig_group_color {
+            Some(self.group_color)
+        } else {
+            None
         }
     }
 
@@ -149,6 +216,14 @@ impl RenameDialog {
             focusable_rects: Vec::new(),
             worktree_branch: None,
             rename_branch: false,
+            manual_color: None,
+            orig_manual_color: None,
+            heat_enabled: None,
+            orig_heat_enabled: None,
+            group_color: None,
+            orig_group_color: None,
+            color_picker_open: false,
+            color_picker_index: 0,
         }
     }
 
@@ -162,21 +237,85 @@ impl RenameDialog {
         self.shows_branch_toggle() && self.focused_field == 3
     }
 
-    fn field_count(&self) -> usize {
-        match self.mode {
-            // title, group, profile, and the branch toggle when present.
-            RenameMode::Session => {
-                if self.shows_branch_toggle() {
-                    4
-                } else {
-                    3
-                }
-            }
-            RenameMode::Group => 2, // group, profile
+    /// Focusable index of the per-session Heat field (Session mode), placed
+    /// after title/group/profile and the optional branch toggle so the
+    /// existing indices stay stable.
+    fn heat_field_index(&self) -> usize {
+        if self.shows_branch_toggle() {
+            4
+        } else {
+            3
         }
     }
 
+    /// Focusable index of the Color field. Session mode: right after Heat.
+    /// Group mode: after group/profile (index 2).
+    fn color_field_index(&self) -> usize {
+        match self.mode {
+            RenameMode::Session => self.heat_field_index() + 1,
+            RenameMode::Group => 2,
+        }
+    }
+
+    fn is_heat_field(&self) -> bool {
+        self.mode == RenameMode::Session && self.focused_field == self.heat_field_index()
+    }
+
+    fn is_color_field(&self) -> bool {
+        self.focused_field == self.color_field_index()
+    }
+
+    fn field_count(&self) -> usize {
+        match self.mode {
+            // title, group, profile, optional branch toggle, then Heat + Color.
+            RenameMode::Session => self.color_field_index() + 1,
+            // group, profile, Color.
+            RenameMode::Group => 3,
+        }
+    }
+
+    /// Number of swatches in the color picker overlay: the palette plus a
+    /// trailing "none" / clear slot.
+    fn color_picker_slot_count(&self) -> usize {
+        FolderColor::ALL.len() + 1
+    }
+
+    /// Apply the currently highlighted color-picker slot to the right target
+    /// (manual session color in Session mode, group spine color in Group mode).
+    /// The last slot clears the color.
+    fn commit_color_picker(&mut self) {
+        let chosen = if self.color_picker_index >= FolderColor::ALL.len() {
+            None
+        } else {
+            Some(FolderColor::ALL[self.color_picker_index])
+        };
+        match self.mode {
+            RenameMode::Session => self.manual_color = chosen,
+            RenameMode::Group => self.group_color = chosen,
+        }
+        self.color_picker_open = false;
+    }
+
+    /// Open the color picker, preselecting the swatch matching the current
+    /// color (or the "none" slot when unset).
+    fn open_color_picker(&mut self) {
+        let current = match self.mode {
+            RenameMode::Session => self.manual_color,
+            RenameMode::Group => self.group_color,
+        };
+        self.color_picker_index = current
+            .and_then(|c| FolderColor::ALL.iter().position(|x| *x == c))
+            .unwrap_or(FolderColor::ALL.len());
+        self.color_picker_open = true;
+    }
+
     pub fn handle_click(&mut self, col: u16, row: u16) -> Option<DialogResult<RenameData>> {
+        // Color picker overlay swallows clicks while open (its swatches are
+        // keyboard-driven); a click anywhere just keeps the dialog up rather
+        // than leaking through to the fields beneath.
+        if self.color_picker_open {
+            return Some(DialogResult::Continue);
+        }
         // Group picker overlay wins when active so a click can pick a
         // group row without dropping the dialog underneath.
         if self.group_picker.is_active() {
@@ -206,6 +345,14 @@ impl RenameDialog {
             self.profile_index = (self.profile_index + 1) % self.available_profiles.len();
         } else if self.is_branch_toggle_field() {
             self.rename_branch = !self.rename_branch;
+        } else if self.is_heat_field() {
+            self.heat_enabled = match self.heat_enabled {
+                None => Some(true),
+                Some(true) => Some(false),
+                Some(false) => None,
+            };
+        } else if self.is_color_field() {
+            self.open_color_picker();
         }
         Some(DialogResult::Continue)
     }
@@ -291,12 +438,56 @@ impl RenameDialog {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<RenameData> {
+        // Color picker overlay wins over everything else while open so its
+        // arrows/Enter/Esc do not leak into the field navigation below.
+        if self.color_picker_open {
+            let slots = self.color_picker_slot_count();
+            match key.code {
+                KeyCode::Esc => self.color_picker_open = false,
+                KeyCode::Left => {
+                    self.color_picker_index = if self.color_picker_index == 0 {
+                        slots - 1
+                    } else {
+                        self.color_picker_index - 1
+                    };
+                }
+                KeyCode::Right => {
+                    self.color_picker_index = (self.color_picker_index + 1) % slots;
+                }
+                KeyCode::Enter | KeyCode::Char(' ') => self.commit_color_picker(),
+                _ => {}
+            }
+            return DialogResult::Continue;
+        }
+
         // Handle group picker if active
         if self.group_picker.is_active() {
             if let ListPickerResult::Selected(value) = self.group_picker.handle_key(key) {
                 self.new_group = Input::new(value);
                 self.group_ghost = None;
             }
+            return DialogResult::Continue;
+        }
+
+        // Heat field: Space/Enter cycle the tri-state override
+        // None -> Some(true) -> Some(false) -> None.
+        if self.is_heat_field() && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
+            self.heat_enabled = match self.heat_enabled {
+                None => Some(true),
+                Some(true) => Some(false),
+                Some(false) => None,
+            };
+            return DialogResult::Continue;
+        }
+
+        // Color field: Enter/Space/Right open the color picker overlay.
+        if self.is_color_field()
+            && matches!(
+                key.code,
+                KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right
+            )
+        {
+            self.open_color_picker();
             return DialogResult::Continue;
         }
 
@@ -334,12 +525,19 @@ impl RenameDialog {
 
                 // If nothing has changed, cancel. Arming the branch toggle
                 // counts as a change even when title/group/profile are
-                // untouched (rename a drifted branch in place).
+                // untouched (rename a drifted branch in place). A color or heat
+                // edit likewise counts as a change.
                 let branch_rename = self.shows_branch_toggle() && self.rename_branch;
+                let manual_color_changed = self.manual_color != self.orig_manual_color;
+                let heat_changed = self.heat_enabled != self.orig_heat_enabled;
+                let group_color_changed = self.group_color != self.orig_group_color;
                 if title_value.is_empty()
                     && group_value == self.current_group
                     && !profile_changed
                     && !branch_rename
+                    && !manual_color_changed
+                    && !heat_changed
+                    && !group_color_changed
                 {
                     return DialogResult::Cancel;
                 }
@@ -381,6 +579,8 @@ impl RenameDialog {
                     group,
                     profile,
                     rename_branch: self.shows_branch_toggle() && self.rename_branch,
+                    manual_color: manual_color_changed.then_some(self.manual_color),
+                    heat_enabled: heat_changed.then_some(self.heat_enabled),
                 })
             }
             KeyCode::Tab => {
@@ -474,7 +674,8 @@ impl RenameDialog {
                 .is_some_and(|w| w.upstream.is_some());
 
         let dialog_width = 50;
-        let height = 15 + if show_toggle { 1 } else { 0 } + if show_warning { 2 } else { 0 };
+        // +2 for the Heat and Color rows.
+        let height = 17 + if show_toggle { 1 } else { 0 } + if show_warning { 2 } else { 0 };
         let dialog_area = super::centered_rect(area, dialog_width, height);
 
         frame.render_widget(Clear, dialog_area);
@@ -509,6 +710,12 @@ impl RenameDialog {
             constraints.push(Constraint::Length(2));
             constraints.len() - 1
         });
+        // Heat + Color rows, placed after the optional branch toggle so their
+        // focusable indices follow the toggle (see `heat_field_index`).
+        constraints.push(Constraint::Length(1));
+        let heat_chunk_idx = constraints.len() - 1;
+        constraints.push(Constraint::Length(1));
+        let color_chunk_idx = constraints.len() - 1;
         constraints.push(Constraint::Length(1)); // Spacer
         constraints.push(Constraint::Min(1)); // Hint
         let hint_idx = constraints.len() - 1;
@@ -561,13 +768,142 @@ impl RenameDialog {
             self.render_branch_warning(frame, chunks[idx], theme);
         }
 
+        // Heat override row + Color row.
+        self.render_heat_row(frame, chunks[heat_chunk_idx], theme);
+        self.focusable_rects
+            .push((self.heat_field_index(), chunks[heat_chunk_idx]));
+        self.render_color_row(frame, chunks[color_chunk_idx], theme);
+        self.focusable_rects
+            .push((self.color_field_index(), chunks[color_chunk_idx]));
+
         // Hint
         self.render_hints(frame, chunks[hint_idx], theme);
 
-        // Render group picker overlay
+        // Overlays drawn last so they sit on top.
         if self.group_picker.is_active() {
             self.group_picker.render(frame, area, theme);
         }
+        if self.color_picker_open {
+            self.render_color_picker(frame, area, theme);
+        }
+    }
+
+    /// "Heat: default (on) | on | off" row. The tri-state override surfaces the
+    /// inherited global value in the "default" label so the user knows what
+    /// inheriting means.
+    fn render_heat_row(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let focused = self.is_heat_field();
+        let label_style = if focused {
+            Style::default().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.dimmed)
+        };
+        let value = match self.heat_enabled {
+            None => "default".to_string(),
+            Some(true) => "on".to_string(),
+            Some(false) => "off".to_string(),
+        };
+        let value_style = if focused {
+            Style::default().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("Heat:       ", label_style),
+                Span::styled(value, value_style),
+            ])),
+            area,
+        );
+    }
+
+    /// Color row: a swatch plus the color name (or "none"). Shared between
+    /// Session (manual session color) and Group (spine color) modes.
+    fn render_color_row(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let focused = self.is_color_field();
+        let label_style = if focused {
+            Style::default().fg(theme.accent)
+        } else {
+            Style::default().fg(theme.dimmed)
+        };
+        let current = match self.mode {
+            RenameMode::Session => self.manual_color,
+            RenameMode::Group => self.group_color,
+        };
+        let mut spans = vec![Span::styled("Color:      ", label_style)];
+        match current {
+            Some(c) => {
+                let (r, g, b) = c.rgb();
+                spans.push(Span::styled(
+                    "\u{2588} ",
+                    Style::default().fg(Color::Rgb(r, g, b)),
+                ));
+                spans.push(Span::styled(
+                    c.as_str(),
+                    if focused {
+                        Style::default().fg(theme.accent)
+                    } else {
+                        Style::default().fg(theme.text)
+                    },
+                ));
+            }
+            None => {
+                spans.push(Span::styled("none", Style::default().fg(theme.dimmed)));
+            }
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// Inline color picker overlay: a centered row of swatches plus a trailing
+    /// "none" slot, the highlighted one bracketed.
+    fn render_color_picker(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let picker_area = super::centered_rect(area, 40, 5);
+        frame.render_widget(Clear, picker_area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.accent))
+            .title(" Pick Color ")
+            .title_style(Style::default().fg(theme.title).bold());
+        let inner = block.inner(picker_area);
+        frame.render_widget(block, picker_area);
+
+        let mut spans: Vec<Span> = Vec::new();
+        for (i, color) in FolderColor::ALL.iter().enumerate() {
+            let (r, g, b) = color.rgb();
+            let sel = i == self.color_picker_index;
+            let glyph = if sel { "[\u{2588}]" } else { " \u{2588} " };
+            spans.push(Span::styled(
+                glyph,
+                Style::default().fg(Color::Rgb(r, g, b)),
+            ));
+        }
+        let none_sel = self.color_picker_index >= FolderColor::ALL.len();
+        spans.push(Span::styled(
+            if none_sel { "[none]" } else { " none " },
+            if none_sel {
+                Style::default().fg(theme.accent)
+            } else {
+                Style::default().fg(theme.dimmed)
+            },
+        ));
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(inner);
+        frame.render_widget(Paragraph::new(Line::from(spans)), layout[0]);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("\u{2190}\u{2192}", Style::default().fg(theme.hint)),
+                Span::raw(" move  "),
+                Span::styled("Enter", Style::default().fg(theme.hint)),
+                Span::raw(" pick  "),
+                Span::styled("Esc", Style::default().fg(theme.hint)),
+                Span::raw(" cancel"),
+            ])),
+            layout[1],
+        );
     }
 
     fn render_branch_toggle(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -617,7 +953,8 @@ impl RenameDialog {
         self.focusable_rects.clear();
         let dialog_width = 50;
         let has_error = self.validation_error.is_some();
-        let dialog_height = if has_error { 16 } else { 13 };
+        // +1 for the Color row.
+        let dialog_height = if has_error { 17 } else { 14 };
         let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
 
         frame.render_widget(Clear, dialog_area);
@@ -632,16 +969,17 @@ impl RenameDialog {
         frame.render_widget(block, dialog_area);
 
         let mut constraints = vec![
-            Constraint::Length(1), // Current group
-            Constraint::Length(1), // Current profile
-            Constraint::Length(1), // Spacer
-            Constraint::Length(1), // New group field
-            Constraint::Length(1), // Profile selector
-            Constraint::Length(1), // Spacer
-            Constraint::Min(1),    // Hint
+            Constraint::Length(1), // 0 Current group
+            Constraint::Length(1), // 1 Current profile
+            Constraint::Length(1), // 2 Spacer
+            Constraint::Length(1), // 3 New group field
+            Constraint::Length(1), // 4 Profile selector
+            Constraint::Length(1), // 5 Color row
+            Constraint::Length(1), // 6 Spacer
+            Constraint::Min(1),    // 7 Hint
         ];
         if has_error {
-            constraints.insert(5, Constraint::Length(2)); // Validation error (2 lines)
+            constraints.insert(6, Constraint::Length(2)); // Validation error (2 lines)
         }
 
         let chunks = Layout::default()
@@ -664,6 +1002,10 @@ impl RenameDialog {
         self.render_profile_selector(frame, chunks[4], theme);
         self.focusable_rects.push((1, chunks[4]));
 
+        // Color row (group spine color), focusable index 2.
+        self.render_color_row(frame, chunks[5], theme);
+        self.focusable_rects.push((2, chunks[5]));
+
         if has_error {
             // Validation error (two lines, one sentence each)
             let error_text: Vec<Line> = self
@@ -678,17 +1020,20 @@ impl RenameDialog {
                     ))
                 })
                 .collect();
-            frame.render_widget(Paragraph::new(error_text), chunks[5]);
+            frame.render_widget(Paragraph::new(error_text), chunks[6]);
             // Hint is shifted one index further
-            self.render_hints(frame, chunks[7], theme);
+            self.render_hints(frame, chunks[8], theme);
         } else {
             // Hint
-            self.render_hints(frame, chunks[6], theme);
+            self.render_hints(frame, chunks[7], theme);
         }
 
-        // Render group picker overlay
+        // Overlays drawn last.
         if self.group_picker.is_active() {
             self.group_picker.render(frame, area, theme);
+        }
+        if self.color_picker_open {
+            self.render_color_picker(frame, area, theme);
         }
     }
 
@@ -761,9 +1106,13 @@ impl RenameDialog {
             Span::styled("Tab", Style::default().fg(theme.hint)),
             Span::raw(" switch  "),
         ];
-        if self.is_branch_toggle_field() {
+        if self.is_branch_toggle_field() || self.is_heat_field() {
             hint_spans.push(Span::styled("Space", Style::default().fg(theme.hint)));
             hint_spans.push(Span::raw(" toggle  "));
+        }
+        if self.is_color_field() {
+            hint_spans.push(Span::styled("Enter", Style::default().fg(theme.hint)));
+            hint_spans.push(Span::raw(" pick color  "));
         }
         if self.is_group_field() && !self.existing_groups.is_empty() {
             if self.group_ghost_text().is_some() {
@@ -972,6 +1321,7 @@ mod tests {
 
     #[test]
     fn test_tab_switches_fields() {
+        // Session mode now has 5 fields: title, group, profile, heat, color.
         let mut dialog =
             RenameDialog::new("Test", "group", "default", default_profiles(), Vec::new());
         assert_eq!(dialog.focused_field, 0);
@@ -983,7 +1333,13 @@ mod tests {
         assert_eq!(dialog.focused_field, 2);
 
         dialog.handle_key(key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 0);
+        assert_eq!(dialog.focused_field, 3); // heat
+
+        dialog.handle_key(key(KeyCode::Tab));
+        assert_eq!(dialog.focused_field, 4); // color
+
+        dialog.handle_key(key(KeyCode::Tab));
+        assert_eq!(dialog.focused_field, 0); // wrap
     }
 
     #[test]
@@ -993,13 +1349,13 @@ mod tests {
         assert_eq!(dialog.focused_field, 0);
 
         dialog.handle_key(shift_key(KeyCode::Tab));
+        assert_eq!(dialog.focused_field, 4); // wrap to color
+
+        dialog.handle_key(shift_key(KeyCode::Tab));
+        assert_eq!(dialog.focused_field, 3); // heat
+
+        dialog.handle_key(shift_key(KeyCode::Tab));
         assert_eq!(dialog.focused_field, 2);
-
-        dialog.handle_key(shift_key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 1);
-
-        dialog.handle_key(shift_key(KeyCode::Tab));
-        assert_eq!(dialog.focused_field, 0);
     }
 
     #[test]
@@ -1663,7 +2019,8 @@ mod tests {
         // A plain session (no with_worktree_branch) has no 4th field and
         // never emits rename_branch=true.
         let mut dialog = RenameDialog::new("hi", "", "default", default_profiles(), Vec::new());
-        assert_eq!(dialog.field_count(), 3);
+        // title, group, profile, heat, color (no branch toggle).
+        assert_eq!(dialog.field_count(), 5);
         assert!(!dialog.shows_branch_toggle());
         dialog.handle_key(key(KeyCode::Char('x')));
         match dialog.handle_key(key(KeyCode::Enter)) {
@@ -1676,7 +2033,8 @@ mod tests {
     fn test_branch_toggle_present_for_tied_worktree() {
         let dialog = tied_dialog(Some("origin/thing"));
         assert!(dialog.shows_branch_toggle());
-        assert_eq!(dialog.field_count(), 4);
+        // title, group, profile, branch toggle, heat, color.
+        assert_eq!(dialog.field_count(), 6);
     }
 
     #[test]
@@ -1744,6 +2102,173 @@ mod tests {
         dialog.handle_key(key(KeyCode::Char(' '))); // cycle profile
         assert_eq!(dialog.profile_index, 1);
         assert!(!dialog.rename_branch);
+    }
+
+    // --- Heat / Color r-menu extensions ---
+
+    #[test]
+    fn session_has_heat_and_color_fields_group_has_only_color() {
+        let session = RenameDialog::new("t", "", "default", default_profiles(), Vec::new());
+        // title, group, profile, heat, color
+        assert_eq!(session.field_count(), 5);
+        assert!(!session.is_heat_field()); // focus starts on title
+        let group = RenameDialog::new_for_group("g", "default", default_profiles(), Vec::new());
+        // group, profile, color (no heat field in Group mode)
+        assert_eq!(group.field_count(), 3);
+    }
+
+    #[test]
+    fn heat_field_tri_state_cycles_into_submit() {
+        let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new())
+            .with_session_settings(None, None);
+        // Tab to the heat field (title->group->profile->heat).
+        dialog.handle_key(key(KeyCode::Tab));
+        dialog.handle_key(key(KeyCode::Tab));
+        dialog.handle_key(key(KeyCode::Tab));
+        assert!(dialog.is_heat_field());
+        dialog.handle_key(key(KeyCode::Char(' '))); // None -> Some(true)
+        match dialog.handle_key(key(KeyCode::Enter)) {
+            // Enter on the heat field cycles rather than submits, so the first
+            // Enter advances to Some(false). Press Tab off then Enter to submit.
+            DialogResult::Continue => {}
+            _ => panic!("heat Enter should cycle"),
+        }
+        // Now heat_enabled is Some(false). Move focus off heat and submit.
+        dialog.handle_key(key(KeyCode::Tab)); // color
+        dialog.handle_key(key(KeyCode::Tab)); // wrap to title
+        match dialog.handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(data) => {
+                assert_eq!(data.heat_enabled, Some(Some(false)));
+                assert_eq!(data.manual_color, None);
+            }
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
+    fn color_picker_cycles_all_palette_and_none() {
+        let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new())
+            .with_session_settings(None, None);
+        // Tab to color field (title->group->profile->heat->color).
+        for _ in 0..4 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        assert!(dialog.is_color_field());
+        // Enter opens the picker; it preselects "none" (index == ALL.len()).
+        dialog.handle_key(key(KeyCode::Enter));
+        assert!(dialog.color_picker_open);
+        assert_eq!(dialog.color_picker_index, FolderColor::ALL.len());
+        // Right wraps to the first palette swatch.
+        dialog.handle_key(key(KeyCode::Right));
+        assert_eq!(dialog.color_picker_index, 0);
+        // Commit the first swatch (Amber).
+        dialog.handle_key(key(KeyCode::Enter));
+        assert!(!dialog.color_picker_open);
+        assert_eq!(dialog.manual_color, Some(FolderColor::ALL[0]));
+        // Submit carries the change.
+        dialog.handle_key(key(KeyCode::Tab)); // off color, back to title
+        match dialog.handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(data) => {
+                assert_eq!(data.manual_color, Some(Some(FolderColor::ALL[0])));
+            }
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
+    fn color_picker_none_clears_existing_color() {
+        let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new())
+            .with_session_settings(Some(FolderColor::Teal), None);
+        for _ in 0..4 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        dialog.handle_key(key(KeyCode::Enter)); // open picker, preselects Teal
+        assert_eq!(
+            dialog.color_picker_index,
+            FolderColor::ALL
+                .iter()
+                .position(|c| *c == FolderColor::Teal)
+                .unwrap()
+        );
+        // Walk left until we hit the trailing "none" slot.
+        dialog.handle_key(key(KeyCode::Left)); // to the slot before Teal... walk to none
+                                               // Simplest: reopen by setting index directly via repeated Left to wrap
+                                               // to the none slot (index ALL.len()).
+        while dialog.color_picker_index != FolderColor::ALL.len() {
+            dialog.handle_key(key(KeyCode::Left));
+        }
+        dialog.handle_key(key(KeyCode::Enter));
+        assert_eq!(dialog.manual_color, None);
+        dialog.handle_key(key(KeyCode::Tab));
+        match dialog.handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(data) => assert_eq!(data.manual_color, Some(None)),
+            _ => panic!("expected submit clearing color"),
+        }
+    }
+
+    #[test]
+    fn group_color_change_only_when_edited() {
+        let mut dialog =
+            RenameDialog::new_for_group("g", "default", default_profiles(), Vec::new())
+                .with_group_color(Some(FolderColor::Sky));
+        // Unchanged: no group color change reported, and an otherwise-unchanged
+        // dialog cancels.
+        assert_eq!(dialog.group_color_change(), None);
+        // Tab to color field (group->profile->color) and pick a different color.
+        dialog.handle_key(key(KeyCode::Tab));
+        dialog.handle_key(key(KeyCode::Tab));
+        assert!(dialog.is_color_field());
+        dialog.handle_key(key(KeyCode::Enter)); // open picker (preselect Sky)
+                                                // Move to first palette swatch (Amber) and commit.
+        dialog.color_picker_index = 0;
+        dialog.handle_key(key(KeyCode::Enter));
+        assert_eq!(dialog.group_color_change(), Some(Some(FolderColor::ALL[0])));
+    }
+
+    #[test]
+    fn only_color_change_submits_not_cancels() {
+        let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new())
+            .with_session_settings(None, None);
+        for _ in 0..4 {
+            dialog.handle_key(key(KeyCode::Tab));
+        }
+        dialog.handle_key(key(KeyCode::Enter)); // open picker
+        dialog.color_picker_index = 0;
+        dialog.handle_key(key(KeyCode::Enter)); // commit Amber
+        dialog.handle_key(key(KeyCode::Tab)); // off color
+        match dialog.handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(_) => {}
+            _ => panic!("a sole color change must submit"),
+        }
+    }
+
+    #[test]
+    fn legacy_new_without_settings_reports_no_color_heat_change() {
+        // A dialog built without `with_session_settings` behaves like before:
+        // an unchanged session submit reports no color/heat change.
+        let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new());
+        dialog.handle_key(key(KeyCode::Char('x'))); // change title so it submits
+        match dialog.handle_key(key(KeyCode::Enter)) {
+            DialogResult::Submit(data) => {
+                assert_eq!(data.manual_color, None);
+                assert_eq!(data.heat_enabled, None);
+            }
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
+    fn tab_reaches_heat_and_color_fields() {
+        let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new());
+        let order: Vec<usize> = (0..dialog.field_count())
+            .map(|_| {
+                let f = dialog.focused_field;
+                dialog.handle_key(key(KeyCode::Tab));
+                f
+            })
+            .collect();
+        // 0 title, 1 group, 2 profile, 3 heat, 4 color.
+        assert_eq!(order, vec![0, 1, 2, 3, 4]);
     }
 
     #[test]

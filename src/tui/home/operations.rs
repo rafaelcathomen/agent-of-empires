@@ -577,6 +577,83 @@ impl HomeView {
         Ok(())
     }
 
+    /// Apply a per-session manual color and/or heat override from the r-menu.
+    /// `manual_color`/`heat_enabled` are `Some(value)` when the dialog changed
+    /// them (`Some(None)` clears/inherits), `None` when unchanged. Routed
+    /// through `apply_user_action` so the change persists under the flock and
+    /// survives concurrent peer writes via `merge_user_action_diff`.
+    pub(super) fn set_session_color_and_heat(
+        &mut self,
+        id: &str,
+        manual_color: Option<Option<crate::session::FolderColor>>,
+        heat_enabled: Option<Option<bool>>,
+    ) {
+        if manual_color.is_none() && heat_enabled.is_none() {
+            return;
+        }
+        if let Err(e) = self.apply_user_action(id, |inst| {
+            if let Some(c) = manual_color {
+                inst.manual_color = c;
+            }
+            if let Some(h) = heat_enabled {
+                inst.heat_enabled = h;
+            }
+        }) {
+            tracing::error!(target: "tui.home", "Failed to set session color/heat: {}", e);
+        }
+        // Reflect the change immediately; the next poll recomputes heat anyway,
+        // but recompute now so a heat toggle takes effect without waiting.
+        self.recompute_heat();
+    }
+
+    /// Set (or clear, with `None`) the spine color of the currently selected
+    /// group. Mirrors the CLI `aoe group color` setter: mutate the profile's
+    /// in-memory `GroupTree` via `set_color`, persist the rebuilt group list
+    /// through that profile's storage, then rebuild the trees so the new color
+    /// shows on the next render.
+    pub(super) fn set_selected_group_color(&mut self, color: Option<crate::session::FolderColor>) {
+        let Some(group_path) = self.selected_group.clone() else {
+            return;
+        };
+        let profile = self
+            .selected_group_profile
+            .clone()
+            .unwrap_or_else(|| self.config_profile());
+        self.set_group_color_at(&group_path, &profile, color);
+    }
+
+    /// Set (or clear) a group's spine color for an explicit path and profile.
+    /// Used after a group rename, where `self.selected_group` may have fallen
+    /// to a different row during reload, so the caller passes the known target
+    /// (the post-rename path) instead of relying on the current selection.
+    pub(super) fn set_group_color_at(
+        &mut self,
+        group_path: &str,
+        profile: &str,
+        color: Option<crate::session::FolderColor>,
+    ) {
+        if let Some(tree) = self.group_trees.get_mut(profile) {
+            if !tree.set_color(group_path, color) {
+                return;
+            }
+        } else {
+            return;
+        }
+
+        if let Some(storage) = self.storages.get(profile) {
+            let res = storage.update(|instances, groups| {
+                let mut tree = GroupTree::new_with_groups(instances, groups);
+                tree.set_color(group_path, color);
+                *groups = tree.get_all_groups();
+                Ok(())
+            });
+            if let Err(e) = res {
+                tracing::error!(target: "tui.home", "Failed to persist group color: {}", e);
+            }
+        }
+        self.rebuild_group_trees();
+    }
+
     pub(super) fn delete_selected_group(&mut self) -> anyhow::Result<()> {
         if let Some(group_path) = self.selected_group.take() {
             let owning_profile = self.selected_group_profile.take();

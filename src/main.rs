@@ -232,6 +232,7 @@ async fn main() -> Result<()> {
         Some(Commands::Init(args)) => return cli::init::run(args).await,
         Some(Commands::ExtractSessionId(args)) => return cli::extract_session_id::run(args).await,
         Some(Commands::HookSubagent(args)) => return cli::hook_subagent::run(args).await,
+        Some(Commands::HookHeat(args)) => return cli::hook_heat::run(args).await,
         Some(Commands::Tmux { command }) => {
             use cli::tmux::TmuxCommands;
             return match command {

@@ -449,6 +449,21 @@ fn folder_color_fg(color: Option<FolderColor>, theme: &Theme) -> Color {
     }
 }
 
+/// Color for the right-aligned activity/time text. Encodes the locked
+/// precedence: a manual per-session color wins; otherwise the heat ratio (when
+/// the session has an engaged heat level) drives the continuous hot->cold ramp;
+/// otherwise the neutral `theme.dimmed` (today's look). `heat` is `Some(ratio)`
+/// only for an engaged `HeatLevel::Ramp`, `None` for `Neutral`.
+fn activity_text_color(manual: Option<FolderColor>, heat: Option<f32>, theme: &Theme) -> Color {
+    if manual.is_some() {
+        return folder_color_fg(manual, theme);
+    }
+    match heat {
+        Some(ratio) => theme.heat_color_at_ratio(ratio),
+        None => theme.dimmed,
+    }
+}
+
 fn selected_row_style(style: Style, theme: &Theme) -> Style {
     let Some(fg) = style.fg else {
         return style.fg(theme.text).bold();
@@ -1513,7 +1528,16 @@ impl HomeView {
                         format_relative_age(age_ts)
                     };
                     let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
-                    let activity_style = Style::default().fg(theme.dimmed);
+                    // Precedence: manual session color > heat ramp > dimmed.
+                    let row_heat_ratio = match inst.heat_level {
+                        crate::hooks::heat::HeatLevel::Ramp(r) => Some(r),
+                        crate::hooks::heat::HeatLevel::Neutral => None,
+                    };
+                    let activity_style = Style::default().fg(activity_text_color(
+                        inst.manual_color,
+                        row_heat_ratio,
+                        theme,
+                    ));
                     line_spans.push(Span::styled(
                         padded,
                         if is_selected {
@@ -3360,6 +3384,33 @@ mod tests {
     fn folder_color_fg_none_is_theme_group() {
         let theme = crate::tui::styles::load_theme_with_mode("empire", false);
         assert_eq!(folder_color_fg(None, &theme), theme.group);
+    }
+
+    #[test]
+    fn activity_text_color_manual_wins_over_heat() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        // Manual color set: paints the folder color regardless of heat.
+        let got = activity_text_color(Some(FolderColor::Teal), Some(1.0), &theme);
+        assert_eq!(got, folder_color_fg(Some(FolderColor::Teal), &theme));
+    }
+
+    #[test]
+    fn activity_text_color_heat_when_no_manual() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        assert_eq!(
+            activity_text_color(None, Some(1.0), &theme),
+            theme.heat_color_at_ratio(1.0)
+        );
+        assert_eq!(
+            activity_text_color(None, Some(0.0), &theme),
+            theme.heat_color_at_ratio(0.0)
+        );
+    }
+
+    #[test]
+    fn activity_text_color_dimmed_when_neutral() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        assert_eq!(activity_text_color(None, None, &theme), theme.dimmed);
     }
 
     #[test]

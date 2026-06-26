@@ -12,6 +12,7 @@ use super::add::AddArgs;
 use super::automation::AutomationCommands;
 use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
+use super::hook_heat::HookHeatArgs;
 use super::hook_subagent::HookSubagentArgs;
 use super::init::InitArgs;
 use super::killall::KillallArgs;
@@ -227,6 +228,12 @@ pub enum Commands {
     #[command(name = "__hook-subagent", hide = true)]
     HookSubagent(HookSubagentArgs),
 
+    /// Internal: machine-spawned by each agent's user-prompt hook to bump the
+    /// per-session heat accumulator that drives the activity-time heat color.
+    /// Hidden from help.
+    #[command(name = "__hook-heat", hide = true)]
+    HookHeat(HookHeatArgs),
+
     /// Uninstall Agent of Empires
     Uninstall(UninstallArgs),
 
@@ -331,6 +338,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::AcpRunner(_) => return None,
         Commands::ExtractSessionId(_) => return None,
         Commands::HookSubagent(_) => return None,
+        Commands::HookHeat(_) => return None,
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",
         Commands::Completion { .. } => "completion",

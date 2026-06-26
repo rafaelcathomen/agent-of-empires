@@ -544,6 +544,53 @@ pub(crate) fn adjust_subagent_counter_via_guard(instance_id: &str, delta: i64) -
     result
 }
 
+/// Atomic read-modify-write of the per-instance `heat` accumulator on a user
+/// prompt. Decays the stored score to `now` and adds a burst-saturated
+/// increment (see [`crate::hooks::heat::HeatAccumulator::bump`]).
+///
+/// Uses an exclusive `flock` for the RMW window rather than `write_atomic`:
+/// racing prompts (two sessions, or a fast burst) must serialize their
+/// decay-then-add so no bump is lost. Garbage or missing content parses to the
+/// default accumulator and the bump proceeds, so a corrupt sidecar self-heals.
+pub(crate) fn bump_heat_via_guard(instance_id: &str, now: i64) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    validate_hook_leaf("heat")?;
+    let dir = open_instance_dir(instance_id)?;
+    let fd = openat(
+        dir.as_fd(),
+        "heat",
+        OFlag::O_RDWR | OFlag::O_CREAT | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::S_IRUSR | Mode::S_IWUSR,
+    )
+    .with_context(|| "openat heat".to_string())?;
+    let mut file = std::fs::File::from(fd);
+    file.lock_exclusive()?;
+    let result = (|| -> Result<()> {
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)?;
+        let mut acc = crate::hooks::heat::parse_accumulator(&buf).unwrap_or_default();
+        acc.bump(now);
+        file.seek(SeekFrom::Start(0))?;
+        file.set_len(0)?;
+        write!(file, "{}", crate::hooks::heat::format_accumulator(&acc))?;
+        Ok(())
+    })();
+    let _ = fs2::FileExt::unlock(&file);
+    result
+}
+
+/// Read the per-instance `heat` accumulator. Returns `None` when the dir or
+/// leaf is absent or the content is unparseable. No staleness TTL (unlike the
+/// subagent counter): heat is mathematically decayed, so an old prompt is
+/// legitimately warm; aging is expressed only via decay and the all-cold mute.
+pub(crate) fn read_heat_accumulator(
+    instance_id: &str,
+) -> Option<crate::hooks::heat::HeatAccumulator> {
+    let dir = open_instance_dir_read_only(instance_id).ok()??;
+    let bytes = read_file_at(dir.as_fd(), "heat", 64).ok()??;
+    crate::hooks::heat::parse_accumulator(&bytes)
+}
+
 /// Symlink-safe deletion of the `session_id` sidecar via `unlinkat` against
 /// a `dir_guard`-verified per-instance dirfd. Replaces path-based
 /// `std::fs::remove_file(dir.join("session_id"))` so deletion participates
@@ -1163,6 +1210,82 @@ mod tests {
             .parse()
             .unwrap();
         assert_eq!(got, 400, "flock must not lose parallel increments");
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn bump_heat_creates_then_accumulates() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        // First bump on a never-prompted session: full increment, t_last set.
+        bump_heat_via_guard("heat_first", 1_000_000).unwrap();
+        let acc = read_heat_accumulator("heat_first").unwrap();
+        assert!(
+            (acc.s - 1.0).abs() < 1e-9,
+            "first bump = full inc, got {}",
+            acc.s
+        );
+        assert_eq!(acc.t_last, 1_000_000);
+        // A second bump within the burst window adds less than a full inc.
+        bump_heat_via_guard("heat_first", 1_000_010).unwrap();
+        let acc2 = read_heat_accumulator("heat_first").unwrap();
+        assert!(
+            acc2.s > 1.0 && acc2.s < 2.0,
+            "burst-clamped, got {}",
+            acc2.s
+        );
+        assert_eq!(acc2.t_last, 1_000_010);
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn bump_heat_recovers_from_garbage() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let dir = open_instance_dir("heat_garbage").unwrap();
+        write_short(dir.as_fd(), "heat", b"not an accumulator").unwrap();
+        // Garbage parses to default; the bump then writes a valid accumulator.
+        bump_heat_via_guard("heat_garbage", 2_000_000).unwrap();
+        let acc = read_heat_accumulator("heat_garbage").unwrap();
+        assert!((acc.s - 1.0).abs() < 1e-9);
+        assert_eq!(acc.t_last, 2_000_000);
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn read_heat_accumulator_none_when_absent() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        assert!(read_heat_accumulator("heat_absent").is_none());
+    }
+
+    #[test]
+    #[serial(hook_base)]
+    fn bump_heat_parallel_no_lost_update() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        std::thread::scope(|s| {
+            for tid in 0..8u8 {
+                let b = barrier.clone();
+                let thread_base = base.clone();
+                s.spawn(move || {
+                    override_base_for_test(thread_base);
+                    reset_for_test();
+                    b.wait();
+                    // Distinct timestamps spaced by a full burst window so each
+                    // bump adds the full increment regardless of interleaving.
+                    for i in 0..10i64 {
+                        let now = 3_000_000 + (tid as i64) * 1000 + i * 100;
+                        bump_heat_via_guard("heat_par", now).unwrap();
+                    }
+                });
+            }
+        });
+        // 80 bumps, each adding a (decayed) positive increment. Lost updates
+        // under a missing flock would drop the score well below this floor.
+        let acc = read_heat_accumulator("heat_par").unwrap();
+        assert!(
+            acc.s > 5.0,
+            "flock must not lose parallel bumps, got {}",
+            acc.s
+        );
     }
 
     #[cfg(target_os = "macos")]

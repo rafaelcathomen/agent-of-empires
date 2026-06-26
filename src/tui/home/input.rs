@@ -1987,6 +1987,10 @@ impl HomeView {
                     self.group_rename_context = None;
                 }
                 DialogResult::Submit(data) => {
+                    // The group color change lives on the dialog (not in
+                    // `data`); capture it before dropping the dialog.
+                    let group_color = dialog.group_color_change();
+                    let selected_session = self.selected_session.clone();
                     self.rename_dialog = None;
                     match mode {
                         RenameMode::Session => {
@@ -1998,13 +2002,57 @@ impl HomeView {
                             ) {
                                 tracing::error!(target: "tui.input", "Failed to rename session: {}", e);
                             }
+                            // Per-session color / heat overrides are applied
+                            // separately from the rename so the rename's
+                            // cross-profile move logic stays untouched.
+                            if let Some(id) = selected_session {
+                                if data.manual_color.is_some() || data.heat_enabled.is_some() {
+                                    self.set_session_color_and_heat(
+                                        &id,
+                                        data.manual_color,
+                                        data.heat_enabled,
+                                    );
+                                }
+                            }
                         }
                         RenameMode::Group => {
+                            // Capture the old path/profile before the rename
+                            // consumes group_rename_context, then compute the
+                            // post-rename target the same way rename_selected_group
+                            // does, so the color lands on the NEW path. Applying
+                            // color via set_selected_group_color (which reads
+                            // self.selected_group) would mis-target: after the
+                            // rename's reload, selected_group can fall to a
+                            // different row.
+                            let rename_target = self.group_rename_context.as_ref().map(|ctx| {
+                                let old_path = ctx.old_path.clone();
+                                let old_profile = ctx.old_profile.clone();
+                                let new_path = match data.group.as_deref() {
+                                    Some(g) if !g.is_empty() && g != old_path => g.to_string(),
+                                    _ => old_path.clone(),
+                                };
+                                let new_profile =
+                                    data.profile.clone().unwrap_or_else(|| old_profile.clone());
+                                (new_path, new_profile)
+                            });
                             if let Err(e) = self.rename_selected_group(
                                 data.group.as_deref(),
                                 data.profile.as_deref(),
                             ) {
                                 tracing::error!(target: "tui.input", "Failed to rename group: {}", e);
+                            }
+                            // Apply the color AFTER the rename, to the resolved
+                            // new path/profile. Doing it before would be dropped
+                            // by rename_selected_group's rebuild-then-merge, which
+                            // pre-creates the new path uncolored from the migrated
+                            // sessions and then merges the old group away.
+                            if let Some(color) = group_color {
+                                match rename_target {
+                                    Some((path, profile)) => {
+                                        self.set_group_color_at(&path, &profile, color)
+                                    }
+                                    None => self.set_selected_group_color(color),
+                                }
                             }
                         }
                     }
@@ -3995,6 +4043,8 @@ impl HomeView {
             let current_profile = inst.source_profile.clone();
             let title = inst.title.clone();
             let group_path = inst.group_path.clone();
+            let manual_color = inst.manual_color;
+            let heat_enabled = inst.heat_enabled;
             // Capture branch context up front; a tied aoe-managed worktree
             // can opt to rename the branch alongside the directory.
             let branch_ctx = inst
@@ -4011,7 +4061,8 @@ impl HomeView {
                 &current_profile,
                 profiles,
                 existing_groups,
-            );
+            )
+            .with_session_settings(manual_color, heat_enabled);
             if self.tie_workdir_applies_for(&id) {
                 if let Some((branch, main_repo)) = branch_ctx {
                     // The upstream probe is a quick `git for-each-ref`; this
@@ -4045,21 +4096,33 @@ impl HomeView {
             // names must be scoped to this group's profile too. Spanning all
             // profiles would falsely block renaming to a name that only
             // collides with a same-named group in a different profile.
-            let existing_groups: Vec<String> = self
+            let groups_in_profile = self
                 .group_trees
                 .get(&current_profile)
-                .map(|t| t.get_all_groups().iter().map(|g| g.path.clone()).collect())
+                .map(|t| t.get_all_groups());
+            let existing_groups: Vec<String> = groups_in_profile
+                .as_ref()
+                .map(|gs| gs.iter().map(|g| g.path.clone()).collect())
                 .unwrap_or_default();
+            // Seed the dialog with the current spine color so an untouched
+            // dialog reports no color change.
+            let current_color = groups_in_profile
+                .as_ref()
+                .and_then(|gs| gs.iter().find(|g| g.path == group_path))
+                .and_then(|g| g.color);
             self.group_rename_context = Some(super::GroupRenameContext {
                 old_path: group_path.clone(),
                 old_profile: current_profile.clone(),
             });
-            self.rename_dialog = Some(RenameDialog::new_for_group(
-                &group_path,
-                &current_profile,
-                profiles,
-                existing_groups,
-            ));
+            self.rename_dialog = Some(
+                RenameDialog::new_for_group(
+                    &group_path,
+                    &current_profile,
+                    profiles,
+                    existing_groups,
+                )
+                .with_group_color(current_color),
+            );
         }
     }
 

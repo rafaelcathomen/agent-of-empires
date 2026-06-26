@@ -287,8 +287,8 @@ mod tests {
     /// criterion #4 (byte-for-byte, not "contains the guard substring").
     fn assert_claude_canonical(claude: &Path) {
         use crate::hooks::{
-            canonical_session_id_command, canonical_status_command, canonical_subagent_command,
-            HookInstallTarget,
+            canonical_heat_command, canonical_session_id_command, canonical_status_command,
+            canonical_subagent_command, HookInstallTarget,
         };
         let parsed: Value = serde_json::from_str(&fs::read_to_string(claude).unwrap()).unwrap();
         let hooks = parsed["hooks"].as_object().expect("hooks present");
@@ -329,6 +329,9 @@ mod tests {
                     if let Some(delta) = event_def.subagent_delta {
                         canonical_set
                             .push(canonical_subagent_command(delta, HookInstallTarget::Host));
+                    }
+                    if event_def.heat {
+                        canonical_set.push(canonical_heat_command(HookInstallTarget::Host));
                     }
                     if let Some(status) = event_def.status {
                         canonical_set

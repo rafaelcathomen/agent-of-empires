@@ -8,6 +8,7 @@
 //! Hook events are agent-specific and defined in `AgentHookConfig::events`.
 
 mod dir_guard;
+pub(crate) mod heat;
 mod status_file;
 
 #[cfg(test)]
@@ -20,14 +21,14 @@ use fs2::FileExt as _;
 use serde_json::Value;
 
 pub(crate) use dir_guard::{
-    adjust_subagent_counter_via_guard, ensure_instance_dir_path, hook_base_path,
-    unlink_session_id_via_guard, write_session_id_via_guard,
+    adjust_subagent_counter_via_guard, bump_heat_via_guard, ensure_instance_dir_path,
+    hook_base_path, unlink_session_id_via_guard, write_session_id_via_guard,
 };
 #[cfg(test)]
 pub(crate) use dir_guard::{clear_base_override_for_test, override_base_for_test, reset_for_test};
 pub use status_file::{
-    cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
-    read_hook_subagent_active, read_hook_urgent,
+    cleanup_hook_status_dir, hook_status_dir, read_hook_heat, read_hook_session_id,
+    read_hook_status, read_hook_subagent_active, read_hook_urgent,
 };
 
 /// Single source of truth for the `aoe-hooks` identity token. Defined as a
@@ -426,6 +427,33 @@ fn hook_command_subagent(delta: i64, target: HookInstallTarget) -> String {
     }
 }
 
+/// Host command for the per-session heat hook. Bumps the heat accumulator on
+/// each user prompt via `aoe __hook-heat`. Mirrors [`hook_command_subagent`]
+/// but reads no stdin and bakes no delta; the subcommand reads the wall clock
+/// itself. Carries the same adopted-session tmux fallback as
+/// [`hook_command_session_id_host`] so a `register`ed session (whose process
+/// env lacks `AOE_INSTANCE_ID`) still resolves the id and counts heat.
+fn hook_command_heat(target: HookInstallTarget) -> String {
+    match target {
+        HookInstallTarget::Host => format!(
+            "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || AOE_INSTANCE_ID=$(tmux show-environment -h AOE_INSTANCE_ID 2>/dev/null | grep \"^AOE_INSTANCE_ID=\" | cut -d= -f2-); \
+             [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; export AOE_INSTANCE_ID; \
+             command -v aoe >/dev/null 2>&1 || exit 0; \
+             aoe __hook-heat 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
+        ),
+        // Same rationale as the subagent counter: `aoe` is absent inside the
+        // container, so heat tracking is a no-op there. Marker-terminated so
+        // uninstall still recognises the command.
+        HookInstallTarget::Sandbox => format!("sh -c 'exit 0 # {AOE_HOOK_MARKER}'"),
+    }
+}
+
+/// Test-only sibling of [`canonical_status_command`] for the `heat` branch.
+#[cfg(test)]
+pub(crate) fn canonical_heat_command(target: HookInstallTarget) -> String {
+    hook_command_heat(target)
+}
+
 fn hook_command_session_id_sandbox(base: &str) -> String {
     format!(
         "sh -c 'unset IFS; set -f; umask 077; \
@@ -804,6 +832,7 @@ fn kiro_config_has_aoe_marker(path: &Path) -> bool {
 /// - `event.subagent_delta.is_some()` → subagent counter command (reads
 ///   stdin to confirm `tool_name` on the +1 path; placed before the status
 ///   writer for the same stdin-first reason).
+/// - `event.heat` → heat-bump command (`aoe __hook-heat`, reads no stdin).
 /// - `event.status.is_some()` → status-writer command (does not read
 ///   stdin).
 ///
@@ -821,6 +850,12 @@ fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarge
         // the session-id extractor above).
         if let Some(delta) = event.subagent_delta {
             commands.push(hook_command_subagent(delta, target));
+        }
+        // Heat bump precedes the status writer too; it reads no stdin, so order
+        // relative to the status writer is immaterial, but keeping all the
+        // `aoe`-subcommand hooks ahead of the status writer is the house style.
+        if event.heat {
+            commands.push(hook_command_heat(target));
         }
         if let Some(status) = event.status {
             commands.push(hook_command(status, target));
@@ -3795,8 +3830,8 @@ hooks_auto_accept: false
         let entries = user_prompt[0]["hooks"].as_array().unwrap();
         assert_eq!(
             entries.len(),
-            2,
-            "UserPromptSubmit should emit status + session_id_capture"
+            3,
+            "UserPromptSubmit should emit session_id_capture + heat + status"
         );
         let commands: Vec<&str> = entries
             .iter()
@@ -3804,6 +3839,9 @@ hooks_auto_accept: false
             .collect();
         assert!(commands.iter().any(|c| c.contains("printf running")));
         assert!(commands.iter().any(|c| c.contains("session_id")));
+        // Heat is a no-op marker command under the Sandbox target (aoe is
+        // absent in the container), so it is detectable only by the marker.
+        // Confirm the count reflects its presence rather than its body here.
     }
 
     #[test]

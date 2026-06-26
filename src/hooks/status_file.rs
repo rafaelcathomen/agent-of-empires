@@ -162,6 +162,16 @@ pub fn read_hook_subagent_active(instance_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Read the hook-written `heat` accumulator for the given instance.
+///
+/// Returns `None` when the sidecar is absent, the instance id is unsafe, or
+/// the content is unparseable. Unlike the subagent counter there is no
+/// staleness TTL: heat is mathematically decayed by the reader, so an old
+/// accumulator is legitimately cool rather than ignored.
+pub fn read_hook_heat(instance_id: &str) -> Option<crate::hooks::heat::HeatAccumulator> {
+    dir_guard::read_heat_accumulator(instance_id)
+}
+
 /// Remove the hook status directory for a given instance (cleanup on stop/delete).
 /// Symlink-safe via `dir_guard::remove_instance_dir` (`unlinkat` walk).
 pub fn cleanup_hook_status_dir(instance_id: &str) {
@@ -504,5 +514,65 @@ mod tests {
         assert!(read_hook_subagent_active("sa_clean"));
         cleanup_hook_status_dir("sa_clean");
         assert!(!read_hook_subagent_active("sa_clean"));
+    }
+
+    fn write_heat_via_guard(instance_id: &str, content: &str) {
+        let dir = dir_guard::open_instance_dir(instance_id).unwrap();
+        dir_guard::write_short(dir.as_fd(), "heat", content.as_bytes()).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn read_hook_heat_some_for_written_accumulator() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_heat_via_guard("heat_read", "2.5 1700000000");
+        let acc = read_hook_heat("heat_read").unwrap();
+        assert!((acc.s - 2.5).abs() < 1e-9);
+        assert_eq!(acc.t_last, 1_700_000_000);
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn read_hook_heat_none_when_absent() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        assert!(read_hook_heat("heat_no_file").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn read_hook_heat_none_for_unsafe_id() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        assert!(read_hook_heat("../etc").is_none());
+        assert!(read_hook_heat("").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn read_hook_heat_ignores_age_no_ttl() {
+        // Unlike the subagent counter, an old heat sidecar is still read; the
+        // reader decays it rather than dropping it on a staleness TTL.
+        let (_g, base, _tmp) = BaseGuard::ready();
+        write_heat_via_guard("heat_old", "3.0 1700000000");
+        let stale = std::time::SystemTime::now() - Duration::from_secs(10 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(base.join("heat_old").join("heat"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+        assert!(
+            read_hook_heat("heat_old").is_some(),
+            "old heat must still be read"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn read_hook_heat_none_after_cleanup() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_heat_via_guard("heat_clean", "1.0 1700000000");
+        assert!(read_hook_heat("heat_clean").is_some());
+        cleanup_hook_status_dir("heat_clean");
+        assert!(read_hook_heat("heat_clean").is_none());
     }
 }

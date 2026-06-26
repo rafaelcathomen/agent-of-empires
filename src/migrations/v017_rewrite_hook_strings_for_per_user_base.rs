@@ -577,6 +577,11 @@ mod tests {
                     if cmd.contains("aoe __hook-subagent") {
                         continue;
                     }
+                    // The heat-bump command (user-prompt events) likewise does
+                    // not bake the per-user base preamble; skip it.
+                    if cmd.contains("aoe __hook-heat") {
+                        continue;
+                    }
                     status_writers += 1;
                     assert!(
                         cmd.contains("drwx------|drwx------.|drwx------+|drwx------@"),

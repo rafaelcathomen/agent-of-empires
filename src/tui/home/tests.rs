@@ -5229,6 +5229,56 @@ fn test_rename_selected_group_path() {
 
 #[test]
 #[serial]
+fn test_rename_group_with_color_carries_color_to_new_path() {
+    use crate::session::FolderColor;
+
+    let mut env = create_test_env_with_groups();
+
+    // Select the "work" group, mirroring what opening the r-menu on a folder does.
+    env.view.selected_group = Some("work".to_string());
+    env.view.selected_group_profile = Some("test".to_string());
+    env.view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "work".to_string(),
+        old_profile: "test".to_string(),
+    });
+
+    // Combined submit: rename, then color the resolved new path (the order the
+    // Group submit arm uses, so the color survives the rebuild-then-merge).
+    env.view
+        .rename_selected_group(Some("projects"), None)
+        .unwrap();
+    env.view
+        .set_group_color_at("projects", "test", Some(FolderColor::Teal));
+
+    // The session followed the rename.
+    let work_session = env
+        .view
+        .instances()
+        .iter()
+        .find(|i| i.title == "work-project")
+        .unwrap();
+    assert_eq!(work_session.group_path, "projects");
+
+    // The color landed on the NEW path on disk, not the stale "work" path.
+    let storage = Storage::new_unwatched("test").unwrap();
+    let (_insts, groups) = storage.load_with_groups().unwrap();
+    let projects = groups
+        .iter()
+        .find(|g| g.path == "projects")
+        .expect("renamed group must exist on disk");
+    assert_eq!(
+        projects.color,
+        Some(FolderColor::Teal),
+        "color must follow the rename to the new path"
+    );
+    assert!(
+        !groups.iter().any(|g| g.path == "work"),
+        "old path must not survive on disk"
+    );
+}
+
+#[test]
+#[serial]
 fn test_rename_selected_group_with_children() {
     use crate::session::GroupTree;
 
@@ -13852,5 +13902,166 @@ mod live_send_boot_size_tests {
             !matches!(seed, Some((0, _)) | Some((_, 0))),
             "empty preview rect must fall back, not seed a 0-dimension size; got {seed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod heat_rmenu_tests {
+    use super::{create_test_env_with_sessions, setup_test_home};
+    use crate::hooks::heat::HeatLevel;
+    use crate::hooks::test_support::BaseGuard;
+    use crate::session::{FolderColor, GroupTree, Instance, Storage};
+    use crate::tmux::AvailableTools;
+    use crate::tui::home::HomeView;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    #[test]
+    #[serial]
+    fn set_session_color_and_heat_persists_and_reloads() {
+        // BaseGuard isolates the hook base; HOME is set per-test below.
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+        let storage = Storage::new_unwatched("test").unwrap();
+        let mut inst = Instance::new("s0", "/tmp/s0");
+        inst.source_profile = "test".to_string();
+        let id = inst.id.clone();
+        storage
+            .update(|i, g| {
+                *i = vec![inst.clone()];
+                *g = GroupTree::new_with_groups(&[inst.clone()], &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        let tools = AvailableTools::with_tools(&["claude"]);
+        let mut view = HomeView::new(
+            Some("test".to_string()),
+            tools,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+
+        view.set_session_color_and_heat(&id, Some(Some(FolderColor::Teal)), Some(Some(false)));
+
+        // In memory.
+        let got = view.instances.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(got.manual_color, Some(FolderColor::Teal));
+        assert_eq!(got.heat_enabled, Some(false));
+
+        // On disk: reload a fresh storage and confirm the fields persisted.
+        let reload = Storage::new_unwatched("test").unwrap();
+        let disk = reload.load().unwrap();
+        let disk_inst = disk.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(disk_inst.manual_color, Some(FolderColor::Teal));
+        assert_eq!(disk_inst.heat_enabled, Some(false));
+    }
+
+    #[test]
+    #[serial]
+    fn recompute_heat_neutral_when_never_prompted() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let mut env = create_test_env_with_sessions(2);
+        // Default config has heat on, but no session ever fired a prompt hook,
+        // so every row stays Neutral (the all-cold mute via freshest==0).
+        env.view.recompute_heat();
+        assert!(env
+            .view
+            .instances
+            .iter()
+            .all(|i| i.heat_level == HeatLevel::Neutral));
+    }
+
+    #[test]
+    #[serial]
+    fn recompute_heat_ramps_a_prompted_session() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let mut env = create_test_env_with_sessions(1);
+        // Source profile must match so the working-set filter keeps the row.
+        env.view.instances[0].source_profile = "test".to_string();
+        let id = env.view.instances[0].id.clone();
+        let now = chrono::Utc::now().timestamp();
+        crate::hooks::bump_heat_via_guard(&id, now).unwrap();
+
+        env.view.recompute_heat();
+        // A single fresh prompt reads warm (pre-engage ramp), not Neutral.
+        assert!(matches!(
+            env.view.instances[0].heat_level,
+            HeatLevel::Ramp(_)
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn recompute_heat_excludes_archived_and_off_rows() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let mut env = create_test_env_with_sessions(2);
+        for inst in &mut env.view.instances {
+            inst.source_profile = "test".to_string();
+        }
+        let now = chrono::Utc::now().timestamp();
+        // Prompt both, then archive the first and force-off heat on it.
+        let id0 = env.view.instances[0].id.clone();
+        let id1 = env.view.instances[1].id.clone();
+        crate::hooks::bump_heat_via_guard(&id0, now).unwrap();
+        crate::hooks::bump_heat_via_guard(&id1, now).unwrap();
+        env.view.instances[0].archived_at = Some(chrono::Utc::now());
+
+        env.view.recompute_heat();
+        // Archived row is Neutral; the live row ramps.
+        let a = env.view.instances.iter().find(|i| i.id == id0).unwrap();
+        let b = env.view.instances.iter().find(|i| i.id == id1).unwrap();
+        assert_eq!(a.heat_level, HeatLevel::Neutral, "archived excluded");
+        assert!(matches!(b.heat_level, HeatLevel::Ramp(_)));
+    }
+
+    #[test]
+    #[serial]
+    fn recompute_heat_active_never_prompted_stays_neutral() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let mut env = create_test_env_with_sessions(2);
+        for inst in &mut env.view.instances {
+            inst.source_profile = "test".to_string();
+        }
+        // Prompt only the first session; the second is Running for a non-prompt
+        // reason (a tool call, an adopted session before its first prompt) and
+        // never fired the hook, so it must read Neutral, not a warm active floor.
+        let id0 = env.view.instances[0].id.clone();
+        let id1 = env.view.instances[1].id.clone();
+        crate::hooks::bump_heat_via_guard(&id0, chrono::Utc::now().timestamp()).unwrap();
+        env.view.instances[1].status = crate::session::Status::Running;
+
+        env.view.recompute_heat();
+        let a = env.view.instances.iter().find(|i| i.id == id0).unwrap();
+        let b = env.view.instances.iter().find(|i| i.id == id1).unwrap();
+        assert!(matches!(a.heat_level, HeatLevel::Ramp(_)));
+        assert_eq!(
+            b.heat_level,
+            HeatLevel::Neutral,
+            "active but never-prompted stays Neutral"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn recompute_heat_all_neutral_when_global_off_and_no_override() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let mut env = create_test_env_with_sessions(1);
+        env.view.instances[0].source_profile = "test".to_string();
+        let id = env.view.instances[0].id.clone();
+        crate::hooks::bump_heat_via_guard(&id, chrono::Utc::now().timestamp()).unwrap();
+        // Global off and no per-session override: short-circuit to Neutral.
+        env.view.heat_indicator = false;
+        env.view.recompute_heat();
+        assert_eq!(env.view.instances[0].heat_level, HeatLevel::Neutral);
+
+        // A per-session force-on override re-engages it.
+        env.view.instances[0].heat_enabled = Some(true);
+        env.view.recompute_heat();
+        assert!(matches!(
+            env.view.instances[0].heat_level,
+            HeatLevel::Ramp(_)
+        ));
     }
 }

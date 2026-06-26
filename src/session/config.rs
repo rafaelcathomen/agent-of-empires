@@ -1215,6 +1215,21 @@ pub struct SessionConfig {
     )]
     pub unread_indicator: bool,
 
+    /// Color the right-aligned activity/time text by per-session heat: a
+    /// relative frecency gradient (hot = used heavily and recently, cool =
+    /// drifted from) driven by user prompts. When off, the time text uses the
+    /// neutral dimmed color, today's look. Per-session overrides (the r-menu
+    /// "Heat: on/off") still apply on top of this default. Unlike
+    /// `unread_indicator` this is not on a sort hot path, so it is read per
+    /// poll and stays profile-overridable rather than `global_only`.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Session Heat Indicator",
+        widget = "toggle",
+        category = "Interaction"
+    )]
+    pub heat_indicator: bool,
+
     /// Show occasional discovery tips: the `💡` badge in the footer, the
     /// browsable tips overlay, and the one-time earned pop. Turn this off to
     /// hide the badge and stop tips from popping; seen/earned state still lives
@@ -1354,6 +1369,7 @@ impl Default for SessionConfig {
             click_action: ClickAction::default(),
             confirm_before_quit: true,
             unread_indicator: true,
+            heat_indicator: true,
             show_tips: true,
             tie_workdir_to_name: true,
         }

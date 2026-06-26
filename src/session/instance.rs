@@ -380,6 +380,27 @@ pub struct Instance {
     /// session JSON loadable.
     #[serde(default)]
     pub subagent_active: bool,
+    /// Manual per-session color override for the right-aligned activity/time
+    /// text, picked from the shared [`crate::session::FolderColor`] palette via
+    /// the r-menu. Highest-precedence color input: when set, it paints the time
+    /// text directly and heat is not consulted. `None` (default) means no
+    /// manual color. Persisted additively; legacy session JSON omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual_color: Option<crate::session::FolderColor>,
+    /// Per-session heat-indicator override set via the r-menu. `None` (default)
+    /// inherits the global `session.heat_indicator` toggle; `Some(true)` forces
+    /// the heat color on for this session even when the global toggle is off;
+    /// `Some(false)` forces it off. Only consulted when `manual_color` is
+    /// `None`. Persisted additively; legacy session JSON omits it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heat_enabled: Option<bool>,
+    /// Runtime-only cached heat level, recomputed once per status poll in
+    /// `HomeView::recompute_heat` (which decays the whole loaded working set to
+    /// one shared `now` and normalizes to a ratio) and read by the row
+    /// renderer. Never persisted: `#[serde(skip)]` keeps it out of session JSON
+    /// and it resets to `Neutral` on load.
+    #[serde(skip)]
+    pub heat_level: crate::hooks::heat::HeatLevel,
     pub created_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_accessed_at: Option<DateTime<Utc>>,
@@ -851,6 +872,9 @@ impl Instance {
             yolo_mode: false,
             status: Status::Idle,
             subagent_active: false,
+            manual_color: None,
+            heat_enabled: None,
+            heat_level: crate::hooks::heat::HeatLevel::default(),
             created_at: Utc::now(),
             last_accessed_at: None,
             idle_entered_at: None,
@@ -1162,6 +1186,12 @@ impl Instance {
         }
         if pre.unread != post.unread {
             self.unread = post.unread;
+        }
+        if pre.manual_color != post.manual_color {
+            self.manual_color = post.manual_color;
+        }
+        if pre.heat_enabled != post.heat_enabled {
+            self.heat_enabled = post.heat_enabled;
         }
         if pre.base_branch_override != post.base_branch_override {
             self.base_branch_override = post.base_branch_override.clone();
@@ -4291,6 +4321,54 @@ mod tests {
         }))
         .expect("deserialize without plugin_meta");
         assert!(inst.plugin_meta.is_empty());
+    }
+
+    #[test]
+    fn test_manual_color_and_heat_enabled_serde_round_trip() {
+        // Defaults (None) are omitted from disk.
+        let inst = Instance::new("t", "/tmp");
+        let json = serde_json::to_value(&inst).unwrap();
+        assert!(
+            json.get("manual_color").is_none(),
+            "None manual_color omitted"
+        );
+        assert!(
+            json.get("heat_enabled").is_none(),
+            "None heat_enabled omitted"
+        );
+
+        // A manual color serializes as its snake_case token and round-trips.
+        let mut set = Instance::new("t", "/tmp");
+        set.manual_color = Some(crate::session::FolderColor::Teal);
+        set.heat_enabled = Some(false);
+        let json = serde_json::to_value(&set).unwrap();
+        assert_eq!(json["manual_color"], "teal");
+        // Some(false) MUST persist (it is a deliberate per-session opt-out).
+        assert_eq!(json["heat_enabled"], false);
+        let back: Instance = serde_json::from_value(json).unwrap();
+        assert_eq!(back.manual_color, Some(crate::session::FolderColor::Teal));
+        assert_eq!(back.heat_enabled, Some(false));
+
+        // Some(true) round-trips too.
+        let mut on = Instance::new("t", "/tmp");
+        on.heat_enabled = Some(true);
+        let back: Instance = serde_json::from_value(serde_json::to_value(&on).unwrap()).unwrap();
+        assert_eq!(back.heat_enabled, Some(true));
+
+        // Legacy rows without the fields deserialize to None.
+        let legacy: Instance = serde_json::from_value(serde_json::json!({
+            "id": "abc",
+            "title": "t",
+            "project_path": "/tmp",
+            "tool": "claude",
+            "status": "idle",
+            "created_at": "2026-01-01T00:00:00Z",
+        }))
+        .expect("deserialize without manual_color/heat_enabled");
+        assert_eq!(legacy.manual_color, None);
+        assert_eq!(legacy.heat_enabled, None);
+        // The runtime cache resets to Neutral on load.
+        assert_eq!(legacy.heat_level, crate::hooks::heat::HeatLevel::Neutral);
     }
 
     #[test]

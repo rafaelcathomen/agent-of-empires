@@ -64,6 +64,12 @@ pub struct HookEvent {
     /// `crate::hooks` `build_aoe_hooks`. Detection analogue of
     /// `session_id_capture`.
     pub subagent_delta: Option<i64>,
+    /// When `true`, install an `aoe __hook-heat` command on this event that
+    /// bumps the per-instance heat accumulator. Set only on each agent's
+    /// user-prompt event (Claude/Cursor/Qwen/Codex `UserPromptSubmit`, Gemini
+    /// `BeforeAgent`) so the heat indicator counts user prompts. Independent of
+    /// `session_id_capture` because Cursor/Qwen want heat but not capture.
+    pub heat: bool,
 }
 
 /// On-disk format an agent uses for its status-detection hooks. Each variant
@@ -215,6 +221,7 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         status: None,
         session_id_capture: true,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "PreToolUse",
@@ -222,6 +229,7 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("running"),
         session_id_capture: false,
         subagent_delta: Some(1),
+        heat: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
@@ -229,6 +237,7 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("running"),
         session_id_capture: true,
         subagent_delta: None,
+        heat: true,
     },
     HookEvent {
         name: "Stop",
@@ -236,6 +245,7 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("idle"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "SubagentStop",
@@ -243,6 +253,7 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         status: None,
         session_id_capture: false,
         subagent_delta: Some(-1),
+        heat: false,
     },
     HookEvent {
         name: "Notification",
@@ -250,6 +261,7 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("waiting"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "ElicitationResult",
@@ -257,6 +269,7 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("running"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
 ];
 
@@ -271,6 +284,7 @@ const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("running"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
@@ -278,6 +292,7 @@ const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("running"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: true,
     },
     HookEvent {
         name: "Stop",
@@ -285,6 +300,7 @@ const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("idle"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "Notification",
@@ -292,6 +308,7 @@ const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("waiting"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "ElicitationResult",
@@ -299,6 +316,7 @@ const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("running"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
 ];
 
@@ -313,6 +331,7 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("running"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
@@ -320,6 +339,7 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("running"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: true,
     },
     HookEvent {
         name: "PostToolUse",
@@ -327,6 +347,7 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("running"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "Stop",
@@ -334,6 +355,7 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("idle"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "Notification",
@@ -341,6 +363,7 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("waiting"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
 ];
 
@@ -352,6 +375,7 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("idle"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
@@ -359,6 +383,7 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("running"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: true,
     },
     HookEvent {
         name: "PreToolUse",
@@ -366,6 +391,7 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("running"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "PermissionRequest",
@@ -373,6 +399,7 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("waiting"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "PostToolUse",
@@ -380,6 +407,7 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("running"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "Stop",
@@ -387,6 +415,7 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
         status: Some("idle"),
         session_id_capture: false,
         subagent_delta: None,
+        heat: false,
     },
 ];
 
@@ -504,6 +533,7 @@ pub const AGENTS: &[AgentDef] = &[
                     status: Some("running"),
                     session_id_capture: false,
                     subagent_delta: None,
+                    heat: false,
                 },
                 HookEvent {
                     name: "BeforeAgent",
@@ -511,6 +541,7 @@ pub const AGENTS: &[AgentDef] = &[
                     status: Some("running"),
                     session_id_capture: false,
                     subagent_delta: None,
+                    heat: true,
                 },
                 HookEvent {
                     name: "AfterAgent",
@@ -518,6 +549,7 @@ pub const AGENTS: &[AgentDef] = &[
                     status: Some("idle"),
                     session_id_capture: false,
                     subagent_delta: None,
+                    heat: false,
                 },
                 HookEvent {
                     name: "Notification",
@@ -525,6 +557,7 @@ pub const AGENTS: &[AgentDef] = &[
                     status: Some("waiting"),
                     session_id_capture: false,
                     subagent_delta: None,
+                    heat: false,
                 },
             ],
             format: HookFormat::JsonSettings,

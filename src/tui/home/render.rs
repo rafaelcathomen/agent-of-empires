@@ -1353,8 +1353,10 @@ impl HomeView {
 
         let mut line_spans = Vec::with_capacity(6);
         // Tree-style indent guides: one width-1 gutter column per depth level.
-        // For level L, draw a colored vertical bar in the color of the folder
-        // at depth L when that ancestor is colored, otherwise a blank space.
+        // For level L, draw a vertical guide bar in the color of the folder
+        // at depth L when that ancestor is colored, otherwise in the neutral
+        // dimmed color so every nesting level shows a guide line (not just
+        // colored folders).
         // Total width equals the row depth, so this replaces the old plain
         // indent column-for-column; relative indentation, icon alignment, and
         // the right-aligned activity column all stay correct. Bars are
@@ -1369,7 +1371,9 @@ impl HomeView {
                     "\u{2502}",
                     Style::default().fg(folder_color_fg(Some(*c), theme)),
                 )),
-                None => line_spans.push(Span::raw(" ")),
+                None => {
+                    line_spans.push(Span::styled("\u{2502}", Style::default().fg(theme.dimmed)))
+                }
             }
         }
         let icon_style = if is_match {

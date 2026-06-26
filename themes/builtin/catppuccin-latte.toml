@@ -24,8 +24,8 @@ terminal_active = "#1e66f5"
 # distinct from the peach waiting and the pink-red error; cold is a muted
 # slate-blue darker than dimmed, never the saturated subagent blue.
 subagent_active = "#3a5ccc"
-heat_hot = "#c4380d"
-heat_cold = "#6c7398"
+heat_hot = "#f0f921"
+heat_cold = "#0d0887"
 group = "#179299"
 search = "#7287fd"
 accent = "#fe640b"

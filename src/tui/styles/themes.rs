@@ -106,17 +106,19 @@ pub struct Theme {
     #[serde(with = "hex_color")]
     pub subagent_active: Color,
 
-    /// Hot end of the per-session heat ramp (most-used sessions). Interpolated
-    /// toward `heat_cold` by the heat ratio and painted on the right-aligned
-    /// activity/time text. A theme-independent warm orange: deriving it from
-    /// `accent`/`fresh_idle` was verified to collide with the status/spinner
-    /// colors in most builtin themes, so it is a fixed endpoint.
+    /// Hot end of the per-session heat ramp (most-used sessions): a bright
+    /// plasma yellow. The ramp runs from `heat_cold` (blue) through fixed
+    /// purple/magenta/orange stops up to this yellow, painted on the
+    /// right-aligned activity/time text. Endpoints are theme-independent
+    /// (deriving them from `accent`/`fresh_idle` collided with status/spinner
+    /// colors in most builtins).
     #[serde(with = "hex_color")]
     pub heat_hot: Color,
-    /// Cold end of the per-session heat ramp (drifted-from sessions). A muted,
-    /// low-chroma slate-blue, deliberately desaturated so it never reads like
-    /// the blue subagent spinner or the green running / yellow waiting / red
-    /// error status colors. The fully-neutral state still uses `dimmed`.
+    /// Cold end of the per-session heat ramp (drifted-from sessions): a deep
+    /// plasma blue. Saturated on purpose so the ramp reads as a real
+    /// temperature scale; it lives in the right-aligned time column, distinct
+    /// from the left-edge subagent spinner, and is never byte-equal to a status
+    /// color. The fully-neutral (heat-off / all-cold) state still uses `dimmed`.
     #[serde(with = "hex_color")]
     pub heat_cold: Color,
 
@@ -294,23 +296,33 @@ impl Theme {
     }
 
     /// Continuous hot->cold heat color for a normalized ratio in `[0, 1]`
-    /// (`1.0` = hottest, most-used; `0.0` = coldest). Interpolates per RGB
-    /// component between `heat_cold` and `heat_hot`. If either endpoint is not
-    /// truecolor (a low-color terminal downsampled them to palette indices, so
-    /// a clean component lerp is impossible) it falls back to `dimmed`, the
-    /// same neutral look a heat-disabled row gets.
+    /// (`1.0` = hottest, most-used; `0.0` = coldest). A plasma-style ramp:
+    /// `heat_cold` (blue) -> purple -> magenta -> orange -> `heat_hot`
+    /// (yellow). The two endpoints come from the theme; the three interior
+    /// hues are fixed so the ramp keeps its plasma character on every theme.
+    /// If either endpoint is not truecolor (a low-color terminal downsampled
+    /// them to palette indices, so a clean component lerp is impossible) it
+    /// falls back to `dimmed`, the same neutral look a heat-disabled row gets.
     pub fn heat_color_at_ratio(&self, ratio: f32) -> Color {
         let ratio = ratio.clamp(0.0, 1.0);
-        let (Some((cr, cg, cb)), Some((hr, hg, hb))) = (
+        let (Some(cold), Some(hot)) = (
             rgb_components(self.heat_cold),
             rgb_components(self.heat_hot),
         ) else {
             return self.dimmed;
         };
-        let lerp = |cold: u8, hot: u8| -> u8 {
-            (cold as f32 + (hot as f32 - cold as f32) * ratio).round() as u8
-        };
-        Color::Rgb(lerp(cr, hr), lerp(cg, hg), lerp(cb, hb))
+        // Fixed interior plasma stops (purple, magenta, orange) sit between the
+        // themed cold and hot endpoints: 4 equal segments across [0, 1].
+        const PURPLE: (u8, u8, u8) = (126, 3, 168);
+        const MAGENTA: (u8, u8, u8) = (204, 71, 120);
+        const ORANGE: (u8, u8, u8) = (248, 149, 64);
+        let stops = [cold, PURPLE, MAGENTA, ORANGE, hot];
+        let seg = ratio * 4.0;
+        let i = (seg.floor() as usize).min(3);
+        let t = seg - i as f32;
+        let lerp = |a: u8, b: u8| -> u8 { (a as f32 + (b as f32 - a as f32) * t).round() as u8 };
+        let (a, b) = (stops[i], stops[i + 1]);
+        Color::Rgb(lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
     }
 }
 
@@ -566,14 +578,10 @@ mod tests {
         // Clamp out-of-range.
         assert_eq!(theme.heat_color_at_ratio(2.0), theme.heat_hot);
         assert_eq!(theme.heat_color_at_ratio(-1.0), theme.heat_cold);
-        // Midpoint is the rounded per-component average.
-        let (Color::Rgb(cr, cg, cb), Color::Rgb(hr, hg, hb)) = (theme.heat_cold, theme.heat_hot)
-        else {
-            panic!("empire heat endpoints must be truecolor");
-        };
-        let mid = theme.heat_color_at_ratio(0.5);
-        let avg = |c: u8, h: u8| (c as f32 + (h as f32 - c as f32) * 0.5).round() as u8;
-        assert_eq!(mid, Color::Rgb(avg(cr, hr), avg(cg, hg), avg(cb, hb)));
+        // Interior plasma stops land exactly on the quarter points.
+        assert_eq!(theme.heat_color_at_ratio(0.25), Color::Rgb(126, 3, 168));
+        assert_eq!(theme.heat_color_at_ratio(0.5), Color::Rgb(204, 71, 120));
+        assert_eq!(theme.heat_color_at_ratio(0.75), Color::Rgb(248, 149, 64));
     }
 
     #[test]
@@ -592,10 +600,11 @@ mod tests {
     }
 
     #[test]
-    fn heat_cold_end_is_muted_not_status_or_spinner() {
-        // The cold end must not collide with any saturated status / spinner /
-        // activity color in any builtin, so a cold row never reads as a live
-        // signal. It is also low-chroma (max channel spread bounded).
+    fn heat_cold_end_distinct_from_status_and_spinner() {
+        // The cold end is a saturated plasma blue (deliberate, so the ramp
+        // reads as a real temperature scale). It must still not be byte-equal
+        // to any status / spinner / activity color in any builtin, so a cold
+        // row never renders as an exact live-signal color.
         for name in builtin_theme_names() {
             let theme = load_theme(name);
             for clash in [
@@ -610,15 +619,6 @@ mod tests {
                 assert_ne!(
                     theme.heat_cold, clash,
                     "{name}: heat_cold collides with a status/spinner color"
-                );
-            }
-            if let Color::Rgb(r, g, b) = theme.heat_cold {
-                let max = r.max(g).max(b) as i32;
-                let min = r.min(g).min(b) as i32;
-                assert!(
-                    max - min <= 80,
-                    "{name}: heat_cold chroma spread {} too high (not muted)",
-                    max - min
                 );
             }
         }

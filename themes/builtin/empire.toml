@@ -25,8 +25,8 @@ subagent_active = "#3b82f6"
 # Per-session heat ramp endpoints. Hot is a warm orange distinct from the
 # amber waiting and red error; cold is a muted slate-blue, desaturated so it
 # never reads like the blue subagent spinner or the green running state.
-heat_hot = "#f97316"
-heat_cold = "#5b6b86"
+heat_hot = "#f0f921"
+heat_cold = "#0d0887"
 group = "#cbd5e1"
 search = "#fbbf24"
 accent = "#d97706"

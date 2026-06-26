@@ -264,7 +264,13 @@ impl RenameDialog {
     }
 
     fn recompute_group_ghost(&mut self) {
-        self.group_ghost = GroupGhostCompletion::compute(&self.new_group, &self.existing_groups);
+        // Suffix matching (resolve a leaf to an existing nested path) is wanted
+        // when MOVING a session into a folder (Session mode's group field) but
+        // not when renaming a group's own name (Group mode), where the typed
+        // text is a brand-new name and an unrelated suffix hit would surprise.
+        let suffix_match = self.mode == RenameMode::Session;
+        self.group_ghost =
+            GroupGhostCompletion::compute(&self.new_group, &self.existing_groups, suffix_match);
     }
 
     fn accept_group_ghost(&mut self) {

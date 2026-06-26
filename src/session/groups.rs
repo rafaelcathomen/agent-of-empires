@@ -42,6 +42,42 @@ pub fn archived_project_sub_path(project_name: &str) -> String {
     format!("{}/{}", ARCHIVED_SECTION_PATH, project_name)
 }
 
+/// Resolve a user-typed group path against the set of groups that already
+/// exist, so a partial/leaf input (e.g. "clients/acme" or "acme") that names
+/// an existing nested folder lands IN that folder instead of spawning a new
+/// top-level duplicate. Shared correctness net for TUI new-session, `aoe add`,
+/// the web create path (all via `build_instance`), and `aoe group move`.
+///
+/// Conservative: rewrites the input only when EXACTLY ONE existing group
+/// matches by trailing segment(s). Zero matches (genuinely new, incl. a new
+/// nested path typed in full) or multiple matches (ambiguous) return the input
+/// verbatim, so we never silently move a session into the wrong folder and
+/// never block creating new folders.
+pub fn resolve_group_path(input: &str, existing: &[String]) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if existing.iter().any(|g| g == trimmed) {
+        return trimmed.to_string();
+    }
+    let needle_suffix = format!("/{trimmed}");
+    let matches: Vec<&String> = existing
+        .iter()
+        .filter(|g| {
+            g.ends_with(&needle_suffix)
+                || g.rsplit('/')
+                    .next()
+                    .map(|seg| seg == trimmed)
+                    .unwrap_or(false)
+        })
+        .collect();
+    if matches.len() == 1 {
+        return matches[0].clone();
+    }
+    trimmed.to_string()
+}
+
 /// Fixed 6-color palette for tinting a session group's header and gutter
 /// spine. Snake_case wire values mirror the web `RepoColor`
 /// (web/src/lib/repoAppearance.ts) so groups.json round-trips with a future
@@ -2922,5 +2958,79 @@ mod tests {
                 Some(FolderColor::Rose)
             ]]
         );
+    }
+
+    fn group_paths(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_group_empty_input_returns_empty() {
+        let e = group_paths(&["work/clients/acme"]);
+        assert_eq!(resolve_group_path("", &e), "");
+        assert_eq!(resolve_group_path("   ", &e), "");
+    }
+
+    #[test]
+    fn resolve_group_exact_match_returns_input() {
+        let e = group_paths(&["work", "work/clients/acme"]);
+        assert_eq!(
+            resolve_group_path("work/clients/acme", &e),
+            "work/clients/acme"
+        );
+    }
+
+    #[test]
+    fn resolve_group_unique_leaf_suffix_resolves() {
+        let e = group_paths(&["work", "work/clients", "work/clients/acme"]);
+        assert_eq!(resolve_group_path("acme", &e), "work/clients/acme");
+    }
+
+    #[test]
+    fn resolve_group_unique_multi_segment_suffix_resolves() {
+        // Core bug: "clients/acme" matches "work/clients/acme" via ends_with
+        // "/clients/acme" uniquely, so it resolves instead of duplicating.
+        let e = group_paths(&["work", "work/clients/acme"]);
+        assert_eq!(resolve_group_path("clients/acme", &e), "work/clients/acme");
+    }
+
+    #[test]
+    fn resolve_group_ambiguous_suffix_returns_input_verbatim() {
+        // Two groups end in "/clients": ambiguous, so never silently pick one.
+        let e = group_paths(&["work/clients", "personal/clients"]);
+        assert_eq!(resolve_group_path("clients", &e), "clients");
+    }
+
+    #[test]
+    fn resolve_group_no_match_nested_is_new() {
+        let e = group_paths(&["work/clients/acme"]);
+        assert_eq!(resolve_group_path("personal/notes", &e), "personal/notes");
+    }
+
+    #[test]
+    fn resolve_group_no_match_leaf_is_new() {
+        let e = group_paths(&["work/clients/acme"]);
+        assert_eq!(resolve_group_path("brandnew", &e), "brandnew");
+    }
+
+    #[test]
+    fn resolve_group_empty_existing_returns_input() {
+        assert_eq!(resolve_group_path("anything", &[]), "anything");
+        assert_eq!(resolve_group_path("", &[]), "");
+    }
+
+    #[test]
+    fn resolve_group_leading_segment_not_matched() {
+        // "work" is a LEADING segment, not trailing, so it must NOT resolve;
+        // proves suffix-only semantics and keeps new top-level "work" creatable.
+        let e = group_paths(&["work/clients/acme"]);
+        assert_eq!(resolve_group_path("work", &e), "work");
+    }
+
+    #[test]
+    fn resolve_group_leaf_no_partial_word_match() {
+        // "acme" must not match "acme-corp" (segment equality, not substring).
+        let e = group_paths(&["work/acme-corp"]);
+        assert_eq!(resolve_group_path("acme", &e), "acme");
     }
 }

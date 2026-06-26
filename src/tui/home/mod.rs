@@ -3259,9 +3259,23 @@ impl HomeView {
             .filter(|i| i.id != stub_id)
             .cloned()
             .collect();
+        // Persisted groups for the target profile (incl. empty folders) so the
+        // worker's resolve_group_path can land a partial leaf in an existing
+        // empty nested folder; group_trees lives on the UI thread only.
+        let existing_groups: Vec<String> = self
+            .group_trees
+            .get(&data.profile)
+            .map(|tree| {
+                tree.get_all_groups()
+                    .into_iter()
+                    .map(|grp| grp.path)
+                    .collect()
+            })
+            .unwrap_or_default();
         let request = CreationRequest {
             data,
             existing_instances,
+            existing_groups,
             hooks,
         };
         self.creation_poller.request_creation(request);

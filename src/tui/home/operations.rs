@@ -240,6 +240,29 @@ impl HomeView {
             .filter(|i| i.source_profile == target_profile)
             .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
             .collect();
+        // Union live instance group_paths with the target profile's persisted
+        // groups so resolve_group_path also sees EMPTY folders (e.g. one created
+        // via the Ctrl+P picker, or whose last session moved out). Without this
+        // a leaf like "clients/acme" typed against an empty "work/clients/acme"
+        // would still spawn a top-level duplicate. Both reads are immutable
+        // &self borrows and the owned Vec is collected before build_instance,
+        // so there is no borrow conflict (mirrors the CLI add path).
+        let existing_groups: Vec<String> = {
+            let mut g: Vec<String> = self
+                .instances()
+                .iter()
+                .filter(|i| i.source_profile == target_profile)
+                .map(|i| i.group_path.clone())
+                .filter(|p| !p.is_empty())
+                .collect();
+            if let Some(tree) = self.group_trees.get(&target_profile) {
+                g.extend(tree.get_all_groups().into_iter().map(|grp| grp.path));
+            }
+            g.sort();
+            g.dedup();
+            g
+        };
+        let group_refs: Vec<&str> = existing_groups.iter().map(|s| s.as_str()).collect();
 
         let params = InstanceParams {
             title: data.title,
@@ -264,6 +287,7 @@ impl HomeView {
             params,
             &existing_titles,
             &existing_branches,
+            &group_refs,
             &target_profile,
         )?;
         let mut instance = build_result.instance;

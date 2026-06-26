@@ -194,3 +194,56 @@ fn test_empty_groups_persist() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+#[serial]
+fn test_new_session_resolves_partial_to_existing_nested_group() -> Result<()> {
+    use agent_of_empires::session::resolve_group_path;
+
+    let _temp = setup_temp_home();
+    let storage = Storage::new_unwatched("default")?;
+
+    // Seed "work/clients/acme".
+    let seed_tree = GroupTree::new_with_groups(&[], &[]);
+    let mut seed_tree = seed_tree;
+    seed_tree.create_group("work/clients/acme");
+    storage.update(|i, g| {
+        *i = Vec::new();
+        *g = seed_tree.get_all_groups();
+        Ok(())
+    })?;
+
+    let (_seed_instances, seed_groups) = storage.load_with_groups()?;
+    let existing: Vec<String> = seed_groups.iter().map(|g| g.path.clone()).collect();
+
+    // Scenario A: partial resolves to the existing nested folder.
+    let resolved = resolve_group_path("clients/acme", &existing);
+    assert_eq!(resolved, "work/clients/acme");
+
+    // Scenario B: a genuinely new nested path stays verbatim.
+    assert_eq!(
+        resolve_group_path("personal/notes", &existing),
+        "personal/notes"
+    );
+
+    // Persist an instance with the resolved path; assert no duplicate top-level tree.
+    let mut inst = Instance::new("acme-sess", "/tmp/acme-proj");
+    inst.group_path = resolved.clone();
+    let persisted = vec![inst];
+    let mut tree = GroupTree::new_with_groups(&persisted, &seed_groups);
+    tree.create_group(&resolved);
+    storage.update(|i, g| {
+        *i = persisted.to_vec();
+        *g = tree.get_all_groups();
+        Ok(())
+    })?;
+
+    let (final_instances, final_groups) = storage.load_with_groups()?;
+    let final_tree = GroupTree::new_with_groups(&final_instances, &final_groups);
+    assert!(final_tree.group_exists("work/clients/acme"));
+    assert!(!final_tree.group_exists("clients"));
+    assert!(!final_tree.group_exists("clients/acme"));
+    assert_eq!(final_tree.get_roots().len(), 1);
+
+    Ok(())
+}

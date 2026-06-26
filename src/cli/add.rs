@@ -905,6 +905,22 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         ) {
             return Ok(false);
         }
+        // Resolve a partial/leaf group typed via -g against existing folders
+        // (instance group_paths + stored groups, incl. empty ones) so e.g.
+        // `-g clients/acme` lands in an existing `work/clients/acme` rather
+        // than duplicating it.
+        if !instance.group_path.is_empty() {
+            let mut existing: Vec<String> = all_instances
+                .iter()
+                .map(|i| i.group_path.clone())
+                .filter(|p| !p.is_empty())
+                .collect();
+            existing.extend(groups.iter().map(|g| g.path.clone()));
+            existing.sort();
+            existing.dedup();
+            instance.group_path =
+                crate::session::resolve_group_path(&instance.group_path, &existing);
+        }
         all_instances.push(instance.clone());
         if !instance.group_path.is_empty() {
             let mut group_tree = GroupTree::new_with_groups(all_instances, groups);

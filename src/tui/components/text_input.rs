@@ -35,13 +35,27 @@ pub fn longest_common_prefix(values: &[String]) -> String {
 pub struct GroupGhostCompletion {
     input_snapshot: String,
     cursor_snapshot: usize,
+    /// The dimmed hint rendered after the cursor. For a prefix completion this
+    /// is the raw tail slice that `accept` appends; for a suffix/leaf match it
+    /// is a display-only arrow hint, and `full_match` is what `accept` commits.
     ghost_text: String,
+    /// The complete existing group path this completion commits on accept
+    /// (e.g. "work/clients/acme"). Empty in the prefix multi-match case, where
+    /// accept falls back to appending the common-prefix slice in `ghost_text`.
+    full_match: String,
 }
 
 impl GroupGhostCompletion {
     /// Compute a ghost completion for the given input against existing groups.
     /// Returns `None` if there is no matching suggestion.
-    pub fn compute(input: &Input, existing_groups: &[String]) -> Option<Self> {
+    ///
+    /// `suffix_match` enables TIER 3 (resolving a leaf/partial input to a full
+    /// existing nested path). It belongs in flows that move a session INTO an
+    /// existing folder (new-session, rename-session move). When renaming a
+    /// group's own name, the intent is to type a NEW name, so suffix matching
+    /// would surface an unrelated path; callers pass `false` to keep the
+    /// original prefix-only behavior there.
+    pub fn compute(input: &Input, existing_groups: &[String], suffix_match: bool) -> Option<Self> {
         if existing_groups.is_empty() {
             return None;
         }
@@ -59,36 +73,86 @@ impl GroupGhostCompletion {
             return None;
         }
 
-        let mut matches: Vec<String> = existing_groups
+        // TIER 1: exact full path -> already complete, no ghost.
+        if existing_groups.iter().any(|g| g == &value) {
+            return None;
+        }
+
+        // TIER 2: prefix matches preserve the original liked behavior exactly.
+        let mut prefix_matches: Vec<String> = existing_groups
             .iter()
             .filter(|g| g.starts_with(&value))
             .cloned()
             .collect();
-
-        if matches.is_empty() {
-            return None;
-        }
-        matches.sort();
-
-        let ghost_text = if matches.len() == 1 {
-            matches[0][value.len()..].to_string()
-        } else {
-            let common = longest_common_prefix(&matches);
-            if common.len() > value.len() {
-                common[value.len()..].to_string()
+        if !prefix_matches.is_empty() {
+            prefix_matches.sort();
+            let (ghost_text, full_match) = if prefix_matches.len() == 1 {
+                (
+                    prefix_matches[0][value.len()..].to_string(),
+                    prefix_matches[0].clone(),
+                )
             } else {
-                matches[0][value.len()..].to_string()
+                let common = longest_common_prefix(&prefix_matches);
+                let slice = if common.len() > value.len() {
+                    common[value.len()..].to_string()
+                } else {
+                    prefix_matches[0][value.len()..].to_string()
+                };
+                // Multiple prefix matches share only a common prefix, not a
+                // single full path; accept extends by the slice, as before.
+                (slice, String::new())
+            };
+            if ghost_text.is_empty() {
+                return None;
             }
-        };
-
-        if ghost_text.is_empty() {
-            return None;
+            return Some(Self {
+                input_snapshot: value,
+                cursor_snapshot: cursor_char,
+                ghost_text,
+                full_match,
+            });
         }
 
+        // TIER 3: no prefix match; resolve a nested/leaf input that is a
+        // trailing segment of an existing path. Mirrors resolve_group_path so
+        // the ghost and the shared safety net agree on what "matches". Skipped
+        // for group-rename, where the typed text is a new name, not a move
+        // target, so an unrelated suffix match would be surprising.
+        if !suffix_match {
+            return None;
+        }
+        let needle_suffix = format!("/{value}");
+        let mut suffix_matches: Vec<String> = existing_groups
+            .iter()
+            .filter(|g| {
+                g.ends_with(&needle_suffix)
+                    || g.rsplit('/')
+                        .next()
+                        .map(|seg| seg == value)
+                        .unwrap_or(false)
+            })
+            .cloned()
+            .collect();
+        if suffix_matches.is_empty() {
+            return None;
+        }
+        // Deterministic pick: shortest path first (closest to the typed leaf),
+        // lexicographic tie-break, so multi-match accept never varies.
+        suffix_matches.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+        let match_count = suffix_matches.len();
+        let full_match = suffix_matches[0].clone();
+        if full_match == value {
+            return None;
+        }
+        let mut ghost_text = format!(" -> {full_match}");
+        if match_count > 1 {
+            ghost_text.push_str(&format!(" (+{} more)", match_count - 1));
+        }
         Some(Self {
             input_snapshot: value,
             cursor_snapshot: cursor_char,
             ghost_text,
+            full_match,
         })
     }
 
@@ -101,6 +165,13 @@ impl GroupGhostCompletion {
         // Staleness check
         if self.input_snapshot != value || self.cursor_snapshot != cursor_char {
             return None;
+        }
+
+        // A suffix/leaf match REPLACES the field with the full path; the prefix
+        // multi-match case (full_match empty) appends the common-prefix slice,
+        // so the arrow-hint ghost_text never reaches the append path.
+        if !self.full_match.is_empty() {
+            return Some(self.full_match);
         }
 
         let mut new_value = value;
@@ -400,28 +471,28 @@ mod tests {
     #[test]
     fn ghost_no_groups() {
         let input = Input::new("w".to_string());
-        assert!(GroupGhostCompletion::compute(&input, &[]).is_none());
+        assert!(GroupGhostCompletion::compute(&input, &[], true).is_none());
     }
 
     #[test]
     fn ghost_empty_input() {
         let input = Input::default();
         let groups = groups(&["work"]);
-        assert!(GroupGhostCompletion::compute(&input, &groups).is_none());
+        assert!(GroupGhostCompletion::compute(&input, &groups, true).is_none());
     }
 
     #[test]
     fn ghost_no_match() {
         let input = Input::new("z".to_string());
         let groups = groups(&["work", "personal"]);
-        assert!(GroupGhostCompletion::compute(&input, &groups).is_none());
+        assert!(GroupGhostCompletion::compute(&input, &groups, true).is_none());
     }
 
     #[test]
     fn ghost_single_match() {
         let input = Input::new("per".to_string());
         let groups = groups(&["work", "personal"]);
-        let ghost = GroupGhostCompletion::compute(&input, &groups).unwrap();
+        let ghost = GroupGhostCompletion::compute(&input, &groups, true).unwrap();
         assert_eq!(ghost.ghost_text(), "sonal");
     }
 
@@ -429,7 +500,7 @@ mod tests {
     fn ghost_multiple_matches_with_common_prefix() {
         let input = Input::new("w".to_string());
         let groups = groups(&["work/api", "work/backend"]);
-        let ghost = GroupGhostCompletion::compute(&input, &groups).unwrap();
+        let ghost = GroupGhostCompletion::compute(&input, &groups, true).unwrap();
         assert_eq!(ghost.ghost_text(), "ork/");
     }
 
@@ -437,7 +508,7 @@ mod tests {
     fn ghost_multiple_matches_no_extra_common_prefix() {
         let input = Input::new("work/".to_string());
         let groups = groups(&["work/api", "work/backend"]);
-        let ghost = GroupGhostCompletion::compute(&input, &groups).unwrap();
+        let ghost = GroupGhostCompletion::compute(&input, &groups, true).unwrap();
         // Common prefix is "work/" which equals input, so falls back to first sorted match
         assert_eq!(ghost.ghost_text(), "api");
     }
@@ -447,21 +518,21 @@ mod tests {
         let input = Input::new("work".to_string());
         let groups = groups(&["work"]);
         // Ghost text would be empty since input == match
-        assert!(GroupGhostCompletion::compute(&input, &groups).is_none());
+        assert!(GroupGhostCompletion::compute(&input, &groups, true).is_none());
     }
 
     #[test]
     fn ghost_case_sensitive() {
         let input = Input::new("W".to_string());
         let groups = groups(&["work"]);
-        assert!(GroupGhostCompletion::compute(&input, &groups).is_none());
+        assert!(GroupGhostCompletion::compute(&input, &groups, true).is_none());
     }
 
     #[test]
     fn ghost_accept_valid() {
         let input = Input::new("per".to_string());
         let groups = groups(&["personal"]);
-        let ghost = GroupGhostCompletion::compute(&input, &groups).unwrap();
+        let ghost = GroupGhostCompletion::compute(&input, &groups, true).unwrap();
         let result = ghost.accept(&input).unwrap();
         assert_eq!(result, "personal");
     }
@@ -470,10 +541,104 @@ mod tests {
     fn ghost_accept_stale_value() {
         let input = Input::new("per".to_string());
         let groups = groups(&["personal"]);
-        let ghost = GroupGhostCompletion::compute(&input, &groups).unwrap();
+        let ghost = GroupGhostCompletion::compute(&input, &groups, true).unwrap();
         // Input changed after computing ghost
         let changed_input = Input::new("pers".to_string());
         assert!(ghost.accept(&changed_input).is_none());
+    }
+
+    #[test]
+    fn ghost_leaf_input_surfaces_full_nested_path() {
+        let input = Input::new("acme".to_string());
+        let g = groups(&["work/clients/acme"]);
+        let ghost = GroupGhostCompletion::compute(&input, &g, true).unwrap();
+        assert_eq!(ghost.accept(&input).unwrap(), "work/clients/acme");
+    }
+
+    #[test]
+    fn ghost_partial_nested_input_surfaces_full_path() {
+        let input = Input::new("clients/acme".to_string());
+        let g = groups(&["work/clients/acme"]);
+        let ghost = GroupGhostCompletion::compute(&input, &g, true).unwrap();
+        assert_eq!(ghost.accept(&input).unwrap(), "work/clients/acme");
+    }
+
+    #[test]
+    fn ghost_accept_replaces_not_appends_for_leaf() {
+        let input = Input::new("acme".to_string());
+        let g = groups(&["work/clients/acme"]);
+        let ghost = GroupGhostCompletion::compute(&input, &g, true).unwrap();
+        let r = ghost.accept(&input).unwrap();
+        assert_eq!(r, "work/clients/acme");
+        assert!(!r.starts_with("acme"));
+    }
+
+    #[test]
+    fn ghost_prefix_input_still_completes() {
+        let input = Input::new("work/cli".to_string());
+        let g = groups(&["work/clients/acme"]);
+        let ghost = GroupGhostCompletion::compute(&input, &g, true).unwrap();
+        assert_eq!(ghost.accept(&input).unwrap(), "work/clients/acme");
+
+        let input2 = Input::new("per".to_string());
+        let g2 = groups(&["personal"]);
+        let ghost2 = GroupGhostCompletion::compute(&input2, &g2, true).unwrap();
+        assert_eq!(ghost2.accept(&input2).unwrap(), "personal");
+    }
+
+    #[test]
+    fn ghost_multiple_suffix_matches_deterministic() {
+        // Two leaf matches: shortest-then-lexicographic pick is stable, and
+        // accept yields that first candidate (never silently both).
+        let input = Input::new("clients".to_string());
+        let g = groups(&["work/clients", "personal/clients"]);
+        let a = GroupGhostCompletion::compute(&input, &g, true)
+            .unwrap()
+            .ghost_text()
+            .to_string();
+        let b = GroupGhostCompletion::compute(&input, &g, true)
+            .unwrap()
+            .ghost_text()
+            .to_string();
+        assert_eq!(a, b);
+        assert!(a.contains("(+1 more)"));
+        // Shortest path first: "work/clients" (12) sorts before "personal/clients" (16).
+        let accepted = GroupGhostCompletion::compute(&input, &g, true)
+            .unwrap()
+            .accept(&input)
+            .unwrap();
+        assert_eq!(accepted, "work/clients");
+
+        // Equal-length paths fall to the lexicographic tie-break: "aaa/leaf"
+        // sorts before "zzz/leaf".
+        let input2 = Input::new("leaf".to_string());
+        let g2 = groups(&["zzz/leaf", "aaa/leaf"]);
+        let accepted2 = GroupGhostCompletion::compute(&input2, &g2, true)
+            .unwrap()
+            .accept(&input2)
+            .unwrap();
+        assert_eq!(accepted2, "aaa/leaf");
+    }
+
+    #[test]
+    fn ghost_no_match_for_unrelated_leaf() {
+        let input = Input::new("zzz".to_string());
+        let g = groups(&["work/clients/acme"]);
+        assert!(GroupGhostCompletion::compute(&input, &g, true).is_none());
+    }
+
+    #[test]
+    fn ghost_suffix_match_disabled_keeps_prefix_only() {
+        // Group-rename passes suffix_match=false: a leaf that only matches as a
+        // trailing segment must NOT surface an unrelated full path (the rename
+        // surprise), but genuine prefix completion still works.
+        let leaf = Input::new("acme".to_string());
+        let g = groups(&["work/clients/acme"]);
+        assert!(GroupGhostCompletion::compute(&leaf, &g, false).is_none());
+
+        let prefix = Input::new("work/cli".to_string());
+        let ghost = GroupGhostCompletion::compute(&prefix, &g, false).unwrap();
+        assert_eq!(ghost.accept(&prefix).unwrap(), "work/clients/acme");
     }
 
     #[test]

@@ -217,27 +217,42 @@ async fn move_session(profile: &str, args: GroupMoveArgs) -> Result<()> {
     let identifier = args.identifier.trim().to_string();
     let group = args.group.trim().to_string();
 
-    let old_group = storage.update(|instances, groups| {
+    let (old_group, resolved_group) = storage.update(|instances, groups| {
         let id = super::resolve_session(&identifier, instances)?.id.clone();
+        // Resolve a partial/leaf target against existing folders (instances +
+        // stored groups, incl. empty ones) so `group move <id> clients/acme`
+        // lands in an existing `work/clients/acme` instead of duplicating it.
+        let mut existing: Vec<String> = instances
+            .iter()
+            .map(|i| i.group_path.clone())
+            .filter(|p| !p.is_empty())
+            .collect();
+        existing.extend(groups.iter().map(|g| g.path.clone()));
+        existing.sort();
+        existing.dedup();
+        let resolved = crate::session::resolve_group_path(&group, &existing);
         let inst = instances
             .iter_mut()
             .find(|i| i.id == id)
             .expect("resolve_session returned an id that is no longer in instances");
         let old = inst.group_path.clone();
-        inst.group_path = group.clone();
+        inst.group_path = resolved.clone();
 
-        if !group.is_empty() {
+        if !resolved.is_empty() {
             let mut group_tree = GroupTree::new_with_groups(instances, groups);
-            group_tree.create_group(&group);
+            group_tree.create_group(&resolved);
             *groups = group_tree.get_all_groups();
         }
-        Ok(old)
+        Ok((old, resolved))
     })?;
 
     if old_group.is_empty() {
-        println!("✓ Moved session to group: {}", group);
+        println!("✓ Moved session to group: {}", resolved_group);
     } else {
-        println!("✓ Moved session from '{}' to '{}'", old_group, group);
+        println!(
+            "✓ Moved session from '{}' to '{}'",
+            old_group, resolved_group
+        );
     }
 
     Ok(())

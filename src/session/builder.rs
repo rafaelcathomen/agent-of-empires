@@ -376,6 +376,7 @@ pub fn build_instance(
     params: InstanceParams,
     existing_titles: &[&str],
     existing_branches: &[&str],
+    existing_groups: &[&str],
     profile: &str,
 ) -> Result<BuildResult> {
     // Host-only agents (e.g. settl) cannot run in a sandbox or use worktrees.
@@ -644,7 +645,11 @@ pub fn build_instance(
         instance.project_path = dir.to_string_lossy().to_string();
         instance.scratch = true;
     }
-    instance.group_path = params.group;
+    // Resolve a partial/leaf group (e.g. "clients/acme") against existing
+    // folders so it lands in "work/clients/acme" instead of duplicating it.
+    // resolve_group_path needs &[String]; adapt the &[&str] param once here.
+    let existing_owned: Vec<String> = existing_groups.iter().map(|s| s.to_string()).collect();
+    instance.group_path = crate::session::resolve_group_path(&params.group, &existing_owned);
     instance.tool = params.tool.clone();
     instance.detect_as = config
         .session
@@ -1480,6 +1485,7 @@ mod tests {
             custom_agent_params(project.path(), "remote-claude"),
             &[],
             &[],
+            &[],
             "default",
         )
         .unwrap();
@@ -1510,6 +1516,7 @@ mod tests {
             custom_agent_params(project.path(), "remote-opencode"),
             &[],
             &[],
+            &[],
             "default",
         )
         .unwrap();
@@ -1531,6 +1538,7 @@ mod tests {
 
         let result = build_instance(
             custom_agent_params(project.path(), "remote-missing"),
+            &[],
             &[],
             &[],
             "default",
@@ -1568,6 +1576,7 @@ mod tests {
             custom_agent_params(project.path(), "whitespace-agent"),
             &[],
             &[],
+            &[],
             "default",
         );
         let err = match result {
@@ -1597,7 +1606,7 @@ mod tests {
         params.scratch = true;
         params.sandbox = false;
 
-        let result = build_instance(params, &[], &[], "default")
+        let result = build_instance(params, &[], &[], &[], "default")
             .expect("scratch build must succeed without a project path");
 
         assert!(
@@ -1626,7 +1635,7 @@ mod tests {
         params.worktree_enabled = true;
         params.worktree_branch = Some("feat".to_string());
 
-        let err = match build_instance(params, &[], &[], "default") {
+        let err = match build_instance(params, &[], &[], &[], "default") {
             Ok(_) => panic!("scratch + worktree must error"),
             Err(e) => e,
         };

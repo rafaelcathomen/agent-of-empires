@@ -77,22 +77,35 @@ pub fn find_rollout_for_cwd(cwd: &str) -> Option<CodexSessionSummary> {
     find_rollout_for_cwd_in(&root, cwd)
 }
 
-/// Testable core of [`find_rollout_for_cwd`]: scan `root`, keep the newest
-/// summary whose `cwd` matches. `scan_sessions_in` already sorts newest-first.
+/// Testable core of [`find_rollout_for_cwd`]: scan `root` for the newest
+/// rollout whose `cwd` matches. Deliberately does NOT apply the AoE-managed
+/// (scratch / worktree) filter: the caller is resolving the rollout of a
+/// *known* aoe session by its own cwd, and an aoe codex session legitimately
+/// lives in a scratch or worktree dir. Filtering here would make those
+/// sessions un-convertible (resume nothing). The AoE-managed filter is only
+/// for the external-import picker (`scan_sessions`).
 fn find_rollout_for_cwd_in(root: &Path, cwd: &str) -> Option<CodexSessionSummary> {
-    scan_sessions_in(root).into_iter().find(|s| s.cwd == cwd)
+    collect_summaries_in(root)
+        .into_iter()
+        .find(|s| s.cwd == cwd)
 }
 
-/// Testable core of [`scan_sessions`]: walk `root` recursively for
-/// `rollout-*.jsonl` files, summarize, filter AoE-managed, sort newest-first.
+/// Testable core of [`scan_sessions`]: all rollouts under `root`, with
+/// AoE-managed (scratch / worktree) sessions filtered out, newest-first.
 fn scan_sessions_in(root: &Path) -> Vec<CodexSessionSummary> {
     let markers = worktree_dir_markers();
+    collect_summaries_in(root)
+        .into_iter()
+        .filter(|s| !cwd_is_aoe_scratch(&s.cwd) && !cwd_under_worktree(&s.cwd, &markers))
+        .collect()
+}
+
+/// Walk `root` recursively for `rollout-*.jsonl`, summarize each, sort
+/// newest-first. No filtering; callers decide what to exclude.
+fn collect_summaries_in(root: &Path) -> Vec<CodexSessionSummary> {
     let mut out = Vec::new();
     collect_rollouts(root, &mut |path| {
         if let Some(summary) = summarize_rollout(path) {
-            if cwd_is_aoe_scratch(&summary.cwd) || cwd_under_worktree(&summary.cwd, &markers) {
-                return;
-            }
             out.push(summary);
         }
     });
@@ -396,19 +409,22 @@ mod tests {
     }
 
     #[test]
-    fn aoe_managed_cwds_excluded() {
+    fn aoe_managed_cwds_excluded_from_picker_but_not_convert() {
         let tmp = tempfile::tempdir().unwrap();
+        let scratch = "/home/me/.config/agent-of-empires/scratch/abcd";
         write_rollout(
             tmp.path(),
             "cccccccc-1111-2222-3333-444444444444",
             "2026-06-28T10-00-00",
-            &[
-                meta("/home/me/.config/agent-of-empires/scratch/abcd"),
-                user_msg("scratch run"),
-            ],
+            &[meta(scratch), user_msg("scratch run")],
         );
-        // A scratch cwd is filtered out of discovery.
+        // The external-import picker filters AoE-managed (scratch) cwds out.
         assert!(scan_sessions_in(tmp.path()).is_empty());
+        // But the convert path resolves a known aoe session's own rollout by
+        // cwd regardless: an aoe codex session can live in a scratch dir and
+        // still must be convertible (resume its real conversation).
+        let got = find_rollout_for_cwd_in(tmp.path(), scratch).unwrap();
+        assert_eq!(got.session_id, "cccccccc-1111-2222-3333-444444444444");
     }
 
     /// Set a file's mtime deterministically via std's `File::set_modified`

@@ -24,7 +24,9 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::acp::claude_import::{cwd_is_aoe_scratch, cwd_under_worktree, worktree_dir_markers};
+use crate::acp::claude_import::{
+    cwd_is_aoe_scratch, cwd_under_worktree, normalize_cwd, worktree_dir_markers,
+};
 
 /// Cap how many lines we read per rollout when extracting metadata. The `cwd`
 /// (session_meta, first record) and the first real user message live at the
@@ -89,34 +91,6 @@ fn find_rollout_for_cwd_in(root: &Path, cwd: &str) -> Option<CodexSessionSummary
     collect_summaries_in(root)
         .into_iter()
         .find(|s| normalize_cwd(&s.cwd) == target)
-}
-
-/// Normalize a cwd for comparison. An aoe worktree `project_path` is stored
-/// relative to the main repo (`.../repo/../repo-worktrees/branch`), while
-/// codex records its *resolved* process cwd (`.../repo-worktrees/branch`).
-/// Exact string compare would miss that match and silently resume nothing, so
-/// resolve symlinks + `.`/`..` via the filesystem when the path exists, else
-/// fall back to a textual `.`/`..` cleanup so a since-removed dir still
-/// compares sanely.
-fn normalize_cwd(raw: &str) -> PathBuf {
-    let p = Path::new(raw);
-    std::fs::canonicalize(p).unwrap_or_else(|_| lexical_normalize(p))
-}
-
-/// Resolve `.` and `..` components textually, without touching the filesystem.
-fn lexical_normalize(p: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for comp in p.components() {
-        match comp {
-            Component::ParentDir => {
-                out.pop();
-            }
-            Component::CurDir => {}
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
 }
 
 /// Testable core of [`scan_sessions`]: all rollouts under `root`, with

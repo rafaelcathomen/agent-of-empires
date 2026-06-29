@@ -1613,6 +1613,50 @@ pub async fn acp_enable(
     if let Err(join_err) = kill_join {
         tracing::error!(target: "acp.switch", session = %id_for_log, "tmux teardown task panicked: {join_err}");
     }
+
+    // A terminal session may have no captured agent session id (codex never
+    // captures one; claude's status hook usually does, but pre-hook sessions
+    // don't), so the structured spawn would start fresh and drop the
+    // conversation. Discover the on-disk session for this cwd and resume it via
+    // `session/load` + history replay: codex scans its rollouts, claude scans
+    // the `~/.claude` transcripts. Gated to a missing captured id; an
+    // already-captured id is left untouched. No match -> fresh convert
+    // (previous behavior), logged. Scans the filesystem, so off-thread.
+    let resume_id: Option<String> = if instance.acp_session_id.is_none() {
+        let cwd = instance.project_path.clone();
+        let tool = instance.tool.clone();
+        let found = tokio::task::spawn_blocking(move || match tool.as_str() {
+            "codex" => crate::acp::codex_import::find_rollout_for_cwd(&cwd).map(|r| r.session_id),
+            "claude" => crate::acp::claude_import::find_session_for_cwd(&cwd).map(|s| s.session_id),
+            _ => None,
+        })
+        .await
+        .ok()
+        .flatten();
+        match found {
+            Some(sid) => {
+                tracing::info!(
+                    target: "acp.switch", session = %id, tool = %instance.tool, resumed = %sid,
+                    "resuming on-disk agent session on structured conversion"
+                );
+                Some(sid)
+            }
+            None => {
+                tracing::info!(
+                    target: "acp.switch", session = %id, tool = %instance.tool, cwd = %instance.project_path,
+                    "no on-disk session matched cwd; converting to a fresh structured session"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(ref sid) = resume_id {
+        instance.acp_session_id = Some(sid.clone());
+        instance.import_pending = Some(true);
+    }
+
     instance.view = crate::session::View::Structured;
     instance.resume_intent = crate::session::ResumeIntent::Default;
 
@@ -1636,17 +1680,26 @@ pub async fn acp_enable(
         if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
             slot.view = crate::session::View::Structured;
             slot.resume_intent = crate::session::ResumeIntent::Default;
+            if let Some(ref sid) = resume_id {
+                slot.acp_session_id = Some(sid.clone());
+                slot.import_pending = Some(true);
+            }
         }
     }
     let id_for_save = id.clone();
     let profile_for_save = profile.clone();
     let file_watch_for_save = state.file_watch.clone();
+    let resume_id_for_save = resume_id.clone();
     let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let storage = crate::session::Storage::new(&profile_for_save, file_watch_for_save)?;
         storage.update(|all, _groups| {
             if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
                 slot.view = crate::session::View::Structured;
                 slot.resume_intent = crate::session::ResumeIntent::Default;
+                if let Some(ref sid) = resume_id_for_save {
+                    slot.acp_session_id = Some(sid.clone());
+                    slot.import_pending = Some(true);
+                }
             }
             Ok(())
         })?;

@@ -64,8 +64,9 @@ fn claude_config_dir() -> Option<PathBuf> {
 /// from `"../{branch}-workspace-{session-id}"`. A cwd living under a directory
 /// whose name contains one of these is an AoE worktree or workspace, so it is
 /// excluded from the import picker. Derived from config so a custom template is
-/// honored. See #2276.
-fn worktree_dir_markers() -> Vec<String> {
+/// honored. See #2276. Shared with `codex_import` so both agents' importers
+/// exclude AoE-managed worktrees the same way.
+pub(crate) fn worktree_dir_markers() -> Vec<String> {
     let cfg = crate::session::Config::load_or_warn();
     let mut markers = Vec::new();
     for tmpl in [
@@ -103,7 +104,7 @@ fn strip_placeholders(seg: &str) -> String {
 /// one namespace (release vs `-dev`), so a scratch session from the other
 /// namespace slips past a plain `starts_with` check; match the app-dir name +
 /// `scratch` component pair instead. See #2276.
-fn cwd_is_aoe_scratch(cwd: &str) -> bool {
+pub(crate) fn cwd_is_aoe_scratch(cwd: &str) -> bool {
     let comps: Vec<&str> = Path::new(cwd)
         .components()
         .filter_map(|c| c.as_os_str().to_str())
@@ -116,7 +117,7 @@ fn cwd_is_aoe_scratch(cwd: &str) -> bool {
 /// True when any directory component of `cwd` contains a worktree marker. Uses
 /// `contains` (not a suffix match) because workspace dirs carry the marker
 /// mid-name, e.g. `<branch>-workspace-<id>`.
-fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
+pub(crate) fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
     if markers.is_empty() {
         return false;
     }
@@ -139,13 +140,40 @@ fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
 /// are filtered separately by the endpoint, which has the instance list.
 /// See #2276.
 pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
+    let worktree_markers = worktree_dir_markers();
+    collect_summaries()
+        .into_iter()
+        // Scratch sessions live under `<app_dir>/scratch/<id>`; worktree
+        // sessions under a dir named by the worktree path template. Both are
+        // AoE-managed, not external conversations to offer in the picker.
+        .filter(|s| !cwd_is_aoe_scratch(&s.cwd) && !cwd_under_worktree(&s.cwd, &worktree_markers))
+        .collect()
+}
+
+/// The best session to resume for `cwd`: the most-recently-modified Claude
+/// session whose recorded cwd matches `cwd`. Unlike [`scan_sessions`] this does
+/// NOT apply the AoE-managed (scratch / worktree) filter, because the caller is
+/// resolving a *known* aoe session's own transcript by its cwd, which legitimately
+/// may be a scratch or worktree dir. `cwd` is normalized so an aoe worktree's
+/// unresolved `..` still matches Claude's recorded resolved cwd. `None` when no
+/// session matches; the caller falls back to a fresh structured session.
+pub fn find_session_for_cwd(cwd: &str) -> Option<ClaudeSessionSummary> {
+    let target = normalize_cwd(cwd);
+    collect_summaries()
+        .into_iter()
+        .find(|s| normalize_cwd(&s.cwd) == target)
+}
+
+/// Walk `<config>/projects/**/*.jsonl`, summarize each, newest-first. No
+/// filtering; callers decide what to exclude. Empty when the projects dir is
+/// absent (Claude Code never run). Unreadable files are skipped, not fatal.
+fn collect_summaries() -> Vec<ClaudeSessionSummary> {
     let Some(projects) = claude_config_dir().map(|d| d.join("projects")) else {
         return Vec::new();
     };
     let Ok(project_dirs) = fs::read_dir(&projects) else {
         return Vec::new();
     };
-    let worktree_markers = worktree_dir_markers();
 
     let mut out = Vec::new();
     for project in project_dirs.flatten() {
@@ -162,25 +190,39 @@ pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
                 continue;
             }
             if let Some(summary) = summarize_file(&fpath) {
-                // Scratch sessions live under `<app_dir>/scratch/<id>`. Match by
-                // layout so both release and -dev namespaces are excluded the
-                // same way (the feature does not discriminate between them).
-                if cwd_is_aoe_scratch(&summary.cwd) {
-                    continue;
-                }
-                // AoE creates session worktrees under a directory named by the
-                // worktree path template (e.g. "<repo>-worktrees"). Any cwd
-                // inside one is an AoE-managed worktree (or a one-shot AoE ran
-                // there, like smart-rename), not a conversation to import.
-                if cwd_under_worktree(&summary.cwd, &worktree_markers) {
-                    continue;
-                }
                 out.push(summary);
             }
         }
     }
 
     out.sort_by_key(|s| std::cmp::Reverse(s.last_modified_ms));
+    out
+}
+
+/// Normalize a cwd for comparison: resolve symlinks + `.`/`..` via the
+/// filesystem when the path exists, else fall back to a textual cleanup. An
+/// aoe worktree `project_path` is stored relative to the main repo
+/// (`.../repo/../repo-worktrees/branch`) while the agent records its resolved
+/// process cwd, so an exact string compare would miss the match. Shared with
+/// `codex_import`.
+pub(crate) fn normalize_cwd(raw: &str) -> PathBuf {
+    let p = Path::new(raw);
+    std::fs::canonicalize(p).unwrap_or_else(|_| lexical_normalize(p))
+}
+
+/// Resolve `.` and `..` components textually, without touching the filesystem.
+pub(crate) fn lexical_normalize(p: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
     out
 }
 
@@ -319,6 +361,49 @@ mod tests {
         assert_eq!(s.cwd, cwd_str);
         assert_eq!(s.title.as_deref(), Some("Fix the spinner bug please"));
         assert!(s.cwd_exists);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn find_session_for_cwd_resolves_worktree_and_ignores_managed_filter() {
+        // A claude session whose cwd is an aoe worktree dir: the picker filters
+        // it out, but convert must still resolve it by (normalized) cwd.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let work = tmp.path().join("repo-worktrees").join("branch");
+        fs::create_dir_all(&repo).unwrap();
+        fs::create_dir_all(&work).unwrap();
+        let resolved = work.canonicalize().unwrap();
+        let recorded = resolved.to_str().unwrap();
+
+        let projects = tmp.path().join("projects").join("encoded");
+        fs::create_dir_all(&projects).unwrap();
+        write_jsonl(
+            &projects,
+            "abc11111-2222-3333-4444-555555555555",
+            &[&format!(
+                r#"{{"type":"user","cwd":"{recorded}","message":{{"role":"user","content":[{{"type":"text","text":"worktree convo"}}]}}}}"#
+            )],
+        );
+
+        let prev = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+        // The picker excludes the worktree cwd...
+        let picker_has = scan_sessions().iter().any(|s| s.cwd == recorded);
+        // ...but convert resolves it, even with the `..`-laden path aoe stores.
+        let unnormalized = format!("{}/../repo-worktrees/branch", repo.to_str().unwrap());
+        let found = find_session_for_cwd(&unnormalized);
+        match prev {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+
+        assert!(
+            !picker_has,
+            "worktree session should be filtered from picker"
+        );
+        let found = found.expect("convert should resolve the worktree session");
+        assert_eq!(found.session_id, "abc11111-2222-3333-4444-555555555555");
     }
 
     #[test]

@@ -22,10 +22,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// Hard cap on how long a single curate one-shot may run before it is killed.
-/// The curator competes with live agent turns for the provider API, so it gets
-/// the same generous budget as smart-rename; the child is killed on drop, so a
-/// timed-out call leaves no orphan.
-const ONESHOT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Floor for the curator run timeout, regardless of config; below this even a
+/// trivial curate cannot finish.
+const ONESHOT_TIMEOUT_FLOOR_SECS: u64 = 30;
 
 /// Section markers the agent must wrap each output in. Chosen to be unambiguous
 /// and vanishingly unlikely to occur in real prose, so parsing is a plain
@@ -645,7 +644,11 @@ pub async fn curate(
     let cwd = group_context::paths_for(profile, group_path)?.dir;
     let cwd = cwd.to_string_lossy().into_owned();
 
-    let Some(raw) = run_oneshot(&argv, &cwd, ONESHOT_TIMEOUT).await else {
+    let timeout_secs = crate::session::profile_config::resolve_config_or_warn(profile)
+        .curator
+        .timeout_secs
+        .max(ONESHOT_TIMEOUT_FLOOR_SECS);
+    let Some(raw) = run_oneshot(&argv, &cwd, Duration::from_secs(timeout_secs)).await else {
         return Ok(CurateOutcome::Failed("agent run failed".to_string()));
     };
 

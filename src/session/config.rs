@@ -1783,6 +1783,18 @@ pub struct CuratorConfig {
     #[serde(default)]
     #[setting(label = "Skip auto-curation on weekends", widget = "toggle")]
     pub skip_weekends: bool,
+
+    /// Seconds the one-shot curator agent may run before it is killed. Large or
+    /// heavily-appended contexts need well past the original 120s; raise this if
+    /// a group's curate keeps failing with a timeout.
+    #[serde(default = "default_curator_timeout_secs")]
+    #[setting(
+        label = "Curator run timeout (seconds)",
+        widget = "number",
+        min = 30,
+        validate = "range:30"
+    )]
+    pub timeout_secs: u64,
 }
 
 impl Default for CuratorConfig {
@@ -1797,6 +1809,7 @@ impl Default for CuratorConfig {
             active_from_hour: 0,
             active_to_hour: default_curator_active_to(),
             skip_weekends: false,
+            timeout_secs: default_curator_timeout_secs(),
         }
     }
 }
@@ -1833,6 +1846,10 @@ fn default_curator_interval_minutes() -> u64 {
 
 fn default_curator_active_to() -> u8 {
     24
+}
+
+fn default_curator_timeout_secs() -> u64 {
+    600
 }
 
 fn default_capture_model() -> String {

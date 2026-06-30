@@ -49,8 +49,9 @@ pub use groups::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     archived_project_sub_path, flatten_sessions_by_attention, flatten_tree,
     flatten_tree_all_profiles, is_archived_section_path, is_trash_section_path,
-    is_within_archived_section, is_within_trash_section, Group, GroupTree, Item,
-    ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, TRASH_SECTION_NAME, TRASH_SECTION_PATH,
+    is_within_archived_section, is_within_trash_section, resolve_group_path, FolderColor, Group,
+    GroupTree, Item, ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, TRASH_SECTION_NAME,
+    TRASH_SECTION_PATH,
 };
 pub(crate) use instance::{persist_session_to_storage, ResumeIntent, SidWrite};
 pub use instance::{

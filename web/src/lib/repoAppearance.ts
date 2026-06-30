@@ -3,7 +3,23 @@ import { safeGetItem, safeRemoveItem, safeSetItem } from "./safeStorage";
 
 const STORAGE_KEY = "aoe-repo-appearance-v1";
 
-export type RepoColor = "amber" | "teal" | "sky" | "violet" | "rose" | "slate";
+export type RepoColor =
+  | "red"
+  | "orange"
+  | "amber"
+  | "yellow"
+  | "lime"
+  | "emerald"
+  | "teal"
+  | "cyan"
+  | "sky"
+  | "blue"
+  | "indigo"
+  | "violet"
+  | "fuchsia"
+  | "pink"
+  | "rose"
+  | "slate";
 
 export interface RepoAppearance {
   alias?: string;
@@ -19,34 +35,58 @@ export const REPO_COLOR_OPTIONS: Array<{
   id: RepoColor;
   label: string;
 }> = [
+  { id: "red", label: "Red" },
+  { id: "orange", label: "Orange" },
   { id: "amber", label: "Amber" },
+  { id: "yellow", label: "Yellow" },
+  { id: "lime", label: "Lime" },
+  { id: "emerald", label: "Emerald" },
   { id: "teal", label: "Teal" },
+  { id: "cyan", label: "Cyan" },
   { id: "sky", label: "Sky" },
+  { id: "blue", label: "Blue" },
+  { id: "indigo", label: "Indigo" },
   { id: "violet", label: "Violet" },
+  { id: "fuchsia", label: "Fuchsia" },
+  { id: "pink", label: "Pink" },
   { id: "rose", label: "Rose" },
   { id: "slate", label: "Slate" },
 ];
 
-const REPO_COLOR_TOKENS: Record<RepoColor, string> = {
-  amber: "--color-status-waiting",
-  teal: "--color-terminal-active",
-  sky: "--color-sandbox",
-  violet: "--color-diff-header",
-  rose: "--color-status-error",
-  slate: "--color-surface-700",
+// Resolved CSS color per palette entry. The original six keep their theme
+// token (so existing folders look unchanged across themes); the added hues are
+// pinned to the same tailwind hexes as the TUI's `FolderColor::rgb` so both
+// clients render an identical wheel.
+const REPO_COLOR_CSS: Record<RepoColor, string> = {
+  red: "#f87171",
+  orange: "#fb923c",
+  amber: "var(--color-status-waiting)",
+  yellow: "#facc15",
+  lime: "#a3e635",
+  emerald: "#34d399",
+  teal: "var(--color-terminal-active)",
+  cyan: "#22d3ee",
+  sky: "var(--color-sandbox)",
+  blue: "#60a5fa",
+  indigo: "#818cf8",
+  violet: "var(--color-diff-header)",
+  fuchsia: "#e879f9",
+  pink: "#f472b6",
+  rose: "var(--color-status-error)",
+  slate: "var(--color-surface-700)",
 };
 
 // Faint tinted background for a repo header / project row carrying a color.
 export function repoColorStyle(color: RepoColor | null): CSSProperties | undefined {
   if (!color) return undefined;
   return {
-    backgroundColor: `color-mix(in srgb, var(${REPO_COLOR_TOKENS[color]}) 14%, transparent)`,
+    backgroundColor: `color-mix(in srgb, ${REPO_COLOR_CSS[color]} 14%, transparent)`,
   };
 }
 
 // Solid swatch for the color picker.
 export function repoSwatchStyle(color: RepoColor): CSSProperties {
-  return { backgroundColor: `var(${REPO_COLOR_TOKENS[color]})` };
+  return { backgroundColor: REPO_COLOR_CSS[color] };
 }
 
 const validColors = new Set(REPO_COLOR_OPTIONS.map((option) => option.id));

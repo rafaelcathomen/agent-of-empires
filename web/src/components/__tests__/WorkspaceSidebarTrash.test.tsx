@@ -171,7 +171,7 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     // Trash is a global recovery affordance: an active filter that matches no
     // workspace must not strand trashed sessions by hiding the footer icon.
     renderWithTrash();
-    fireEvent.click(screen.getByLabelText("Filter sessions"));
+    fireEvent.click(screen.getByLabelText("Search sessions"));
     fireEvent.change(screen.getByTestId("sidebar-filter-input"), { target: { value: "zzz-no-match" } });
     expect(screen.getByTestId("sidebar-trash-toggle").textContent).toContain("Trash");
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));

@@ -4094,6 +4094,16 @@ pub async fn create_session(
         .iter()
         .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.clone()))
         .collect();
+    let existing_groups: Vec<String> = {
+        let mut g: Vec<String> = instances
+            .iter()
+            .map(|i| i.group_path.clone())
+            .filter(|p| !p.is_empty())
+            .collect();
+        g.sort();
+        g.dedup();
+        g
+    };
     drop(instances);
 
     let file_watch_for_create = state.file_watch.clone();
@@ -4113,6 +4123,7 @@ pub async fn create_session(
 
         let title_refs: Vec<&str> = existing_titles.iter().map(|s| s.as_str()).collect();
         let branch_refs: Vec<&str> = existing_branches.iter().map(|s| s.as_str()).collect();
+        let group_refs: Vec<&str> = existing_groups.iter().map(|s| s.as_str()).collect();
         let extra_repo_paths: Vec<String> = body
             .extra_repo_paths
             .into_iter()
@@ -4167,7 +4178,8 @@ pub async fn create_session(
             scratch: body.scratch,
         };
 
-        let build_result = builder::build_instance(params, &title_refs, &branch_refs, &profile)?;
+        let build_result =
+            builder::build_instance(params, &title_refs, &branch_refs, &group_refs, &profile)?;
         let mut instance = build_result.instance;
         instance.source_profile = profile.clone();
         let build_warnings = build_result.warnings;

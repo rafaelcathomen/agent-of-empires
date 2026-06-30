@@ -44,6 +44,25 @@ pub enum ResumeStrategy {
     Unsupported,
 }
 
+/// How an agent forks an existing session (start a new conversation seeded
+/// from a parent session's history) from the CLI. The parent session id is
+/// substituted for `<parent>` in the rendered launch flags.
+pub enum ForkStrategy {
+    /// Resume the parent and pass an extra flag so the tool mints a fresh
+    /// session instead of mutating the parent (e.g. claude
+    /// `--resume <parent> --fork-session`). `resume` and `flag` are emitted
+    /// in order with the parent id between them.
+    ResumeWithFlag {
+        resume: &'static str,
+        flag: &'static str,
+    },
+    /// Fork is a subcommand inserted right after the binary name (e.g.
+    /// `codex fork <parent>`), mirroring `ResumeStrategy::Subcommand`.
+    Subcommand(&'static str),
+    /// Fork is a single flag carrying the parent id (e.g. `pi --fork <parent>`).
+    Flag(&'static str),
+}
+
 /// A single hook event that AoE registers in an agent's settings file.
 #[derive(Debug)]
 pub struct HookEvent {
@@ -57,6 +76,19 @@ pub struct HookEvent {
     /// `session_id` from the agent's stdin JSON payload and writes it to
     /// `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id`.
     pub session_id_capture: bool,
+    /// When `Some(n)`, install an `aoe __hook-subagent --delta n` command on
+    /// this event: `Some(1)` (PreToolUse) increments the per-instance subagent
+    /// counter after the subcommand confirms `tool_name == "Task"`; `Some(-1)`
+    /// (SubagentStop) decrements it. Drives the blue TUI spinner; consumed by
+    /// `crate::hooks` `build_aoe_hooks`. Detection analogue of
+    /// `session_id_capture`.
+    pub subagent_delta: Option<i64>,
+    /// When `true`, install an `aoe __hook-heat` command on this event that
+    /// bumps the per-instance heat accumulator. Set only on each agent's
+    /// user-prompt event (Claude/Cursor/Qwen/Codex `UserPromptSubmit`, Gemini
+    /// `BeforeAgent`) so the heat indicator counts user prompts. Independent of
+    /// `session_id_capture` because Cursor/Qwen want heat but not capture.
+    pub heat: bool,
 }
 
 /// On-disk format an agent uses for its status-detection hooks. Each variant
@@ -224,6 +256,10 @@ pub struct AgentDef {
     pub sidecar_hooks: Option<SidecarHooks>,
     /// How this agent resumes a prior session.
     pub resume_strategy: ResumeStrategy,
+    /// How this agent forks a session (new conversation from a parent's
+    /// history). `None` means the agent has no fork capability, so a fork
+    /// request falls back to a plain fresh launch with the same setup.
+    pub fork_strategy: Option<ForkStrategy>,
     /// If true, this agent can only run on the host (no sandbox/worktree support).
     /// The new-session dialog hides sandbox and worktree options for these agents.
     pub host_only: bool,
@@ -258,48 +294,72 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: None,
         session_id_capture: true,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: Some(1),
+        heat: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
         session_id_capture: true,
+        subagent_delta: None,
+        heat: true,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
+    },
+    HookEvent {
+        name: "SubagentStop",
+        matcher: None,
+        status: None,
+        session_id_capture: false,
+        subagent_delta: Some(-1),
+        heat: false,
     },
     HookEvent {
         name: "StopFailure",
         matcher: None,
         status: Some("idle"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("idle_prompt"),
         status: Some("idle"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
 ];
 
@@ -313,30 +373,40 @@ const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: true,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
 ];
 
@@ -350,30 +420,40 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: true,
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
 ];
 
@@ -384,36 +464,48 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
         matcher: None,
         status: Some("idle"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: true,
     },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "PermissionRequest",
         matcher: None,
         status: Some("waiting"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some("running"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
         session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
     },
 ];
 
@@ -441,6 +533,10 @@ pub const AGENTS: &[AgentDef] = &[
             existing: "--resume",
             new_session: "--session-id",
         },
+        fork_strategy: Some(ForkStrategy::ResumeWithFlag {
+            resume: "--resume",
+            flag: "--fork-session",
+        }),
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @anthropic-ai/claude-code",
@@ -460,6 +556,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--session"),
+        fork_strategy: None,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://opencode.ai/install | bash",
@@ -479,6 +576,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
+        fork_strategy: None,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "pip install mistral-vibe",
@@ -507,6 +605,7 @@ pub const AGENTS: &[AgentDef] = &[
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Subcommand("resume"),
+        fork_strategy: Some(ForkStrategy::Subcommand("fork")),
         host_only: false,
         // Codex has paste-burst detection with a 120ms Enter-suppression window;
         // Enter keys arriving within that window after a character stream are
@@ -535,30 +634,39 @@ pub const AGENTS: &[AgentDef] = &[
                     matcher: None,
                     status: Some("running"),
                     session_id_capture: false,
+                    subagent_delta: None,
+                    heat: false,
                 },
                 HookEvent {
                     name: "BeforeAgent",
                     matcher: None,
                     status: Some("running"),
                     session_id_capture: false,
+                    subagent_delta: None,
+                    heat: true,
                 },
                 HookEvent {
                     name: "AfterAgent",
                     matcher: None,
                     status: Some("idle"),
                     session_id_capture: false,
+                    subagent_delta: None,
+                    heat: false,
                 },
                 HookEvent {
                     name: "Notification",
                     matcher: Some("ToolPermission"),
                     status: Some("waiting"),
                     session_id_capture: false,
+                    subagent_delta: None,
+                    heat: false,
                 },
             ],
             format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
+        fork_strategy: None,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @google/gemini-cli",
@@ -583,6 +691,7 @@ pub const AGENTS: &[AgentDef] = &[
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
+        fork_strategy: None,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "see https://docs.cursor.com/cli",
@@ -602,6 +711,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
+        fork_strategy: None,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "see https://docs.github.com/en/copilot/github-copilot-in-the-cli",
@@ -622,6 +732,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--session"),
+        fork_strategy: Some(ForkStrategy::Flag("--fork")),
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @earendil-works/pi-coding-agent",
@@ -641,6 +752,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
+        fork_strategy: None,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g droid",
@@ -671,6 +783,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::SettlToml,
         }),
         resume_strategy: ResumeStrategy::Unsupported,
+        fork_strategy: None,
         host_only: true,
         send_keys_enter_delay_ms: 0,
         install_hint: "brew install --cask mozilla-ai/tap/settl",
@@ -707,6 +820,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::HermesYaml,
         }),
         resume_strategy: ResumeStrategy::Flag("--resume"),
+        fork_strategy: None,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint:
@@ -751,6 +865,7 @@ pub const AGENTS: &[AgentDef] = &[
             format: SidecarFormat::KiroJson,
         }),
         resume_strategy: ResumeStrategy::Flag("--resume-id"),
+        fork_strategy: None,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://cli.kiro.dev/install | bash",
@@ -778,6 +893,7 @@ pub const AGENTS: &[AgentDef] = &[
             existing: "--resume",
             new_session: "--session-id",
         },
+        fork_strategy: None,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @qwen-code/qwen-code",
@@ -797,6 +913,7 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
+        fork_strategy: None,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",

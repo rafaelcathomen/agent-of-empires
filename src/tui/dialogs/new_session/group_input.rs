@@ -36,7 +36,7 @@ impl NewSessionDialog {
     }
 
     pub(super) fn recompute_group_ghost(&mut self) {
-        self.group_ghost = GroupGhostCompletion::compute(&self.group, &self.existing_groups);
+        self.group_ghost = GroupGhostCompletion::compute(&self.group, &self.existing_groups, true);
     }
 
     pub(super) fn accept_group_ghost(&mut self) {

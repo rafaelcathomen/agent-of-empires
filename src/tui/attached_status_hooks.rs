@@ -124,6 +124,7 @@ fn apply_updates(
         session.instance.status = update.status;
         session.instance.last_error = update.last_error;
         session.instance.idle_entered_at = update.idle_entered_at;
+        session.instance.subagent_active = update.subagent_active;
 
         if run_hooks && old != update.status {
             crate::status_hooks::run_for_transition(
@@ -146,6 +147,7 @@ fn snapshot(sessions: &[AttachedStatusHookSession]) -> Vec<StatusUpdate> {
             idle_entered_at: session.instance.idle_entered_at,
             last_accessed_at: session.instance.last_accessed_at,
             pane_dead: session.instance.pane_dead_observed,
+            subagent_active: session.instance.subagent_active,
         })
         .collect()
 }
@@ -181,6 +183,7 @@ mod tests {
                 idle_entered_at: None,
                 last_accessed_at: None,
                 pane_dead: false,
+                subagent_active: false,
             }],
             true,
         );

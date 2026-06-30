@@ -99,6 +99,28 @@ pub struct Theme {
     pub error: Color,
     #[serde(with = "hex_color")]
     pub terminal_active: Color,
+    /// Spinner color for a session whose Claude Code main agent is working
+    /// (`Status::Running`) AND has one or more Task subagents running. Distinct
+    /// from `running` (green, main agent only) and the bluish `terminal_active`
+    /// so a parallel subagent reads as its own state. User picked blue.
+    #[serde(with = "hex_color")]
+    pub subagent_active: Color,
+
+    /// Hot end of the per-session heat ramp (most-used sessions): a bright
+    /// plasma yellow. The ramp runs from `heat_cold` (blue) through fixed
+    /// purple/magenta/orange stops up to this yellow, painted on the
+    /// right-aligned activity/time text. Endpoints are theme-independent
+    /// (deriving them from `accent`/`fresh_idle` collided with status/spinner
+    /// colors in most builtins).
+    #[serde(with = "hex_color")]
+    pub heat_hot: Color,
+    /// Cold end of the per-session heat ramp (drifted-from sessions): a deep
+    /// plasma blue. Saturated on purpose so the ramp reads as a real
+    /// temperature scale; it lives in the right-aligned time column, distinct
+    /// from the left-edge subagent spinner, and is never byte-equal to a status
+    /// color. The fully-neutral (heat-off / all-cold) state still uses `dimmed`.
+    #[serde(with = "hex_color")]
+    pub heat_cold: Color,
 
     // UI elements
     #[serde(with = "hex_color")]
@@ -175,6 +197,12 @@ struct RawThemeDefaults {
     #[serde(with = "hex_color")]
     terminal_active: Color,
     #[serde(with = "hex_color")]
+    subagent_active: Color,
+    #[serde(with = "hex_color")]
+    heat_hot: Color,
+    #[serde(with = "hex_color")]
+    heat_cold: Color,
+    #[serde(with = "hex_color")]
     group: Color,
     #[serde(with = "hex_color")]
     search: Color,
@@ -215,6 +243,9 @@ impl From<RawThemeDefaults> for Theme {
             unread: raw.unread,
             error: raw.error,
             terminal_active: raw.terminal_active,
+            subagent_active: raw.subagent_active,
+            heat_hot: raw.heat_hot,
+            heat_cold: raw.heat_cold,
             group: raw.group,
             search: raw.search,
             accent: raw.accent,
@@ -263,6 +294,46 @@ impl Theme {
         }
         self.fresh_idle
     }
+
+    /// Continuous hot->cold heat color for a normalized ratio in `[0, 1]`
+    /// (`1.0` = hottest, most-used; `0.0` = coldest). A plasma-style ramp:
+    /// `heat_cold` (blue) -> purple -> magenta -> orange -> `heat_hot`
+    /// (yellow). The two endpoints come from the theme; the three interior
+    /// hues are fixed so the ramp keeps its plasma character on every theme.
+    /// If either endpoint is not truecolor (a low-color terminal downsampled
+    /// them to palette indices, so a clean component lerp is impossible) it
+    /// falls back to `dimmed`, the same neutral look a heat-disabled row gets.
+    pub fn heat_color_at_ratio(&self, ratio: f32) -> Color {
+        let ratio = ratio.clamp(0.0, 1.0);
+        let (Some(cold), Some(hot)) = (
+            rgb_components(self.heat_cold),
+            rgb_components(self.heat_hot),
+        ) else {
+            return self.dimmed;
+        };
+        // Fixed interior plasma stops (purple, magenta, orange) sit between the
+        // themed cold and hot endpoints: 4 equal segments across [0, 1].
+        const PURPLE: (u8, u8, u8) = (126, 3, 168);
+        const MAGENTA: (u8, u8, u8) = (204, 71, 120);
+        const ORANGE: (u8, u8, u8) = (248, 149, 64);
+        let stops = [cold, PURPLE, MAGENTA, ORANGE, hot];
+        let seg = ratio * 4.0;
+        let i = (seg.floor() as usize).min(3);
+        let t = seg - i as f32;
+        let lerp = |a: u8, b: u8| -> u8 { (a as f32 + (b as f32 - a as f32) * t).round() as u8 };
+        let (a, b) = (stops[i], stops[i + 1]);
+        Color::Rgb(lerp(a.0, b.0), lerp(a.1, b.1), lerp(a.2, b.2))
+    }
+}
+
+/// RGB components of a truecolor `Color`. `None` for any non-`Rgb` variant
+/// (named, indexed, reset): used by `heat_color_at_ratio` to detect a
+/// downsampled theme where a component lerp is meaningless.
+fn rgb_components(c: Color) -> Option<(u8, u8, u8)> {
+    match c {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        _ => None,
+    }
 }
 
 impl Theme {
@@ -270,7 +341,7 @@ impl Theme {
     /// single authoritative list shared by `downsample_to_palette` and the
     /// structural guard test. New `Color` fields added to `Theme` must be
     /// added here too; non-color metadata (appearance, syntax, etc.) must not.
-    pub fn color_fields_mut(&mut self) -> [&mut Color; 26] {
+    pub fn color_fields_mut(&mut self) -> [&mut Color; 29] {
         [
             &mut self.background,
             &mut self.border,
@@ -288,6 +359,9 @@ impl Theme {
             &mut self.unread,
             &mut self.error,
             &mut self.terminal_active,
+            &mut self.subagent_active,
+            &mut self.heat_hot,
+            &mut self.heat_cold,
             &mut self.group,
             &mut self.search,
             &mut self.accent,
@@ -302,7 +376,7 @@ impl Theme {
     }
 
     /// Read-only counterpart to `color_fields_mut`.
-    pub fn color_fields(&self) -> [Color; 26] {
+    pub fn color_fields(&self) -> [Color; 29] {
         [
             self.background,
             self.border,
@@ -320,6 +394,9 @@ impl Theme {
             self.unread,
             self.error,
             self.terminal_active,
+            self.subagent_active,
+            self.heat_hot,
+            self.heat_cold,
             self.group,
             self.search,
             self.accent,
@@ -494,6 +571,76 @@ mod tests {
     }
 
     #[test]
+    fn heat_color_at_ratio_endpoints_and_midpoint() {
+        let theme = load_theme("empire");
+        assert_eq!(theme.heat_color_at_ratio(1.0), theme.heat_hot);
+        assert_eq!(theme.heat_color_at_ratio(0.0), theme.heat_cold);
+        // Clamp out-of-range.
+        assert_eq!(theme.heat_color_at_ratio(2.0), theme.heat_hot);
+        assert_eq!(theme.heat_color_at_ratio(-1.0), theme.heat_cold);
+        // Interior plasma stops land exactly on the quarter points.
+        assert_eq!(theme.heat_color_at_ratio(0.25), Color::Rgb(126, 3, 168));
+        assert_eq!(theme.heat_color_at_ratio(0.5), Color::Rgb(204, 71, 120));
+        assert_eq!(theme.heat_color_at_ratio(0.75), Color::Rgb(248, 149, 64));
+    }
+
+    #[test]
+    fn heat_ramp_endpoints_are_fixed_truecolor() {
+        for name in builtin_theme_names() {
+            let theme = load_theme(name);
+            assert!(
+                matches!(theme.heat_hot, Color::Rgb(_, _, _)),
+                "{name}: heat_hot must be truecolor"
+            );
+            assert!(
+                matches!(theme.heat_cold, Color::Rgb(_, _, _)),
+                "{name}: heat_cold must be truecolor"
+            );
+        }
+    }
+
+    #[test]
+    fn heat_cold_end_distinct_from_status_and_spinner() {
+        // The cold end is a saturated plasma blue (deliberate, so the ramp
+        // reads as a real temperature scale). It must still not be byte-equal
+        // to any status / spinner / activity color in any builtin, so a cold
+        // row never renders as an exact live-signal color.
+        for name in builtin_theme_names() {
+            let theme = load_theme(name);
+            for clash in [
+                theme.running,
+                theme.waiting,
+                theme.error,
+                theme.subagent_active,
+                theme.terminal_active,
+                theme.idle,
+                theme.unread,
+            ] {
+                assert_ne!(
+                    theme.heat_cold, clash,
+                    "{name}: heat_cold collides with a status/spinner color"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn heat_colors_survive_downsample() {
+        let mut theme = load_theme("empire");
+        theme.downsample_to_palette();
+        assert!(!matches!(theme.heat_hot, Color::Rgb(_, _, _)));
+        assert!(!matches!(theme.heat_cold, Color::Rgb(_, _, _)));
+        // Once downsampled, the lerp falls back to dimmed (no truecolor lerp).
+        assert_eq!(theme.heat_color_at_ratio(0.5), theme.dimmed);
+    }
+
+    #[test]
+    fn heat_fields_counted_in_color_fields() {
+        let theme = load_theme("empire");
+        assert_eq!(theme.color_fields().len(), 29);
+    }
+
+    #[test]
     fn theme_attention_hierarchy_holds() {
         // Visual hierarchy: Waiting is the most attention-grabbing state;
         // fresh-idle sits one rung dimmer; decayed idle blends in. On dark
@@ -547,6 +694,18 @@ mod tests {
             // intentionally unconstrained: themes may tie them.
             cmp("waiting", w, "unread", u);
             cmp("unread", u, "idle", i);
+        }
+    }
+
+    #[test]
+    fn subagent_active_is_distinct_from_running_and_terminal() {
+        // The blue subagent spinner only reads as a separate state if its
+        // color differs from the green main-agent spinner (`running`) and the
+        // bluish `terminal_active` it can replace in the Terminal branch.
+        for name in builtin_theme_names() {
+            let theme = load_theme(name);
+            assert_ne!(theme.subagent_active, theme.running, "{name}");
+            assert_ne!(theme.subagent_active, theme.terminal_active, "{name}");
         }
     }
 }

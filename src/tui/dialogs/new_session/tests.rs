@@ -1651,3 +1651,86 @@ fn click_on_worktree_while_scratch_on_surfaces_error_not_toggle() {
     );
     assert!(dialog.error_message.is_some());
 }
+
+#[test]
+fn test_fork_defaults_off_and_no_parent() {
+    let dialog = single_tool_dialog();
+    assert!(dialog.fork_parent_id.is_none());
+    assert!(!dialog.use_fork_branch);
+    assert!(dialog.fork_branch_name().is_none());
+}
+
+#[test]
+fn test_set_fork_parent_records_id_and_keeps_toggle_off() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_fork_parent("parent-id-1".to_string(), "My Session".to_string());
+    assert_eq!(dialog.fork_parent_id.as_deref(), Some("parent-id-1"));
+    assert!(
+        !dialog.use_fork_branch,
+        "fork-branch toggle must default OFF"
+    );
+    // Branch auto-name derives from the parent title.
+    assert_eq!(
+        dialog.fork_branch_name().as_deref(),
+        Some("fork/my-session")
+    );
+}
+
+#[test]
+fn test_ctrl_f_toggles_fork_branch_only_when_forking() {
+    // No parent: Ctrl+F is a no-op (the row is not shown).
+    let mut plain = single_tool_dialog();
+    plain.handle_key(ctrl_key(KeyCode::Char('f')));
+    assert!(!plain.use_fork_branch);
+
+    // Forking: Ctrl+F flips the toggle on, then off.
+    let mut dialog = single_tool_dialog();
+    dialog.set_fork_parent("parent-id-1".to_string(), "My Session".to_string());
+    dialog.handle_key(ctrl_key(KeyCode::Char('f')));
+    assert!(dialog.use_fork_branch);
+    dialog.handle_key(ctrl_key(KeyCode::Char('f')));
+    assert!(!dialog.use_fork_branch);
+}
+
+#[test]
+fn test_submit_carries_fork_parent_and_no_branch_by_default() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_fork_parent("parent-id-1".to_string(), "My Session".to_string());
+    // Disable any inherited worktree default so the fork-off case is clean.
+    dialog.worktree_enabled = false;
+    match dialog.handle_key(key(KeyCode::Enter)) {
+        DialogResult::Submit(data) => {
+            assert_eq!(data.fork_parent_id.as_deref(), Some("parent-id-1"));
+            assert!(
+                !data.worktree_enabled,
+                "fork without the branch toggle must not force a worktree"
+            );
+            assert!(data.worktree_branch.is_none());
+        }
+        _ => panic!("Expected Submit"),
+    }
+}
+
+#[test]
+fn test_submit_with_fork_branch_forces_worktree_and_autobranch() {
+    let mut dialog = single_tool_dialog();
+    dialog.set_fork_parent("parent-id-1".to_string(), "My Session".to_string());
+    dialog.toggle_fork_branch();
+    assert!(dialog.use_fork_branch);
+    match dialog.handle_key(key(KeyCode::Enter)) {
+        DialogResult::Submit(data) => {
+            assert_eq!(data.fork_parent_id.as_deref(), Some("parent-id-1"));
+            assert!(
+                data.worktree_enabled,
+                "fork-branch toggle must enable a worktree"
+            );
+            assert!(data.create_new_branch, "fork branch is always new");
+            assert_eq!(
+                data.worktree_branch.as_deref(),
+                Some("fork/my-session"),
+                "branch auto-names from the parent title"
+            );
+        }
+        _ => panic!("Expected Submit"),
+    }
+}

@@ -13,7 +13,10 @@ use super::automation::AutomationCommands;
 use super::context::ContextCommands;
 use super::curator::CuratorCommands;
 use super::extract_session_id::ExtractSessionIdArgs;
+use super::fork::ForkArgs;
 use super::group::GroupCommands;
+use super::hook_heat::HookHeatArgs;
+use super::hook_subagent::HookSubagentArgs;
 use super::init::InitArgs;
 use super::killall::KillallArgs;
 use super::list::ListArgs;
@@ -74,6 +77,10 @@ pub struct Cli {
 pub enum Commands {
     /// Add a new session
     Add(Box<AddArgs>),
+
+    /// Fork an existing session: start a new conversation seeded from a
+    /// parent session's context, optionally in a fresh git worktree branch
+    Fork(ForkArgs),
 
     /// Adopt an existing tmux session (an agent you started yourself) into aoe
     Register(RegisterArgs),
@@ -241,6 +248,18 @@ pub enum Commands {
     #[command(name = "__extract-session-id", hide = true)]
     ExtractSessionId(ExtractSessionIdArgs),
 
+    /// Internal: machine-spawned by the Claude Code PreToolUse(Task) and
+    /// SubagentStop hooks to track running Task subagents for the blue TUI
+    /// spinner. Hidden from help.
+    #[command(name = "__hook-subagent", hide = true)]
+    HookSubagent(HookSubagentArgs),
+
+    /// Internal: machine-spawned by each agent's user-prompt hook to bump the
+    /// per-session heat accumulator that drives the activity-time heat color.
+    /// Hidden from help.
+    #[command(name = "__hook-heat", hide = true)]
+    HookHeat(HookHeatArgs),
+
     /// Uninstall Agent of Empires
     Uninstall(UninstallArgs),
 
@@ -266,6 +285,7 @@ pub enum Commands {
 /// `command_name` output is a member.
 pub const CLI_COMMAND_NAMES: &[&str] = &[
     "add",
+    "fork",
     "register",
     "agents",
     "automation",
@@ -312,6 +332,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
 pub fn command_name(command: &Commands) -> Option<&'static str> {
     Some(match command {
         Commands::Add(_) => "add",
+        Commands::Fork(_) => "fork",
         Commands::Register(_) => "register",
         Commands::Agents => "agents",
         Commands::Automation { .. } => "automation",
@@ -350,6 +371,8 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         #[cfg(feature = "serve")]
         Commands::AcpRunner(_) => return None,
         Commands::ExtractSessionId(_) => return None,
+        Commands::HookSubagent(_) => return None,
+        Commands::HookHeat(_) => return None,
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",
         Commands::Completion { .. } => "completion",

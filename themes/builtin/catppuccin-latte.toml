@@ -19,6 +19,13 @@ idle = "#9ca0b0"
 unread = "#7287fd"
 error = "#d20f39"
 terminal_active = "#1e66f5"
+# Light theme: darker/more saturated endpoints than the dark builtins so the
+# ramp stays legible on the pale background. Hot is a deep burnt orange
+# distinct from the peach waiting and the pink-red error; cold is a muted
+# slate-blue darker than dimmed, never the saturated subagent blue.
+subagent_active = "#3a5ccc"
+heat_hot = "#f0f921"
+heat_cold = "#0d0887"
 group = "#179299"
 search = "#7287fd"
 accent = "#fe640b"

@@ -1202,6 +1202,10 @@ impl App {
                             // it and write to the user's clipboard.
                             if let Some(text) = self.home.take_preview_copy_text() {
                                 crate::tui::clipboard::copy_to_clipboard(&text);
+                                // Also publish to the PRIMARY selection so a
+                                // middle-click pastes it into other windows
+                                // (the standard X11 mouse-select flow).
+                                crate::tui::clipboard::copy_to_primary(&text);
                             }
                             if let Some(action) = click_action {
                                 self.execute_action(action, terminal)?;
@@ -2367,12 +2371,18 @@ impl App {
     ) -> Result<()> {
         // Global keybindings
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            // Gated by `!has_dialog()` to match the `q` / Ctrl+Q arms below:
+            // `has_dialog()` is true while a live-send relay is active (or any
+            // overlay is open), so Ctrl+C falls through to `home.handle_key`
+            // and is forwarded to the agent (interrupting it) instead of
+            // quitting aoe. Without the guard, hitting Ctrl+C to stop an agent
+            // from live mode killed the whole TUI.
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) if !self.home.has_dialog() => {
                 if self.home.is_creating_stub_selected() {
                     self.home.cancel_creation();
                     return Ok(());
                 }
-                if self.home.is_creation_pending() && !self.home.has_dialog() {
+                if self.home.is_creation_pending() {
                     self.home.show_quit_during_creation_confirm();
                     return Ok(());
                 }

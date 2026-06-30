@@ -893,6 +893,27 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.session-search",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-session-search.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/App.tsx"]
+    },
+    {
+      "id": "sidebar.session-search-pure",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/__tests__/sessionSearch.test.ts"],
+      "components": []
+    },
+    {
+      "id": "sidebar.session-search-component",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/WorkspaceSidebarSearch.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.new-session-tooltips",
       "kind": "mocked-playwright",
       "risk": "low",

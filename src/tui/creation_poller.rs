@@ -15,6 +15,11 @@ pub struct CreationRequest {
     pub data: NewSessionData,
     /// Existing instances, used for generating unique titles
     pub existing_instances: Vec<Instance>,
+    /// Existing group paths for the target profile (instance-derived UNION the
+    /// persisted groups store, so empty folders are visible to
+    /// resolve_group_path). Built on the UI thread where group_trees is in
+    /// scope, since this worker thread has no access to it.
+    pub existing_groups: Vec<String>,
     /// Trusted hooks to execute after instance creation (already approved by user).
     pub hooks: Option<HooksConfig>,
 }
@@ -107,6 +112,22 @@ impl CreationPoller {
             .iter()
             .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
             .collect();
+        let existing_groups: Vec<String> = {
+            let mut g: Vec<String> = request
+                .existing_instances
+                .iter()
+                .map(|i| i.group_path.clone())
+                .filter(|p| !p.is_empty())
+                .collect();
+            // Union the persisted groups (incl. empty folders) threaded in from
+            // the UI thread, so resolve_group_path can land a partial leaf in an
+            // existing empty nested folder instead of duplicating it.
+            g.extend(request.existing_groups.iter().cloned());
+            g.sort();
+            g.dedup();
+            g
+        };
+        let group_refs: Vec<&str> = existing_groups.iter().map(|s| s.as_str()).collect();
 
         let params = InstanceParams {
             title: data.title,
@@ -127,11 +148,16 @@ impl CreationPoller {
             scratch: data.scratch,
         };
 
-        let build_result =
-            match builder::build_instance(params, &existing_titles, &existing_branches, &profile) {
-                Ok(r) => r,
-                Err(e) => return CreationResult::Error(format!("{:#}", e)),
-            };
+        let build_result = match builder::build_instance(
+            params,
+            &existing_titles,
+            &existing_branches,
+            &group_refs,
+            &profile,
+        ) {
+            Ok(r) => r,
+            Err(e) => return CreationResult::Error(format!("{:#}", e)),
+        };
 
         let mut instance = build_result.instance;
         // Tag the instance with its profile NOW, before container creation or any

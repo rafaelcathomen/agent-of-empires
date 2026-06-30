@@ -20,11 +20,19 @@ use super::dir_guard;
 /// Maximum age before a sidecar `session_id` file is considered stale.
 pub(crate) const SESSION_ID_SIDECAR_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
+/// Maximum age before a `subagent_active` counter sidecar is considered
+/// stale. Bounds how long a crashed subagent (one that never emitted
+/// SubagentStop) can leave the blue spinner stuck on. Mirrors
+/// [`SESSION_ID_SIDECAR_MAX_AGE`].
+pub(crate) const SUBAGENT_SIDECAR_MAX_AGE: Duration = Duration::from_secs(5 * 60);
+
 /// Cap used when reading a status file. The legitimate values are short
 /// tokens; an attacker-planted larger payload is irrelevant either way.
 const STATUS_FILE_READ_CAP: usize = 64;
 const SESSION_ID_FILE_READ_CAP: usize = 128;
 const ATTENTION_FILE_READ_CAP: usize = 16 * 1024;
+/// The counter is a short decimal integer; anything larger is bogus.
+const SUBAGENT_FILE_READ_CAP: usize = 32;
 
 /// `<host base>/<instance_id>`. The base is the per-user directory
 /// `/tmp/aoe-hooks-<euid>` resolved by `dir_guard::hook_base_path()`.
@@ -115,6 +123,53 @@ pub fn read_hook_urgent(instance_id: &str) -> bool {
         }
     }
     true
+}
+
+/// Read the hook-written `subagent_active` counter for the given instance.
+///
+/// Returns `true` when one or more Claude Task subagents are running (counter
+/// `> 0`) and the sidecar is fresh. Returns `false` on absent/empty/
+/// non-numeric content, a zero or negative count, or a sidecar older than
+/// [`SUBAGENT_SIDECAR_MAX_AGE`] (the staleness clear for a crashed subagent
+/// that never emitted SubagentStop). The renderer only needs the boolean; the
+/// counter arithmetic stays on the writer side.
+pub fn read_hook_subagent_active(instance_id: &str) -> bool {
+    let Ok(Some(dir)) = dir_guard::open_instance_dir_read_only(instance_id) else {
+        return false;
+    };
+    let Ok(Some(meta)) = dir_guard::metadata_at(dir.as_fd(), "subagent_active") else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    if mtime
+        .elapsed()
+        .map(|e| e > SUBAGENT_SIDECAR_MAX_AGE)
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let Ok(Some(bytes)) =
+        dir_guard::read_file_at(dir.as_fd(), "subagent_active", SUBAGENT_FILE_READ_CAP)
+    else {
+        return false;
+    };
+    std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|n| n > 0)
+        .unwrap_or(false)
+}
+
+/// Read the hook-written `heat` accumulator for the given instance.
+///
+/// Returns `None` when the sidecar is absent, the instance id is unsafe, or
+/// the content is unparseable. Unlike the subagent counter there is no
+/// staleness TTL: heat is mathematically decayed by the reader, so an old
+/// accumulator is legitimately cool rather than ignored.
+pub fn read_hook_heat(instance_id: &str) -> Option<crate::hooks::heat::HeatAccumulator> {
+    dir_guard::read_heat_accumulator(instance_id)
 }
 
 /// Remove the hook status directory for a given instance (cleanup on stop/delete).
@@ -388,5 +443,136 @@ mod tests {
         let (_g, _, _tmp) = BaseGuard::ready();
         cleanup_hook_status_dir("../etc");
         cleanup_hook_status_dir("");
+    }
+
+    fn write_subagent_via_guard(instance_id: &str, content: &str) {
+        let dir = dir_guard::open_instance_dir(instance_id).unwrap();
+        dir_guard::write_short(dir.as_fd(), "subagent_active", content.as_bytes()).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn subagent_active_false_when_absent() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        assert!(!read_hook_subagent_active("sa_absent"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn subagent_active_true_for_positive_count() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_subagent_via_guard("sa_pos", "2");
+        assert!(read_hook_subagent_active("sa_pos"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn subagent_active_false_for_zero() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_subagent_via_guard("sa_zero", "0");
+        assert!(!read_hook_subagent_active("sa_zero"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn subagent_active_false_for_malformed() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_subagent_via_guard("sa_bad", "abc");
+        assert!(!read_hook_subagent_active("sa_bad"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn subagent_active_false_when_stale() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        write_subagent_via_guard("sa_stale", "3");
+        let stale =
+            std::time::SystemTime::now() - (SUBAGENT_SIDECAR_MAX_AGE + Duration::from_secs(10));
+        std::fs::File::options()
+            .write(true)
+            .open(base.join("sa_stale").join("subagent_active"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+        assert!(!read_hook_subagent_active("sa_stale"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn subagent_active_false_for_unsafe_id() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        assert!(!read_hook_subagent_active("../etc"));
+        assert!(!read_hook_subagent_active(""));
+        assert!(!read_hook_subagent_active("foo/bar"));
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn subagent_active_false_after_cleanup() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_subagent_via_guard("sa_clean", "1");
+        assert!(read_hook_subagent_active("sa_clean"));
+        cleanup_hook_status_dir("sa_clean");
+        assert!(!read_hook_subagent_active("sa_clean"));
+    }
+
+    fn write_heat_via_guard(instance_id: &str, content: &str) {
+        let dir = dir_guard::open_instance_dir(instance_id).unwrap();
+        dir_guard::write_short(dir.as_fd(), "heat", content.as_bytes()).unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn read_hook_heat_some_for_written_accumulator() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_heat_via_guard("heat_read", "2.5 1700000000");
+        let acc = read_hook_heat("heat_read").unwrap();
+        assert!((acc.s - 2.5).abs() < 1e-9);
+        assert_eq!(acc.t_last, 1_700_000_000);
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn read_hook_heat_none_when_absent() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        assert!(read_hook_heat("heat_no_file").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn read_hook_heat_none_for_unsafe_id() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        assert!(read_hook_heat("../etc").is_none());
+        assert!(read_hook_heat("").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn read_hook_heat_ignores_age_no_ttl() {
+        // Unlike the subagent counter, an old heat sidecar is still read; the
+        // reader decays it rather than dropping it on a staleness TTL.
+        let (_g, base, _tmp) = BaseGuard::ready();
+        write_heat_via_guard("heat_old", "3.0 1700000000");
+        let stale = std::time::SystemTime::now() - Duration::from_secs(10 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(base.join("heat_old").join("heat"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(stale))
+            .unwrap();
+        assert!(
+            read_hook_heat("heat_old").is_some(),
+            "old heat must still be read"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn read_hook_heat_none_after_cleanup() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        write_heat_via_guard("heat_clean", "1.0 1700000000");
+        assert!(read_hook_heat("heat_clean").is_some());
+        cleanup_hook_status_dir("heat_clean");
+        assert!(read_hook_heat("heat_clean").is_none());
     }
 }

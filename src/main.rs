@@ -258,6 +258,8 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Init(args)) => return cli::init::run(args).await,
         Some(Commands::ExtractSessionId(args)) => return cli::extract_session_id::run(args).await,
+        Some(Commands::HookSubagent(args)) => return cli::hook_subagent::run(args).await,
+        Some(Commands::HookHeat(args)) => return cli::hook_heat::run(args).await,
         Some(Commands::Tmux { command }) => {
             use cli::tmux::TmuxCommands;
             return match command {
@@ -334,6 +336,7 @@ async fn main() -> Result<()> {
 
     let result = match cli.command {
         Some(Commands::Add(args)) => cli::add::run(&profile, *args).await,
+        Some(Commands::Fork(args)) => cli::fork::run(&profile, args).await,
         Some(Commands::Automation { command }) => cli::automation::run(&profile, command).await,
         Some(Commands::Register(args)) => cli::register::run(&profile, args).await,
         Some(Commands::List(args)) => cli::list::run(&profile, args).await,

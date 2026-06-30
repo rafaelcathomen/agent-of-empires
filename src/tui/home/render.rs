@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 use rattles::presets::prelude as spinners;
 
 use super::{
-    get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING,
-    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN, ICON_UNREAD,
+    live_send, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING, ICON_ERROR,
+    ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, SortOrder};
-use crate::session::{Item, Status};
+use crate::session::{FolderColor, Item, Status};
 use crate::tui::components::preview::{self, CachedPreview};
 use crate::tui::components::{
     format_scroll_indicator, set_prefixed_input_cursor_position, HelpOverlay, Preview,
@@ -421,6 +421,47 @@ const LAST_ACTIVITY_SLOT: usize = 6;
 const LAST_ACTIVITY_RIGHT_MARGIN: usize = 1;
 
 const SELECTED_ROW_CONTRAST_RATIO: f32 = 3.0;
+
+/// Minimum WCAG contrast for a folder color to be drawn against the theme
+/// background. The fixed `FolderColor` palette is tuned for dark backgrounds;
+/// on the lone builtin light theme (catppuccin-latte, bg #eff1f5) every hex
+/// lands below the 3.0 large-text/UI threshold (amber is essentially
+/// invisible). Below this, the header tint and the spine fall back to
+/// `theme.group`, which every theme picks for legible folder text.
+const FOLDER_COLOR_CONTRAST_RATIO: f32 = 3.0;
+
+/// Resolve a `FolderColor` to a foreground `Color` that reads against the
+/// theme background, falling back to `theme.group` when the fixed palette hex
+/// would be too low-contrast (light themes). Returns `theme.group` for `None`
+/// so callers can use it unconditionally for the header tint.
+fn folder_color_fg(color: Option<FolderColor>, theme: &Theme) -> Color {
+    match color {
+        Some(c) => {
+            let (r, g, b) = c.rgb();
+            let fg = Color::Rgb(r, g, b);
+            if has_min_contrast(fg, theme.background, FOLDER_COLOR_CONTRAST_RATIO) {
+                fg
+            } else {
+                theme.group
+            }
+        }
+        None => theme.group,
+    }
+}
+
+/// Color for the right-aligned activity/time text. The time column belongs to
+/// heat alone: an engaged heat ratio drives the continuous hot->cold ramp,
+/// otherwise the neutral `theme.dimmed` (today's look). `heat` is `Some(ratio)`
+/// only for an engaged `HeatLevel::Ramp`, `None` for `Neutral`. The manual
+/// per-session color is no longer consulted here — it tints the session *name*
+/// instead (see the title-span render), so name and time carry independent
+/// signals.
+fn activity_text_color(heat: Option<f32>, theme: &Theme) -> Color {
+    match heat {
+        Some(ratio) => theme.heat_color_at_ratio(ratio),
+        None => theme.dimmed,
+    }
+}
 
 fn selected_row_style(style: Style, theme: &Theme) -> Style {
     let Some(fg) = style.fg else {
@@ -1021,8 +1062,6 @@ impl HomeView {
         theme: &Theme,
         list_width: u16,
     ) -> Line<'static> {
-        let indent = get_indent(item.depth());
-
         // Attention-mode-gated visuals. Favorite, snooze (decoration), and
         // urgent only render when the user is in Attention sort, so the
         // sidebar stays clean for users who don't run a high-volume
@@ -1041,6 +1080,7 @@ impl HomeView {
                 collapsed,
                 session_count,
                 archived_at,
+                color,
                 ..
             } => {
                 let icon = if *collapsed {
@@ -1062,6 +1102,13 @@ impl HomeView {
                     Cow::Owned(format!("{} ({})", name, session_count))
                 };
                 let mut style = Style::default().fg(theme.group).bold();
+                // Tint the header in the folder's OWN color, falling back to
+                // theme.group on low-contrast (light) themes. The archived
+                // branches below reassign `style`, so archived/synthetic rows
+                // keep their dimmed+italic divider look instead of a tint.
+                if color.is_some() {
+                    style = style.fg(folder_color_fg(*color, theme)).bold();
+                }
                 if crate::session::is_within_archived_section(path)
                     || crate::session::is_within_trash_section(path)
                 {
@@ -1132,7 +1179,16 @@ impl HomeView {
                                 && inst.is_unread()
                                 && matches!(inst.status, Status::Idle | Status::Unknown);
                             let color = match inst.status {
-                                Status::Running => theme.running,
+                                Status::Running => {
+                                    // A live Task subagent paints the same
+                                    // spinner in blue; the green running color
+                                    // means the main agent only.
+                                    if inst.subagent_active {
+                                        theme.subagent_active
+                                    } else {
+                                        theme.running
+                                    }
+                                }
                                 Status::Waiting => theme.waiting,
                                 Status::Idle if unread_resting => theme.unread,
                                 Status::Idle => {
@@ -1234,7 +1290,17 @@ impl HomeView {
                             let unread_overlay =
                                 crate::session::unread_enabled() && inst.is_unread();
                             let (mut icon, color) = if terminal_running {
-                                (spinner_running(&inst.created_at), theme.terminal_active)
+                                (
+                                    spinner_running(&inst.created_at),
+                                    // A live Task subagent recolors the active
+                                    // terminal spinner blue; see the Structured
+                                    // branch for the same override.
+                                    if inst.subagent_active {
+                                        theme.subagent_active
+                                    } else {
+                                        theme.terminal_active
+                                    },
+                                )
                             } else if unread_overlay {
                                 (ICON_UNREAD, theme.unread)
                             } else {
@@ -1318,20 +1384,57 @@ impl HomeView {
             }
         }
 
-        let mut line_spans = Vec::with_capacity(5);
-        line_spans.push(Span::raw(indent));
+        let mut line_spans = Vec::with_capacity(6);
+        // Tree-style indent guides: one width-1 gutter column per depth level.
+        // For level L, draw a vertical guide bar in the color of the folder
+        // at depth L when that ancestor is colored, otherwise in the neutral
+        // dimmed color so every nesting level shows a guide line (not just
+        // colored folders).
+        // Total width equals the row depth, so this replaces the old plain
+        // indent column-for-column; relative indentation, icon alignment, and
+        // the right-aligned activity column all stay correct. Bars are
+        // structural, so they keep their color even on the selected row
+        // (matching the header tint, which also survives selection).
+        for ancestor in item.ancestor_colors() {
+            match ancestor {
+                // Same contrast guard as the header tint: on light themes
+                // where the fixed palette hex is illegible, folder_color_fg
+                // falls back to theme.group so the bar stays visible.
+                Some(c) => line_spans.push(Span::styled(
+                    "\u{2502}",
+                    Style::default().fg(folder_color_fg(Some(*c), theme)),
+                )),
+                None => {
+                    line_spans.push(Span::styled("\u{2502}", Style::default().fg(theme.dimmed)))
+                }
+            }
+        }
         let icon_style = if is_match {
             Style::default().fg(theme.search)
         } else {
             style
         };
         line_spans.push(Span::styled(format!("{} ", icon), icon_style));
+        // The session NAME carries the manual per-session color when one is set
+        // (the heat ramp owns the time column instead, so the two signals stay
+        // independent). Only the foreground is retinted; the status-derived
+        // modifiers (bold/blink/dim for urgent/snooze/archived) are preserved,
+        // and the icon keeps its status color. Group headers and other items
+        // are unaffected.
+        let title_style = if let Item::Session { id, .. } = item {
+            match self.get_instance(id).and_then(|inst| inst.manual_color) {
+                Some(c) => style.fg(folder_color_fg(Some(c), theme)),
+                None => style,
+            }
+        } else {
+            style
+        };
         line_spans.push(Span::styled(
             text.into_owned(),
             if is_selected {
-                selected_row_style(style, theme)
+                selected_row_style(title_style, theme)
             } else {
-                style
+                title_style
             },
         ));
 
@@ -1457,7 +1560,14 @@ impl HomeView {
                         format_relative_age(age_ts)
                     };
                     let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
-                    let activity_style = Style::default().fg(theme.dimmed);
+                    // The time column is heat-only (ramp when engaged, else
+                    // dimmed); the manual session color tints the name instead.
+                    let row_heat_ratio = match inst.heat_level {
+                        crate::hooks::heat::HeatLevel::Ramp(r) => Some(r),
+                        crate::hooks::heat::HeatLevel::Neutral => None,
+                    };
+                    let activity_style =
+                        Style::default().fg(activity_text_color(row_heat_ratio, theme));
                     line_spans.push(Span::styled(
                         padded,
                         if is_selected {
@@ -3355,6 +3465,56 @@ mod tests {
         let style = Style::default().fg(theme.dimmed);
 
         assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
+    }
+
+    #[test]
+    fn folder_color_fg_uses_palette_on_dark_theme() {
+        // Empire (bg #0f172a) clears the contrast threshold for every palette
+        // hex, so the folder color renders as its own RGB.
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let (r, g, b) = FolderColor::Sky.rgb();
+        assert_eq!(
+            folder_color_fg(Some(FolderColor::Sky), &theme),
+            Color::Rgb(r, g, b)
+        );
+    }
+
+    #[test]
+    fn folder_color_fg_falls_back_on_light_theme() {
+        // Catppuccin-latte (bg #eff1f5) drops every palette hex below 3.0
+        // contrast, so the tint falls back to the legible theme.group.
+        let theme = crate::tui::styles::load_theme_with_mode("catppuccin-latte", false);
+        assert_eq!(
+            folder_color_fg(Some(FolderColor::Amber), &theme),
+            theme.group
+        );
+    }
+
+    #[test]
+    fn folder_color_fg_none_is_theme_group() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        assert_eq!(folder_color_fg(None, &theme), theme.group);
+    }
+
+    #[test]
+    fn activity_text_color_uses_heat_ramp() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        // The time column tracks the heat ratio across the ramp; the manual
+        // session color no longer participates (it tints the name instead).
+        assert_eq!(
+            activity_text_color(Some(1.0), &theme),
+            theme.heat_color_at_ratio(1.0)
+        );
+        assert_eq!(
+            activity_text_color(Some(0.0), &theme),
+            theme.heat_color_at_ratio(0.0)
+        );
+    }
+
+    #[test]
+    fn activity_text_color_dimmed_when_neutral() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        assert_eq!(activity_text_color(None, &theme), theme.dimmed);
     }
 
     #[test]

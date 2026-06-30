@@ -355,23 +355,6 @@ pub(super) struct PreviewTimings {
     pub(super) parse: std::time::Duration,
 }
 
-pub(super) const INDENTS: [&str; 10] = [
-    "",
-    " ",
-    "  ",
-    "   ",
-    "    ",
-    "     ",
-    "      ",
-    "       ",
-    "        ",
-    "         ",
-];
-
-pub(super) fn get_indent(depth: usize) -> &'static str {
-    INDENTS.get(depth).copied().unwrap_or(INDENTS[9])
-}
-
 pub(super) const ICON_IDLE: &str = "⠒";
 /// Unread rows swap the muted idle braille dot for a solid filled circle so
 /// the marker reads at a glance (and matches the web sidebar's unread dot).
@@ -804,6 +787,11 @@ pub struct HomeView {
     /// drive the breathe rattle and fresh-idle color, and by the `w`
     /// keybind to gate which Idle sessions are still "actionable".
     pub(super) idle_decay_window: std::time::Duration,
+
+    /// Global default for the per-session heat indicator, from
+    /// `Config.session.heat_indicator`. Read once per poll in
+    /// `recompute_heat`; a per-session `heat_enabled` override wins over it.
+    pub(super) heat_indicator: bool,
 
     // When true, letter-based action hotkeys require SHIFT (guard against
     // dictation / stray keystrokes triggering destructive actions).
@@ -1927,6 +1915,7 @@ impl HomeView {
         let confirm_before_quit = resolved.session.confirm_before_quit;
         let idle_decay_window =
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
+        let heat_indicator = resolved.session.heat_indicator;
         crate::session::set_unread_enabled(resolved.session.unread_indicator);
         let user_config = load_config().ok().flatten();
         let sort_order = user_config
@@ -2106,6 +2095,7 @@ impl HomeView {
             confirm_before_quit,
             active_tui_count: 1,
             idle_decay_window,
+            heat_indicator,
             settings_view: None,
             automations_view: None,
             automation_schedule_dialog: None,
@@ -2638,6 +2628,10 @@ impl HomeView {
             for update in updates {
                 self.apply_one_status_update(update);
             }
+            // Recompute heat once per poll cycle, after all status updates land,
+            // so the whole working set decays to one shared `now` regardless of
+            // polling tier and the per-frame render only reads the cache.
+            self.recompute_heat();
             self.pending_status_refresh = false;
             return true;
         }
@@ -2655,6 +2649,79 @@ impl HomeView {
     pub(super) fn apply_status_updates_without_hooks(&mut self, updates: Vec<StatusUpdate>) {
         for update in updates {
             self.apply_status_update(update, false, false);
+        }
+        self.recompute_heat();
+    }
+
+    /// Recompute every loaded session's cached `heat_level` once per status
+    /// poll. Decays the whole working set to one shared `now` (so scores share
+    /// a timestamp regardless of which polling tier produced each update) and
+    /// normalizes to a continuous ratio-to-max, then writes the resulting level
+    /// back onto each `Instance` for the per-frame renderer to read.
+    ///
+    /// Reads one heat sidecar per working-set session, including cold/Stopped
+    /// rows that the status poller skips: that is deliberate, because the
+    /// normalization set is the loaded working set (home-view rule), not the
+    /// polled subset.
+    pub(super) fn recompute_heat(&mut self) {
+        use crate::session::Status;
+
+        // Short-circuit: if the global toggle is off and no session forces heat
+        // on via a per-session override, every row is Neutral and we skip the
+        // sidecar reads entirely.
+        let any_forced_on = self
+            .instances
+            .iter()
+            .any(|inst| inst.heat_enabled == Some(true));
+        if !self.heat_indicator && !any_forced_on {
+            for inst in &mut self.instances {
+                inst.heat_level = crate::hooks::heat::HeatLevel::Neutral;
+            }
+            return;
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let active_profile = self.active_profile.clone();
+        let global_heat = self.heat_indicator;
+
+        // Working set = the home-view rule: non-archived, non-snoozed; scoped to
+        // the active profile when one is selected, else all profiles. NOT the
+        // search/scroll-filtered subset, so color does not lurch when filtering
+        // or collapsing.
+        let mut rows: Vec<(f64, bool)> = Vec::new();
+        let mut freshest_t_last: i64 = 0;
+        // Map each working-set row back to its instance index so levels land on
+        // the right session; non-working-set rows are forced Neutral directly.
+        let mut row_indices: Vec<usize> = Vec::new();
+
+        for (idx, inst) in self.instances.iter().enumerate() {
+            let in_working_set = !inst.is_archived()
+                && !inst.is_snoozed()
+                && active_profile
+                    .as_ref()
+                    .is_none_or(|p| inst.source_profile == *p);
+            let effective_on = inst.heat_enabled.unwrap_or(global_heat);
+            if !in_working_set || !effective_on {
+                continue;
+            }
+            let acc = crate::hooks::read_hook_heat(&inst.id).unwrap_or_default();
+            let s_now = acc.s_at(now);
+            let active = matches!(inst.status, Status::Running | Status::Waiting);
+            rows.push((s_now, active));
+            row_indices.push(idx);
+            freshest_t_last = freshest_t_last.max(acc.t_last);
+        }
+
+        let levels = crate::hooks::heat::normalize(&rows, freshest_t_last, now);
+
+        // Default every row to Neutral, then overwrite the working-set rows with
+        // their computed level. This neutralizes archived/snoozed/off rows and
+        // sessions outside the active profile in one pass.
+        for inst in &mut self.instances {
+            inst.heat_level = crate::hooks::heat::HeatLevel::Neutral;
+        }
+        for (level, idx) in levels.into_iter().zip(row_indices) {
+            self.instances[idx].heat_level = level;
         }
     }
 
@@ -2676,6 +2743,7 @@ impl HomeView {
 
         let new_last_accessed = update.last_accessed_at;
         let new_pane_dead = update.pane_dead;
+        let new_subagent_active = update.subagent_active;
 
         if should_update {
             let new_status = update.status;
@@ -2692,6 +2760,10 @@ impl HomeView {
                     inst.last_accessed_at = new_last_accessed;
                 }
                 inst.pane_dead_observed = new_pane_dead;
+                // Written in all three branches: subagent_active flips while
+                // status stays Running, so wiring it only here would leave the
+                // blue spinner stuck on after a subagent finishes mid-turn.
+                inst.subagent_active = new_subagent_active;
             });
 
             if let Some(old) = old_status {
@@ -2732,6 +2804,7 @@ impl HomeView {
             self.mutate_instance(&update.id, |inst| {
                 inst.last_accessed_at = new_last_accessed;
                 inst.pane_dead_observed = new_pane_dead;
+                inst.subagent_active = new_subagent_active;
             });
         } else {
             // No status change AND no fresh activity stamp. We still
@@ -2740,6 +2813,7 @@ impl HomeView {
             // current reality. Cheap mutate (one bool write).
             self.mutate_instance(&update.id, |inst| {
                 inst.pane_dead_observed = new_pane_dead;
+                inst.subagent_active = new_subagent_active;
             });
         }
     }
@@ -3398,9 +3472,23 @@ impl HomeView {
             .filter(|i| i.id != stub_id)
             .cloned()
             .collect();
+        // Persisted groups for the target profile (incl. empty folders) so the
+        // worker's resolve_group_path can land a partial leaf in an existing
+        // empty nested folder; group_trees lives on the UI thread only.
+        let existing_groups: Vec<String> = self
+            .group_trees
+            .get(&data.profile)
+            .map(|tree| {
+                tree.get_all_groups()
+                    .into_iter()
+                    .map(|grp| grp.path)
+                    .collect()
+            })
+            .unwrap_or_default();
         let request = CreationRequest {
             data,
             existing_instances,
+            existing_groups,
             hooks,
         };
         self.creation_poller.request_creation(request);
@@ -4927,6 +5015,10 @@ impl HomeView {
                         disk_g.name = tui_g.name.clone();
                         disk_g.collapsed = tui_g.collapsed;
                         disk_g.archived_at = tui_g.archived_at;
+                        // Persist in-TUI folder color edits (the r-menu Color
+                        // row) through the same merge that already carries
+                        // name/collapsed/archive.
+                        disk_g.color = tui_g.color;
                     } else {
                         disk_groups.push(tui_g.clone());
                     }
@@ -5882,6 +5974,7 @@ impl HomeView {
         self.profile_default_attach_mode = config.session.default_attach_mode;
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
+        self.heat_indicator = config.session.heat_indicator;
         crate::session::set_unread_enabled(config.session.unread_indicator);
         self.tips_unseen = tips_unseen_count(&config);
         self.tool_configs = config.tools;

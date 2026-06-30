@@ -184,7 +184,7 @@ pub fn ensure_pm_session(profile: &str, group_path: &str) -> Result<Option<Strin
     };
 
     let title_refs: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
-    let mut instance = builder::build_instance(params, &title_refs, &[], profile)?.instance;
+    let mut instance = builder::build_instance(params, &title_refs, &[], &[], profile)?.instance;
     instance.is_project_manager = true;
     instance.source_profile = profile.to_string();
     // Dormant: the record exists but the agent is not launched here.

@@ -4503,6 +4503,7 @@ fn test_create_session_in_all_mode_is_findable() {
         extra_args: String::new(),
         command_override: String::new(),
         scratch: false,
+        fork_parent_id: None,
     };
 
     let session_id = view.create_session(data).unwrap();
@@ -5253,6 +5254,56 @@ fn test_rename_selected_group_path() {
 
 #[test]
 #[serial]
+fn test_rename_group_with_color_carries_color_to_new_path() {
+    use crate::session::FolderColor;
+
+    let mut env = create_test_env_with_groups();
+
+    // Select the "work" group, mirroring what opening the r-menu on a folder does.
+    env.view.selected_group = Some("work".to_string());
+    env.view.selected_group_profile = Some("test".to_string());
+    env.view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "work".to_string(),
+        old_profile: "test".to_string(),
+    });
+
+    // Combined submit: rename, then color the resolved new path (the order the
+    // Group submit arm uses, so the color survives the rebuild-then-merge).
+    env.view
+        .rename_selected_group(Some("projects"), None)
+        .unwrap();
+    env.view
+        .set_group_color_at("projects", "test", Some(FolderColor::Teal));
+
+    // The session followed the rename.
+    let work_session = env
+        .view
+        .instances()
+        .iter()
+        .find(|i| i.title == "work-project")
+        .unwrap();
+    assert_eq!(work_session.group_path, "projects");
+
+    // The color landed on the NEW path on disk, not the stale "work" path.
+    let storage = Storage::new_unwatched("test").unwrap();
+    let (_insts, groups) = storage.load_with_groups().unwrap();
+    let projects = groups
+        .iter()
+        .find(|g| g.path == "projects")
+        .expect("renamed group must exist on disk");
+    assert_eq!(
+        projects.color,
+        Some(FolderColor::Teal),
+        "color must follow the rename to the new path"
+    );
+    assert!(
+        !groups.iter().any(|g| g.path == "work"),
+        "old path must not survive on disk"
+    );
+}
+
+#[test]
+#[serial]
 fn test_rename_selected_group_with_children() {
     use crate::session::GroupTree;
 
@@ -5634,6 +5685,7 @@ fn test_apply_creation_results_returns_session_id() {
         extra_args: String::new(),
         command_override: String::new(),
         scratch: false,
+        fork_parent_id: None,
     };
 
     // Use the async CreationPoller path (pass None hooks, non-sandbox,
@@ -5820,11 +5872,51 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
         idle_entered_at: Some(now),
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
     assert_eq!(inst.status, Status::Idle);
     assert_eq!(inst.idle_entered_at, Some(now));
+}
+
+#[test]
+#[serial]
+fn apply_status_update_tracks_subagent_active_while_running() {
+    use crate::session::Status;
+    use crate::tui::status_poller::StatusUpdate;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+
+    // A subagent spawns while the main agent is Running.
+    env.view.apply_one_status_update(StatusUpdate {
+        id: id.clone(),
+        status: Status::Running,
+        last_error: None,
+        idle_entered_at: None,
+        last_accessed_at: None,
+        pane_dead: false,
+        subagent_active: true,
+    });
+    assert!(env.view.get_instance(&id).unwrap().subagent_active);
+
+    // Status stays Running but the subagent finished: the flag must clear.
+    // This specifically guards the should_update branch wiring (without it
+    // the blue spinner would stick on).
+    env.view.apply_one_status_update(StatusUpdate {
+        id: id.clone(),
+        status: Status::Running,
+        last_error: None,
+        idle_entered_at: None,
+        last_accessed_at: None,
+        pane_dead: false,
+        subagent_active: false,
+    });
+    assert!(!env.view.get_instance(&id).unwrap().subagent_active);
 }
 
 #[test]
@@ -5848,6 +5940,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         idle_entered_at: Some(stop_time),
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
     });
     assert_eq!(
         env.view.get_instance(&id).unwrap().idle_entered_at,
@@ -5865,6 +5958,7 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         idle_entered_at: None,
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -5962,6 +6056,7 @@ fn apply_status_update_skips_terminal_states() {
         idle_entered_at: Some(stale_ts),
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
     });
 
     // Status and timestamp should both stay untouched.
@@ -6037,6 +6132,7 @@ fn apply_status_update_runs_status_hook_on_transition() {
         idle_entered_at: None,
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
     });
 
     let launches = take_recorded_launches();
@@ -6102,6 +6198,7 @@ fn apply_status_update_does_not_run_status_hook_for_same_status() {
         idle_entered_at: None,
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
     });
 
     assert!(take_recorded_launches().is_empty());
@@ -6135,6 +6232,7 @@ fn apply_status_updates_without_hooks_does_not_run_status_hook() {
             idle_entered_at: None,
             last_accessed_at: None,
             pane_dead: false,
+            subagent_active: false,
         }]);
 
     assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Waiting);
@@ -6910,7 +7008,9 @@ fn unarchive_keeps_selection() {
 fn restart_selected_session_noop_with_no_selection() {
     let mut env = create_test_env_empty();
     env.view.selected_session = None;
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     assert!(env.view.restart_cooldown_at.is_empty());
 }
@@ -6926,7 +7026,9 @@ fn restart_selected_session_skips_archived_row() {
     env.view.selected_session = Some(id.clone());
     env.view.mutate_instance(&id, |inst| inst.archive());
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     assert!(
         env.view.instances[0].is_archived(),
@@ -6949,7 +7051,9 @@ fn restart_selected_session_skips_snoozed_row_in_attention_sort() {
     env.view.sort_order = SortOrder::Attention;
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     assert!(
         env.view.instances[0].is_snoozed(),
@@ -6977,7 +7081,9 @@ fn restart_selected_session_wakes_snooze_outside_attention_sort() {
     env.view.mutate_instance(&id, |inst| inst.snooze(30));
     assert!(env.view.instances[0].is_snoozed(), "pre-condition");
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     assert!(
         !env.view.instances[0].is_snoozed(),
@@ -6992,6 +7098,65 @@ fn restart_selected_session_wakes_snooze_outside_attention_sort() {
     );
 }
 
+/// `fresh_start = true` discards the saved conversation (resume target +
+/// failed-sid marker) before relaunching, so a session whose stored
+/// conversation the backend no longer has can recover in place. With
+/// `fresh_start = false` the resume state is left untouched.
+#[test]
+#[serial]
+fn restart_selected_session_fresh_start_clears_resume_target() {
+    use crate::session::ResumeIntent;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.mutate_instance(&id, |inst| {
+        inst.resume_intent = ResumeIntent::Use("dead-sid".to_string());
+        inst.resume_probe_failed_sid = Some("dead-sid".to_string());
+        inst.agent_session_id = Some("dead-sid".to_string());
+        // A crashed session presents a dead pane; fresh-start must still run.
+        inst.pane_dead_observed = true;
+    });
+
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, true);
+    assert!(result.is_ok());
+    assert_eq!(env.view.instances[0].resume_intent, ResumeIntent::Cleared);
+    assert_eq!(env.view.instances[0].resume_probe_failed_sid, None);
+    assert_eq!(env.view.instances[0].agent_session_id, None);
+    // The dead-pane skip was bypassed, so the restart actually proceeded
+    // (records the cooldown) rather than returning early.
+    assert!(env.view.restart_cooldown_at.contains_key(&id));
+}
+
+#[test]
+#[serial]
+fn restart_selected_session_without_fresh_start_keeps_resume_target() {
+    use crate::session::ResumeIntent;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.mutate_instance(&id, |inst| {
+        inst.resume_intent = ResumeIntent::Use("keep-sid".to_string());
+        inst.resume_probe_failed_sid = Some("keep-sid".to_string());
+    });
+
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
+    assert!(result.is_ok());
+    assert_eq!(
+        env.view.instances[0].resume_intent,
+        ResumeIntent::Use("keep-sid".to_string())
+    );
+    assert_eq!(
+        env.view.instances[0].resume_probe_failed_sid,
+        Some("keep-sid".to_string())
+    );
+}
+
 #[test]
 #[serial]
 fn restart_selected_session_skips_creating_row() {
@@ -7001,7 +7166,9 @@ fn restart_selected_session_skips_creating_row() {
     env.view
         .mutate_instance(&id, |inst| inst.status = crate::session::Status::Creating);
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     assert!(env.view.restart_cooldown_at.is_empty());
 }
@@ -7028,7 +7195,9 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     let now = std::time::Instant::now();
     env.view.restart_cooldown_at.insert(id.clone(), now);
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     let stored = env.view.restart_cooldown_at.get(&id).copied().unwrap();
     assert_eq!(
@@ -7084,7 +7253,7 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     view.update_selected();
     view.selected_session = Some(id.clone());
 
-    let result = view.restart_selected_session(None, None, None, None);
+    let result = view.restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
 
     let mut applied = false;
@@ -7228,7 +7397,9 @@ fn restart_selected_session_skips_when_already_in_flight() {
     env.view.selected_session = Some(id.clone());
     env.view.restart_in_flight.insert(id.clone());
 
-    let result = env.view.restart_selected_session(None, None, None, None);
+    let result = env
+        .view
+        .restart_selected_session(None, None, None, None, false);
     assert!(result.is_ok());
     assert!(
         env.view.restart_cooldown_at.is_empty(),
@@ -8659,7 +8830,7 @@ fn archived_section_nests_by_project_in_project_mode() {
     }
     // Then alpha's archived session at depth 2.
     match &tail[1] {
-        Item::Session { id, depth } => {
+        Item::Session { id, depth, .. } => {
             assert_eq!(
                 id, &alpha_id,
                 "alpha sub-folder should contain alpha-running"
@@ -8686,7 +8857,7 @@ fn archived_section_nests_by_project_in_project_mode() {
     }
     // Then beta's archived session at depth 2.
     match &tail[3] {
-        Item::Session { id, depth } => {
+        Item::Session { id, depth, .. } => {
             assert_eq!(id, &beta_id, "beta sub-folder should contain beta-error");
             assert_eq!(*depth, 2);
         }
@@ -12630,6 +12801,7 @@ mod new_session_attach_mode {
             extra_args: String::new(),
             command_override: String::new(),
             scratch: false,
+            fork_parent_id: None,
         }
     }
 
@@ -14432,5 +14604,166 @@ mod live_send_boot_size_tests {
             !matches!(seed, Some((0, _)) | Some((_, 0))),
             "empty preview rect must fall back, not seed a 0-dimension size; got {seed:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod heat_rmenu_tests {
+    use super::{create_test_env_with_sessions, setup_test_home};
+    use crate::hooks::heat::HeatLevel;
+    use crate::hooks::test_support::BaseGuard;
+    use crate::session::{FolderColor, GroupTree, Instance, Storage};
+    use crate::tmux::AvailableTools;
+    use crate::tui::home::HomeView;
+    use serial_test::serial;
+    use tempfile::TempDir;
+
+    #[test]
+    #[serial]
+    fn set_session_color_and_heat_persists_and_reloads() {
+        // BaseGuard isolates the hook base; HOME is set per-test below.
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+        let storage = Storage::new_unwatched("test").unwrap();
+        let mut inst = Instance::new("s0", "/tmp/s0");
+        inst.source_profile = "test".to_string();
+        let id = inst.id.clone();
+        storage
+            .update(|i, g| {
+                *i = vec![inst.clone()];
+                *g = GroupTree::new_with_groups(&[inst.clone()], &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        let tools = AvailableTools::with_tools(&["claude"]);
+        let mut view = HomeView::new(
+            Some("test".to_string()),
+            tools,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+
+        view.set_session_color_and_heat(&id, Some(Some(FolderColor::Teal)), Some(Some(false)));
+
+        // In memory.
+        let got = view.instances.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(got.manual_color, Some(FolderColor::Teal));
+        assert_eq!(got.heat_enabled, Some(false));
+
+        // On disk: reload a fresh storage and confirm the fields persisted.
+        let reload = Storage::new_unwatched("test").unwrap();
+        let disk = reload.load().unwrap();
+        let disk_inst = disk.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(disk_inst.manual_color, Some(FolderColor::Teal));
+        assert_eq!(disk_inst.heat_enabled, Some(false));
+    }
+
+    #[test]
+    #[serial]
+    fn recompute_heat_neutral_when_never_prompted() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let mut env = create_test_env_with_sessions(2);
+        // Default config has heat on, but no session ever fired a prompt hook,
+        // so every row stays Neutral (the all-cold mute via freshest==0).
+        env.view.recompute_heat();
+        assert!(env
+            .view
+            .instances
+            .iter()
+            .all(|i| i.heat_level == HeatLevel::Neutral));
+    }
+
+    #[test]
+    #[serial]
+    fn recompute_heat_ramps_a_prompted_session() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let mut env = create_test_env_with_sessions(1);
+        // Source profile must match so the working-set filter keeps the row.
+        env.view.instances[0].source_profile = "test".to_string();
+        let id = env.view.instances[0].id.clone();
+        let now = chrono::Utc::now().timestamp();
+        crate::hooks::bump_heat_via_guard(&id, now).unwrap();
+
+        env.view.recompute_heat();
+        // A single fresh prompt reads warm (pre-engage ramp), not Neutral.
+        assert!(matches!(
+            env.view.instances[0].heat_level,
+            HeatLevel::Ramp(_)
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn recompute_heat_excludes_archived_and_off_rows() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let mut env = create_test_env_with_sessions(2);
+        for inst in &mut env.view.instances {
+            inst.source_profile = "test".to_string();
+        }
+        let now = chrono::Utc::now().timestamp();
+        // Prompt both, then archive the first and force-off heat on it.
+        let id0 = env.view.instances[0].id.clone();
+        let id1 = env.view.instances[1].id.clone();
+        crate::hooks::bump_heat_via_guard(&id0, now).unwrap();
+        crate::hooks::bump_heat_via_guard(&id1, now).unwrap();
+        env.view.instances[0].archived_at = Some(chrono::Utc::now());
+
+        env.view.recompute_heat();
+        // Archived row is Neutral; the live row ramps.
+        let a = env.view.instances.iter().find(|i| i.id == id0).unwrap();
+        let b = env.view.instances.iter().find(|i| i.id == id1).unwrap();
+        assert_eq!(a.heat_level, HeatLevel::Neutral, "archived excluded");
+        assert!(matches!(b.heat_level, HeatLevel::Ramp(_)));
+    }
+
+    #[test]
+    #[serial]
+    fn recompute_heat_active_never_prompted_stays_neutral() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let mut env = create_test_env_with_sessions(2);
+        for inst in &mut env.view.instances {
+            inst.source_profile = "test".to_string();
+        }
+        // Prompt only the first session; the second is Running for a non-prompt
+        // reason (a tool call, an adopted session before its first prompt) and
+        // never fired the hook, so it must read Neutral, not a warm active floor.
+        let id0 = env.view.instances[0].id.clone();
+        let id1 = env.view.instances[1].id.clone();
+        crate::hooks::bump_heat_via_guard(&id0, chrono::Utc::now().timestamp()).unwrap();
+        env.view.instances[1].status = crate::session::Status::Running;
+
+        env.view.recompute_heat();
+        let a = env.view.instances.iter().find(|i| i.id == id0).unwrap();
+        let b = env.view.instances.iter().find(|i| i.id == id1).unwrap();
+        assert!(matches!(a.heat_level, HeatLevel::Ramp(_)));
+        assert_eq!(
+            b.heat_level,
+            HeatLevel::Neutral,
+            "active but never-prompted stays Neutral"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn recompute_heat_all_neutral_when_global_off_and_no_override() {
+        let (_g, _base, _tmp) = BaseGuard::ready();
+        let mut env = create_test_env_with_sessions(1);
+        env.view.instances[0].source_profile = "test".to_string();
+        let id = env.view.instances[0].id.clone();
+        crate::hooks::bump_heat_via_guard(&id, chrono::Utc::now().timestamp()).unwrap();
+        // Global off and no per-session override: short-circuit to Neutral.
+        env.view.heat_indicator = false;
+        env.view.recompute_heat();
+        assert_eq!(env.view.instances[0].heat_level, HeatLevel::Neutral);
+
+        // A per-session force-on override re-engages it.
+        env.view.instances[0].heat_enabled = Some(true);
+        env.view.recompute_heat();
+        assert!(matches!(
+            env.view.instances[0].heat_level,
+            HeatLevel::Ramp(_)
+        ));
     }
 }

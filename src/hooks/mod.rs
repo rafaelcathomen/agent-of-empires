@@ -8,6 +8,7 @@
 //! Hook events are agent-specific and defined in `AgentHookConfig::events`.
 
 mod dir_guard;
+pub(crate) mod heat;
 mod status_file;
 mod targets;
 
@@ -20,15 +21,15 @@ use anyhow::{Context, Result};
 use fs2::FileExt as _;
 use serde_json::Value;
 
+pub(crate) use dir_guard::{
+    adjust_subagent_counter_via_guard, bump_heat_via_guard, ensure_instance_dir_path,
+    hook_base_path, unlink_session_id_via_guard, write_session_id_via_guard,
+};
 #[cfg(test)]
 pub(crate) use dir_guard::{clear_base_override_for_test, override_base_for_test, reset_for_test};
-pub(crate) use dir_guard::{
-    ensure_instance_dir_path, hook_base_path, unlink_session_id_via_guard,
-    write_session_id_via_guard,
-};
 pub use status_file::{
-    cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
-    read_hook_urgent,
+    cleanup_hook_status_dir, hook_status_dir, read_hook_heat, read_hook_session_id,
+    read_hook_status, read_hook_subagent_active, read_hook_urgent,
 };
 pub(crate) use targets::{
     has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
@@ -340,7 +341,7 @@ fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -
         HookInstallTarget::Sandbox => "",
     };
     format!(
-        "sh -c 'unset IFS; set -f; umask 077; \
+        "sh -c 'cat >/dev/null 2>&1; unset IFS; set -f; umask 077; \
          {resolve_id}\
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
@@ -390,6 +391,13 @@ pub(crate) fn canonical_session_id_command(target: HookInstallTarget) -> String 
     hook_command_session_id(target)
 }
 
+/// Test-only sibling of [`canonical_status_command`] for the
+/// `subagent_delta` branch, used by migration canonical-shape checkers.
+#[cfg(test)]
+pub(crate) fn canonical_subagent_command(delta: i64, target: HookInstallTarget) -> String {
+    hook_command_subagent(delta, target)
+}
+
 fn hook_command_session_id_host() -> String {
     // Same adopted-session fallback as the status hook (see `hook_command_with_base`):
     // resolve AOE_INSTANCE_ID from the tmux hidden env when the process env
@@ -401,6 +409,57 @@ fn hook_command_session_id_host() -> String {
          command -v aoe >/dev/null 2>&1 || exit 0; \
          aoe __extract-session-id 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
     )
+}
+
+/// Host command for the subagent counter hook. `delta` is baked at install
+/// time: `+1` on PreToolUse (the subcommand re-reads the hook stdin to confirm
+/// `tool_name == "Task"` before counting), `-1` on SubagentStop. Mirrors
+/// [`hook_command_session_id_host`]; ends with the marker so uninstall finds
+/// it.
+fn hook_command_subagent(delta: i64, target: HookInstallTarget) -> String {
+    match target {
+        HookInstallTarget::Host => format!(
+            "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
+             command -v aoe >/dev/null 2>&1 || exit 0; \
+             aoe __hook-subagent --delta {delta} 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
+        ),
+        // Sandbox sessions install with the Host target in practice; `aoe` is
+        // absent inside the container, so subagent tracking is intentionally a
+        // no-op for v1. Emit a marker-terminated no-op so uninstall still
+        // recognises the command.
+        HookInstallTarget::Sandbox => {
+            format!("sh -c 'cat >/dev/null 2>&1; exit 0 # {AOE_HOOK_MARKER}'")
+        }
+    }
+}
+
+/// Host command for the per-session heat hook. Bumps the heat accumulator on
+/// each user prompt via `aoe __hook-heat`. Mirrors [`hook_command_subagent`]
+/// but reads no stdin and bakes no delta; the subcommand reads the wall clock
+/// itself. Carries the same adopted-session tmux fallback as
+/// [`hook_command_session_id_host`] so a `register`ed session (whose process
+/// env lacks `AOE_INSTANCE_ID`) still resolves the id and counts heat.
+fn hook_command_heat(target: HookInstallTarget) -> String {
+    match target {
+        HookInstallTarget::Host => format!(
+            "sh -c 'cat >/dev/null 2>&1; [ -n \"$AOE_INSTANCE_ID\" ] || AOE_INSTANCE_ID=$(tmux show-environment -h AOE_INSTANCE_ID 2>/dev/null | grep \"^AOE_INSTANCE_ID=\" | cut -d= -f2-); \
+             [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; export AOE_INSTANCE_ID; \
+             command -v aoe >/dev/null 2>&1 || exit 0; \
+             aoe __hook-heat 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
+        ),
+        // Same rationale as the subagent counter: `aoe` is absent inside the
+        // container, so heat tracking is a no-op there. Marker-terminated so
+        // uninstall still recognises the command.
+        HookInstallTarget::Sandbox => {
+            format!("sh -c 'cat >/dev/null 2>&1; exit 0 # {AOE_HOOK_MARKER}'")
+        }
+    }
+}
+
+/// Test-only sibling of [`canonical_status_command`] for the `heat` branch.
+#[cfg(test)]
+pub(crate) fn canonical_heat_command(target: HookInstallTarget) -> String {
+    hook_command_heat(target)
 }
 
 fn hook_command_session_id_sandbox(base: &str) -> String {
@@ -452,6 +511,10 @@ pub(super) fn is_aoe_hook_command(cmd: &str) -> bool {
 /// - `event.session_id_capture` → session-id-extractor command (placed
 ///   first so it gets stdin first if the agent only delivers stdin to the
 ///   leading command in a matcher block).
+/// - `event.subagent_delta.is_some()` → subagent counter command (reads
+///   stdin to confirm `tool_name` on the +1 path; placed before the status
+///   writer for the same stdin-first reason).
+/// - `event.heat` → heat-bump command (`aoe __hook-heat`, reads no stdin).
 /// - `event.status.is_some()` → status-writer command (does not read
 ///   stdin).
 ///
@@ -469,6 +532,18 @@ fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarge
         let mut commands: Vec<String> = Vec::new();
         if event.session_id_capture {
             commands.push(hook_command_session_id(target));
+        }
+        // Subagent counter command precedes the status writer so the
+        // stdin-reading +1 command runs first (same stdin-first rationale as
+        // the session-id extractor above).
+        if let Some(delta) = event.subagent_delta {
+            commands.push(hook_command_subagent(delta, target));
+        }
+        // Heat bump precedes the status writer too; it reads no stdin, so order
+        // relative to the status writer is immaterial, but keeping all the
+        // `aoe`-subcommand hooks ahead of the status writer is the house style.
+        if event.heat {
+            commands.push(hook_command_heat(target));
         }
         if let Some(status) = event.status {
             commands.push(hook_command(status, target));
@@ -2926,11 +3001,22 @@ command = "echo user-hook"
             .flat_map(|m| m["hooks"].as_array().unwrap())
             .filter_map(|h| h["command"].as_str().map(|s| s.to_string()))
             .collect();
+        // PreToolUse now installs two AoE commands: the subagent counter (+1)
+        // and the status writer. The reinstall must REPLACE the single legacy
+        // command with exactly those two, not append to it.
         assert_eq!(
             all_cmds.len(),
-            1,
-            "Expected exactly 1 hook after reinstall, got: {:?}",
+            2,
+            "Expected exactly 2 hooks after reinstall, got: {:?}",
             all_cmds
+        );
+        assert!(
+            all_cmds.iter().any(|c| c.contains("__hook-subagent")),
+            "subagent counter command must be present: {all_cmds:?}"
+        );
+        assert!(
+            all_cmds.iter().any(|c| c.contains("$D/status")),
+            "status writer must be present: {all_cmds:?}"
         );
     }
 
@@ -3691,8 +3777,8 @@ hooks_auto_accept: false
         let entries = user_prompt[0]["hooks"].as_array().unwrap();
         assert_eq!(
             entries.len(),
-            2,
-            "UserPromptSubmit should emit status + session_id_capture"
+            3,
+            "UserPromptSubmit should emit session_id_capture + heat + status"
         );
         let commands: Vec<&str> = entries
             .iter()
@@ -3700,13 +3786,18 @@ hooks_auto_accept: false
             .collect();
         assert!(commands.iter().any(|c| c.contains("printf running")));
         assert!(commands.iter().any(|c| c.contains("session_id")));
+        // Heat is a no-op marker command under the Sandbox target (aoe is
+        // absent in the container), so it is detectable only by the marker.
+        // Confirm the count reflects its presence rather than its body here.
     }
 
     #[test]
     fn test_build_aoe_hooks_status_only_events_unchanged() {
         let events = claude_events();
         let hooks = build_aoe_hooks(events, HookInstallTarget::Sandbox);
-        for event_name in &["PreToolUse", "Stop", "Notification", "ElicitationResult"] {
+        // PreToolUse is no longer status-only: it also carries the subagent
+        // counter command (asserted separately below), so it is excluded here.
+        for event_name in &["Stop", "Notification", "ElicitationResult"] {
             let block = hooks
                 .get(*event_name)
                 .unwrap_or_else(|| panic!("expected {event_name}"))
@@ -3719,6 +3810,33 @@ hooks_auto_accept: false
                 "status-only event {event_name} should emit 1 hook"
             );
         }
+        // PreToolUse emits the subagent counter command (first, stdin-first)
+        // plus the status writer; SubagentStop emits only the counter command.
+        let pre = hooks.get("PreToolUse").unwrap().as_array().unwrap();
+        assert_eq!(
+            pre[0]["hooks"].as_array().unwrap().len(),
+            2,
+            "PreToolUse should emit subagent counter + status writer"
+        );
+        let sub = hooks.get("SubagentStop").unwrap().as_array().unwrap();
+        let sub_entries = sub[0]["hooks"].as_array().unwrap();
+        assert_eq!(
+            sub_entries.len(),
+            1,
+            "SubagentStop should emit only the subagent counter command"
+        );
+        // The decrement delta is baked into the Host command; the Sandbox
+        // variant is an intentional marker-terminated no-op, so check the Host
+        // build for the -1.
+        let host = build_aoe_hooks(events, HookInstallTarget::Host);
+        let host_sub = host.get("SubagentStop").unwrap().as_array().unwrap();
+        assert!(
+            host_sub[0]["hooks"].as_array().unwrap()[0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("__hook-subagent --delta -1"),
+            "SubagentStop must decrement on the Host target"
+        );
     }
 
     #[test]
@@ -4214,6 +4332,44 @@ hooks_auto_accept: false
             logs_parse.contains("session.store"),
             "warn must carry the load_or_warn target; captured: {logs_parse}"
         );
+    }
+
+    #[test]
+    fn status_hook_drains_stdin_before_exit_no_broken_pipe() {
+        // Regression for the AoE-Codex PostToolUse "Broken pipe (os error 32)"
+        // noise: the agent streams the full tool payload (multi-MB for image
+        // results) to the hook's stdin. The generated command must drain it
+        // before any exit, or the agent's write fails with EPIPE. The invalid
+        // AOE_INSTANCE_ID forces the earliest exit-0 path (the id sanitizer),
+        // so this asserts the drain runs *before* that exit and touches no
+        // tmux/filesystem state.
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let cmd = canonical_status_command("running", HookInstallTarget::Host);
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("AOE_INSTANCE_ID", "test-bad!")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn status hook");
+
+        // 4 MiB, well past the ~64 KiB pipe buffer, so an undrained reader
+        // would force this write to fail partway with EPIPE.
+        let payload = vec![b'x'; 4 * 1024 * 1024];
+        let mut stdin = child.stdin.take().expect("child stdin piped");
+        let write_res = stdin.write_all(&payload).and_then(|_| stdin.flush());
+        drop(stdin); // close so the hook's `cat` sees EOF and proceeds
+        let status = child.wait().expect("wait for status hook");
+
+        assert!(
+            write_res.is_ok(),
+            "payload write must not EPIPE: {write_res:?}"
+        );
+        assert!(status.success(), "status hook must exit 0, got {status:?}");
     }
 
     #[test]

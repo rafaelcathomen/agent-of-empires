@@ -11,6 +11,7 @@ import {
   useRef,
   useState,
   type MutableRefObject,
+  type ReactNode,
 } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -28,6 +29,7 @@ import {
   Play,
   Plus,
   RotateCcw,
+  Search,
   Sparkles,
   Trash2,
   X,
@@ -64,6 +66,7 @@ import {
   type SidebarGroup,
   type SidebarWorkspaceView,
 } from "../lib/sidebarGroups";
+import { highlightRanges, workspaceMatches } from "../lib/sessionSearch";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 import { menuBus, closeOtherContextMenus } from "../lib/menuBus";
 import { REPO_COLOR_OPTIONS, repoColorStyle, repoSwatchStyle, type RepoAppearanceUpdate } from "../lib/repoAppearance";
@@ -320,6 +323,14 @@ interface Props {
   onPluginSortChange: (ref: { pluginId: string; entryId: string }) => void;
   axis: SidebarAxis;
   onAxisChange: (axis: SidebarAxis) => void;
+  // Inline session search, optionally driven by App (Ctrl/Cmd+F). When any
+  // of these are provided the search is controlled; otherwise it falls back
+  // to local state so the component still works standalone in tests.
+  searchOpen?: boolean;
+  searchQuery?: string;
+  onSearchQueryChange?: (q: string) => void;
+  onSearchOpen?: () => void;
+  onSearchClose?: () => void;
 }
 
 function bestSession(
@@ -749,6 +760,8 @@ function SortableSessionRow({
   workspace: Workspace;
   isActive: boolean;
   isSelected: boolean;
+  highlightQuery?: string;
+  keyHighlighted?: boolean;
   onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onDelete?: (workspaceId: string) => void;
   onStop?: (workspaceId: string) => void;
@@ -872,6 +885,8 @@ export const SessionRow = memo(function SessionRow({
   workspace,
   isActive,
   isSelected,
+  highlightQuery,
+  keyHighlighted,
   onActivate,
   onDelete,
   onStop,
@@ -890,6 +905,10 @@ export const SessionRow = memo(function SessionRow({
   isActive: boolean;
   // Whether this row is part of the sidebar multi-select. See #1724.
   isSelected: boolean;
+  // Active search query, used to <mark> the matched run of the row title.
+  highlightQuery?: string;
+  // True when this row is the Up/Down keyboard selection in search mode.
+  keyHighlighted?: boolean;
   // Row click. The parent interprets the modifier keys (plain navigates,
   // Cmd/Ctrl toggles, Shift ranges), so the row forwards the event up rather
   // than navigating directly. See #1724.
@@ -1279,6 +1298,11 @@ export const SessionRow = memo(function SessionRow({
         tabIndex={isDeleting ? -1 : undefined}
         aria-disabled={isDeleting || undefined}
         data-testid="sidebar-session-row"
+        data-row-id={workspace.id}
+        // Lets the search input point aria-activedescendant at the active row
+        // so screen readers announce the Up/Down keyboard selection.
+        id={keyHighlighted ? `sidebar-row-${workspace.id}` : undefined}
+        aria-selected={keyHighlighted || undefined}
         draggable={false}
         onClick={(e) => {
           // Let the browser handle non-primary clicks (middle-click still
@@ -1314,7 +1338,7 @@ export const SessionRow = memo(function SessionRow({
             : "border-l-2 border-transparent hover:bg-surface-700/40"
         } ${
           isSelected ? "ring-1 ring-inset ring-brand-500/60 bg-brand-500/10" : ""
-        } ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
+        } ${keyHighlighted ? "ring-1 ring-inset ring-brand-500/60" : ""} ${isDeleting ? "opacity-50 pointer-events-none" : ""}`}
       >
         {isSelected && <span className="sr-only">Selected</span>}
         <div className="flex items-center gap-2">
@@ -1344,7 +1368,27 @@ export const SessionRow = memo(function SessionRow({
                 </span>
               )}
               <span className="truncate" title={label}>
-                {label}
+                {(() => {
+                  const ranges = highlightQuery ? highlightRanges(label, highlightQuery) : [];
+                  if (ranges.length === 0) return label;
+                  const parts: ReactNode[] = [];
+                  let cursor = 0;
+                  ranges.forEach((r, i) => {
+                    if (r.start > cursor) parts.push(label.slice(cursor, r.start));
+                    parts.push(
+                      <mark
+                        key={i}
+                        data-testid="session-search-match"
+                        className="rounded-[2px] bg-brand-500/15 px-px text-text-bright"
+                      >
+                        {label.slice(r.start, r.end)}
+                      </mark>,
+                    );
+                    cursor = r.end;
+                  });
+                  if (cursor < label.length) parts.push(label.slice(cursor));
+                  return parts;
+                })()}
               </span>
               {hasDraft && (
                 <span title="Unsent draft" aria-label="Unsent draft" className="inline-flex shrink-0">
@@ -2469,16 +2513,6 @@ export const SidebarGroupHeader = memo(function SidebarGroupHeader({
   );
 });
 
-function workspaceMatchesFilter(ws: Workspace, q: string): boolean {
-  return (
-    ws.displayName.toLowerCase().includes(q) ||
-    ws.projectPath.toLowerCase().includes(q) ||
-    (ws.branch?.toLowerCase().includes(q) ?? false) ||
-    ws.agents.some((a) => a.toLowerCase().includes(q)) ||
-    ws.sessions.some((s) => s.title.toLowerCase().includes(q))
-  );
-}
-
 // The grouping toggle cycles through the three axes on each click. Order is
 // chosen so the first click off the default still lands on the flat group
 // axis (preserving the pre-#1720 repo -> group step), then adds nesting.
@@ -2539,6 +2573,11 @@ export function WorkspaceSidebar({
   onPluginSortChange,
   axis,
   onAxisChange,
+  searchOpen,
+  searchQuery,
+  onSearchQueryChange,
+  onSearchOpen,
+  onSearchClose,
 }: Props) {
   // Plugin sort/filter slots (#2401). Read the live snapshot here so the facet
   // control and the sort-picker options stay local to the sidebar; the active
@@ -2603,6 +2642,27 @@ export function WorkspaceSidebar({
   }, [width]);
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterQuery, setFilterQuery] = useState("");
+  const searchControlled = searchOpen !== undefined || searchQuery !== undefined;
+  const searchActive = searchOpen ?? filterOpen;
+  const query = searchQuery ?? filterQuery;
+  const setQuery = onSearchQueryChange ?? setFilterQuery;
+  const openSearch = onSearchOpen ?? (() => setFilterOpen(true));
+  const closeSearch = () => {
+    if (searchControlled) {
+      onSearchClose?.();
+    } else {
+      setFilterOpen(false);
+      setFilterQuery("");
+    }
+  };
+  const [highlightIndex, setHighlightIndex] = useState(0);
+  // Reset the keyboard selection to the first row on every query edit, so a
+  // fresh result set always starts highlighted at its top. Routed through the
+  // change handler (an event) rather than an effect.
+  const handleQueryChange = (next: string) => {
+    setHighlightIndex(0);
+    setQuery(next);
+  };
   const [facetOpen, setFacetOpen] = useState(false);
   const [sunkExpanded, setSunkExpanded] = useState<boolean>(loadSunkExpanded);
   const toggleSunkExpanded = useCallback(() => {
@@ -2711,7 +2771,7 @@ export function WorkspaceSidebar({
   // truth. Triage always targets the workspace's primary session.
   const triage = useSidebarTriage(allWorkspaces);
 
-  const q = filterQuery.trim().toLowerCase();
+  const q = query.trim().toLowerCase();
 
   const isNested = axis === "repo+group";
 
@@ -2721,7 +2781,7 @@ export function WorkspaceSidebar({
   // whether the list is filtered at all.
   const hasFilter = !!q || activeFacets.length > 0;
   const textMatches = (v: SidebarWorkspaceView, ...groupNames: string[]) =>
-    !q || workspaceMatchesFilter(v.workspace, q) || groupNames.some((n) => n.toLowerCase().includes(q));
+    !q || workspaceMatches(v.workspace, q) || groupNames.some((n) => n.toLowerCase().includes(q));
 
   const filteredGroups = hasFilter
     ? groups
@@ -2795,6 +2855,19 @@ export function WorkspaceSidebar({
     }
     return ids;
   }, [filteredGroups, hasFilter, sunkExpanded]);
+
+  // Move the keyboard selection by `delta` within the filtered flat order,
+  // clamped to the ends, and scroll the newly highlighted row into view.
+  // Called straight from the input's Arrow handlers (an event), so the
+  // scroll stays out of an effect.
+  const moveHighlight = (delta: number) => {
+    setHighlightIndex((i) => {
+      const next = Math.min(Math.max(i + delta, 0), flatRenderedOrder.length - 1);
+      const id = flatRenderedOrder[next];
+      if (id) document.querySelector(`[data-row-id="${id}"]`)?.scrollIntoView({ block: "nearest" });
+      return next;
+    });
+  };
 
   // Drop selected ids for workspaces that no longer exist (a session was
   // deleted or moved). Existence-based, not visibility-based: collapsing a
@@ -2988,12 +3061,10 @@ export function WorkspaceSidebar({
   );
 
   const toggleFilter = () => {
-    setFilterOpen((o) => {
-      if (o) setFilterQuery("");
-      return !o;
-    });
-    if (!filterOpen) {
-      requestAnimationFrame(() => filterRef.current?.focus());
+    if (searchActive) {
+      closeSearch();
+    } else {
+      openSearch();
     }
   };
 
@@ -3092,23 +3163,13 @@ export function WorkspaceSidebar({
           <Tooltip text="Filter">
             <button
               onClick={toggleFilter}
+              data-testid="sidebar-search-toggle"
               className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors ${
-                filterOpen ? "text-text-secondary" : "text-text-dim hover:text-text-secondary"
+                searchActive ? "text-text-secondary" : "text-text-dim hover:text-text-secondary"
               }`}
-              aria-label="Filter sessions"
+              aria-label="Search sessions"
             >
-              <svg
-                width="14"
-                height="14"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              >
-                <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
-              </svg>
+              <Search className="h-3.5 w-3.5" />
             </button>
           </Tooltip>
           <Tooltip text={offline ? OFFLINE_TITLE : "New project session"}>
@@ -3142,20 +3203,75 @@ export function WorkspaceSidebar({
           </button>
         </div>
 
-        {filterOpen && (
+        {searchActive && (
           <div className="px-3 pb-2">
-            <input
-              ref={filterRef}
-              type="text"
-              value={filterQuery}
-              onChange={(e) => setFilterQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") toggleFilter();
-              }}
-              placeholder="Filter by name, branch, agent..."
-              data-testid="sidebar-filter-input"
-              className="w-full bg-surface-800 border border-surface-700 rounded-md px-2.5 py-1.5 text-[13px] text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
-            />
+            <div className="relative">
+              <input
+                ref={filterRef}
+                type="text"
+                // The input mounts only while search is open, so autoFocus
+                // fires on every open path: external Ctrl/Cmd+F, the header
+                // toggle, and the phone tap affordance.
+                autoFocus
+                value={query}
+                onChange={(e) => handleQueryChange(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") {
+                    closeSearch();
+                    return;
+                  }
+                  // During IME composition (CJK), Arrow keys cycle conversion
+                  // candidates and Enter commits them; let the IME consume those
+                  // rather than moving the row highlight or opening a session.
+                  // Mirrors the Composer convention (acp/Composer.tsx).
+                  if (e.nativeEvent.isComposing) return;
+                  // Arrow / Enter navigation is backed by flatRenderedOrder,
+                  // which only walks the flat axis; gate it off under the
+                  // nested (repo+group) axis where that order is not built.
+                  if (isNested || flatRenderedOrder.length === 0) return;
+                  if (e.key === "ArrowDown") {
+                    e.preventDefault();
+                    moveHighlight(1);
+                  } else if (e.key === "ArrowUp") {
+                    e.preventDefault();
+                    moveHighlight(-1);
+                  } else if (e.key === "Enter") {
+                    e.preventDefault();
+                    const id = flatRenderedOrder[highlightIndex];
+                    if (id) handleRowActivate(id, { metaKey: false, ctrlKey: false, shiftKey: false });
+                  }
+                }}
+                placeholder="Search sessions by name, branch, agent..."
+                data-testid="sidebar-filter-input"
+                role="combobox"
+                aria-expanded
+                aria-controls="sidebar-session-list"
+                aria-activedescendant={
+                  !isNested && flatRenderedOrder[highlightIndex]
+                    ? `sidebar-row-${flatRenderedOrder[highlightIndex]}`
+                    : undefined
+                }
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                enterKeyHint="search"
+                className="w-full bg-surface-800 border border-surface-700 rounded-md px-2.5 py-1.5 pr-7 text-[13px] text-text-primary placeholder:text-text-dim focus:border-brand-600 focus:outline-none"
+              />
+              {query.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleQueryChange("");
+                    filterRef.current?.focus();
+                  }}
+                  aria-label="Clear search"
+                  data-testid="sidebar-search-clear"
+                  className="absolute right-1 top-1/2 flex h-7 w-7 -translate-y-1/2 items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              )}
+            </div>
           </div>
         )}
 
@@ -3195,7 +3311,10 @@ export function WorkspaceSidebar({
           </div>
         )}
 
-        <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/60">
+        <div
+          id="sidebar-session-list"
+          className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/60"
+        >
           {!isNested && (
             <DragSuppressContext.Provider value={dragSuppressRef}>
               <DndContext
@@ -3261,6 +3380,8 @@ export function WorkspaceSidebar({
                                     workspace={v.workspace}
                                     isActive={v.workspace.id === displayedActiveId}
                                     isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
+                                    highlightQuery={q || undefined}
+                                    keyHighlighted={!isNested && v.workspace.id === flatRenderedOrder[highlightIndex]}
                                     onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                                     onDelete={onDeleteSession}
                                     onStop={onStopSession}
@@ -3369,6 +3490,7 @@ export function WorkspaceSidebar({
                                 workspace={v.workspace}
                                 isActive={v.workspace.id === displayedActiveId}
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
+                                highlightQuery={q || undefined}
                                 onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                                 onDelete={onDeleteSession}
                                 onStop={onStopSession}
@@ -3443,6 +3565,8 @@ export function WorkspaceSidebar({
                       workspace={v.workspace}
                       isActive={v.workspace.id === displayedActiveId}
                       isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
+                      highlightQuery={q || undefined}
+                      keyHighlighted={!isNested && v.workspace.id === flatRenderedOrder[highlightIndex]}
                       onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                       onDelete={onDeleteSession}
                       onStop={onStopSession}
@@ -3473,8 +3597,8 @@ export function WorkspaceSidebar({
           />
 
           {!hasResults && hasFilter && (
-            <div className="px-4 py-8 text-center">
-              <p className="text-sm text-text-muted">No matches for &ldquo;{filterQuery}&rdquo;</p>
+            <div className="px-4 py-8 text-center" data-testid="sidebar-no-matches">
+              <p className="text-sm text-text-muted">No matching sessions</p>
             </div>
           )}
 

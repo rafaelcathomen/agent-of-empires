@@ -240,6 +240,29 @@ impl HomeView {
             .filter(|i| i.source_profile == target_profile)
             .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
             .collect();
+        // Union live instance group_paths with the target profile's persisted
+        // groups so resolve_group_path also sees EMPTY folders (e.g. one created
+        // via the Ctrl+P picker, or whose last session moved out). Without this
+        // a leaf like "clients/acme" typed against an empty "work/clients/acme"
+        // would still spawn a top-level duplicate. Both reads are immutable
+        // &self borrows and the owned Vec is collected before build_instance,
+        // so there is no borrow conflict (mirrors the CLI add path).
+        let existing_groups: Vec<String> = {
+            let mut g: Vec<String> = self
+                .instances()
+                .iter()
+                .filter(|i| i.source_profile == target_profile)
+                .map(|i| i.group_path.clone())
+                .filter(|p| !p.is_empty())
+                .collect();
+            if let Some(tree) = self.group_trees.get(&target_profile) {
+                g.extend(tree.get_all_groups().into_iter().map(|grp| grp.path));
+            }
+            g.sort();
+            g.dedup();
+            g
+        };
+        let group_refs: Vec<&str> = existing_groups.iter().map(|s| s.as_str()).collect();
 
         let params = InstanceParams {
             title: data.title,
@@ -264,10 +287,21 @@ impl HomeView {
             params,
             &existing_titles,
             &existing_branches,
+            &group_refs,
             &target_profile,
         )?;
         let mut instance = build_result.instance;
         instance.source_profile = target_profile.clone();
+
+        // Context-fork: a one-shot `ResumeIntent::Fork(parent)` so the first
+        // launch seeds the new session from the parent's conversation, then
+        // auto-promotes to `Default`. Record the lineage on
+        // `parent_session_id` too.
+        if let Some(parent_id) = data.fork_parent_id {
+            instance.resume_intent = crate::session::ResumeIntent::Fork(parent_id.clone());
+            instance.parent_session_id = Some(parent_id);
+        }
+
         let session_id = instance.id.clone();
 
         // Ensure target profile storage exists
@@ -357,6 +391,7 @@ impl HomeView {
         new_tool: Option<&str>,
         new_extra_args: Option<&str>,
         new_command_override: Option<&str>,
+        fresh_start: bool,
     ) -> anyhow::Result<()> {
         let id = match &self.selected_session {
             Some(id) => id.clone(),
@@ -379,11 +414,16 @@ impl HomeView {
         let (skip, wake_snooze) = match self.get_instance(&id) {
             Some(inst) => {
                 let snoozed = inst.is_snoozed();
+                // A dead pane is normally treated as a sunk row and skipped, but
+                // a fresh-start is an explicit "revive this crashed session"
+                // gesture, so it must punch through that guard (otherwise the
+                // restart returns before the resume-clearing below ever runs,
+                // and the row stays stuck resuming its dead conversation).
                 let skip = matches!(inst.status, Status::Creating | Status::Deleting)
                     || inst.is_archived()
                     || inst.is_trashed()
                     || (snoozed && in_attention)
-                    || inst.pane_dead_observed;
+                    || (inst.pane_dead_observed && !fresh_start);
                 let wake_snooze = snoozed && !in_attention;
                 (skip, wake_snooze)
             }
@@ -410,6 +450,35 @@ impl HomeView {
         // clear snooze without restarting.
         if wake_snooze {
             self.mutate_instance(&id, |inst| inst.unsnooze());
+        }
+
+        // Start-fresh: discard the saved conversation so the relaunch begins a
+        // brand-new one in place. Mirrors `aoe session set-session-id <id> ""`
+        // (ResumeIntent::Cleared + drop the failed-sid loop-breaker). This is
+        // the escape hatch for a session whose stored conversation the agent
+        // backend no longer has ("No conversation found with session ID ..."),
+        // which the resume cascade otherwise preserves and retries forever.
+        if fresh_start {
+            self.mutate_instance(&id, |inst| {
+                inst.resume_intent = crate::session::ResumeIntent::Cleared;
+                inst.resume_probe_failed_sid = None;
+                // Drop the stale conversation pointers outright too, not just
+                // the intent: the recovery/status pollers resume off
+                // `agent_session_id` (and structured sessions off
+                // `acp_session_id`), so leaving the dead id on disk lets the
+                // crash-loop keep resuming it before our Cleared launch lands.
+                // Stash the dead sid in the retroactive-capture exclusion set so
+                // a re-scan of the crashing pane can't grab it back and re-pin
+                // the very conversation we're discarding.
+                if let Some(dead) = inst.agent_session_id.take() {
+                    inst.retroactive_capture_excludes.insert(dead);
+                }
+                inst.pane_dead_observed = false;
+                #[cfg(feature = "serve")]
+                {
+                    inst.acp_session_id = None;
+                }
+            });
         }
 
         // Apply tool swap before restart so the new binary starts on the
@@ -577,6 +646,83 @@ impl HomeView {
             }
         }
         Ok(())
+    }
+
+    /// Apply a per-session manual color and/or heat override from the r-menu.
+    /// `manual_color`/`heat_enabled` are `Some(value)` when the dialog changed
+    /// them (`Some(None)` clears/inherits), `None` when unchanged. Routed
+    /// through `apply_user_action` so the change persists under the flock and
+    /// survives concurrent peer writes via `merge_user_action_diff`.
+    pub(super) fn set_session_color_and_heat(
+        &mut self,
+        id: &str,
+        manual_color: Option<Option<crate::session::FolderColor>>,
+        heat_enabled: Option<Option<bool>>,
+    ) {
+        if manual_color.is_none() && heat_enabled.is_none() {
+            return;
+        }
+        if let Err(e) = self.apply_user_action(id, |inst| {
+            if let Some(c) = manual_color {
+                inst.manual_color = c;
+            }
+            if let Some(h) = heat_enabled {
+                inst.heat_enabled = h;
+            }
+        }) {
+            tracing::error!(target: "tui.home", "Failed to set session color/heat: {}", e);
+        }
+        // Reflect the change immediately; the next poll recomputes heat anyway,
+        // but recompute now so a heat toggle takes effect without waiting.
+        self.recompute_heat();
+    }
+
+    /// Set (or clear, with `None`) the spine color of the currently selected
+    /// group. Mirrors the CLI `aoe group color` setter: mutate the profile's
+    /// in-memory `GroupTree` via `set_color`, persist the rebuilt group list
+    /// through that profile's storage, then rebuild the trees so the new color
+    /// shows on the next render.
+    pub(super) fn set_selected_group_color(&mut self, color: Option<crate::session::FolderColor>) {
+        let Some(group_path) = self.selected_group.clone() else {
+            return;
+        };
+        let profile = self
+            .selected_group_profile
+            .clone()
+            .unwrap_or_else(|| self.config_profile());
+        self.set_group_color_at(&group_path, &profile, color);
+    }
+
+    /// Set (or clear) a group's spine color for an explicit path and profile.
+    /// Used after a group rename, where `self.selected_group` may have fallen
+    /// to a different row during reload, so the caller passes the known target
+    /// (the post-rename path) instead of relying on the current selection.
+    pub(super) fn set_group_color_at(
+        &mut self,
+        group_path: &str,
+        profile: &str,
+        color: Option<crate::session::FolderColor>,
+    ) {
+        if let Some(tree) = self.group_trees.get_mut(profile) {
+            if !tree.set_color(group_path, color) {
+                return;
+            }
+        } else {
+            return;
+        }
+
+        if let Some(storage) = self.storages.get(profile) {
+            let res = storage.update(|instances, groups| {
+                let mut tree = GroupTree::new_with_groups(instances, groups);
+                tree.set_color(group_path, color);
+                *groups = tree.get_all_groups();
+                Ok(())
+            });
+            if let Err(e) = res {
+                tracing::error!(target: "tui.home", "Failed to persist group color: {}", e);
+            }
+        }
+        self.rebuild_group_trees();
     }
 
     pub(super) fn delete_selected_group(&mut self) -> anyhow::Result<()> {

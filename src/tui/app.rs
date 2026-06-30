@@ -2601,15 +2601,17 @@ impl App {
             for group in due {
                 // Curation runs as a background one-shot agent (headless
                 // `claude -p`, no visible chat), never as the group's PM. Stamp
-                // the curator state up front so a slow run is not re-spawned on
-                // the next tick before it commits.
+                // the curator state up front so a slow or failing run is not
+                // re-spawned every tick. `due_groups` already applied the
+                // change+interval gate, and the stamp sets `last_size` to the
+                // current size, so curate must run with force=true or its own
+                // change-gate would now see "no change" and skip.
                 let _ = crate::session::group_context::mark_curation_started(&profile, &group);
                 let profile = profile.clone();
                 let agent = curator.effective_agent().to_string();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        crate::session::curator::curate(&profile, &group, &agent, false, false)
-                            .await
+                        crate::session::curator::curate(&profile, &group, &agent, true, false).await
                     {
                         tracing::warn!(target: "curator", group = %group, "auto-curate failed: {e}");
                     }

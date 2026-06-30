@@ -3247,7 +3247,7 @@ async fn auto_curate_due_groups(
     for (profile, group, agent) in plans {
         tokio::spawn(async move {
             if let Err(e) =
-                crate::session::curator::curate(&profile, &group, &agent, false, false).await
+                crate::session::curator::curate(&profile, &group, &agent, true, false).await
             {
                 tracing::warn!(target: "curator", group = %group, "auto-curate failed: {e}");
             }

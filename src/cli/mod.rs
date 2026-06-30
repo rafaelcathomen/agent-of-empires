@@ -7,6 +7,7 @@ pub mod agents;
 pub mod automation;
 pub mod definition;
 pub mod extract_session_id;
+pub mod fork;
 pub mod group;
 pub mod hook_heat;
 pub mod hook_subagent;

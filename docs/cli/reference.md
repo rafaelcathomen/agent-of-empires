@@ -6,6 +6,8 @@ This document contains the help content for the `aoe` command-line program.
 
 * [`aoe`↴](#aoe)
 * [`aoe add`↴](#aoe-add)
+* [`aoe fork`↴](#aoe-fork)
+* [`aoe register`↴](#aoe-register)
 * [`aoe agents`↴](#aoe-agents)
 * [`aoe automation`↴](#aoe-automation)
 * [`aoe automation add`↴](#aoe-automation-add)
@@ -115,6 +117,8 @@ Run without arguments to launch the TUI dashboard.
 ###### **Subcommands:**
 
 * `add` — Add a new session
+* `fork` — Fork an existing session: start a new conversation seeded from a parent session's context, optionally in a fresh git worktree branch
+* `register` — Adopt an existing tmux session (an agent you started yourself) into aoe
 * `agents` — List supported agents and their install status
 * `automation` — Manage automations (scheduled agent runs)
 * `init` — Initialize .agent-of-empires/config.toml in a repository
@@ -186,6 +190,44 @@ Add a new session
 * `--model <MODEL>` — Override the model used by aoe-agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
 * `--prompt <PROMPT>` — Initial prompt to inject into the session right after launch
 * `--scratch` — Create the session in a fresh scratch directory under `<app_dir>/scratch/<id>/` instead of a project path. The directory is removed when the session is deleted (unless `aoe rm` is given `--keep-scratch`). Mutually exclusive with worktree-related flags
+
+
+
+## `aoe fork`
+
+Fork an existing session: start a new conversation seeded from a parent session's context, optionally in a fresh git worktree branch
+
+**Usage:** `aoe fork [OPTIONS] <PARENT>`
+
+###### **Arguments:**
+
+* `<PARENT>` — Parent session to fork (id, id prefix, or unique title)
+
+###### **Options:**
+
+* `--branch <BRANCH>` — Create the forked session in a fresh git worktree on a new branch. Pass a branch name, or leave empty to auto-generate `fork/<parent-title>`
+* `--base <BASE>` — Branch to base the new worktree branch on (use with `--branch`). Defaults to the repository's default branch
+* `-t`, `--title <TITLE>` — Title for the forked session (defaults to `<parent-title>-fork`)
+* `-l`, `--launch` — Launch the forked session immediately after creating it
+
+
+
+## `aoe register`
+
+Adopt an existing tmux session (an agent you started yourself) into aoe
+
+**Usage:** `aoe register [OPTIONS] <TMUX_SESSION>`
+
+###### **Arguments:**
+
+* `<TMUX_SESSION>` — Name of the existing tmux session to adopt (as shown by `tmux ls`). The agent must already be running inside this tmux session
+
+###### **Options:**
+
+* `-t`, `--title <TITLE>` — Session title (defaults to a readable form of the tmux session name)
+* `--path <PATH>` — Project directory for the session (defaults to the tmux pane's current working directory)
+* `--tool <TOOL>` — Agent tool running in the session (e.g. claude, codex, gemini). Defaults to auto-detecting from the pane's foreground command, falling back to `claude` when detection is inconclusive
+* `-g`, `--group <GROUP>` — Group path to place the session under
 
 
 

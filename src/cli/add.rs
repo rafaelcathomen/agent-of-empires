@@ -143,16 +143,121 @@ pub struct AddArgs {
         ]
     )]
     scratch: bool,
+
+    /// Fork an existing session: start a new conversation seeded from the
+    /// parent session's context. Clones the parent's tool/path/group/extra
+    /// args when not overridden. Set via the `aoe fork` subcommand.
+    #[arg(skip)]
+    pub(crate) fork: Option<String>,
+}
+
+impl AddArgs {
+    /// Build the `AddArgs` the `aoe fork` subcommand delegates into. All
+    /// add-only knobs default to off; the parent-cloning of
+    /// tool/path/group/extra_args and the resume intent happen inside
+    /// [`run`] keyed on `fork`. `worktree_branch == Some("")` signals
+    /// `--branch` with no explicit name (run auto-generates `fork/<title>`).
+    pub(crate) fn for_fork(
+        parent: String,
+        title: Option<String>,
+        worktree_branch: Option<String>,
+        base_branch: Option<String>,
+        launch: bool,
+    ) -> Self {
+        AddArgs {
+            path: None,
+            title,
+            interactive: false,
+            group: None,
+            command: None,
+            tool: None,
+            parent: None,
+            launch,
+            worktree_branch,
+            create_branch: false,
+            base_branch,
+            extra_repos: Vec::new(),
+            projects: Vec::new(),
+            no_submodules: false,
+            sandbox: false,
+            sandbox_image: None,
+            yolo: false,
+            trust_hooks: false,
+            extra_args: None,
+            cmd_override: None,
+            #[cfg(feature = "serve")]
+            structured_view: false,
+            #[cfg(feature = "serve")]
+            agent: None,
+            #[cfg(feature = "serve")]
+            model: None,
+            prompt: None,
+            scratch: false,
+            fork: Some(parent),
+        }
+    }
 }
 
 #[tracing::instrument(target = "cli.add", skip_all, fields(profile = %profile))]
-pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
+pub async fn run(profile: &str, mut args: AddArgs) -> Result<()> {
     // Fail fast before any filesystem side effects: --interactive must
     // have a real terminal to read the name from, otherwise the prompt
     // would block on EOF or a PTY harness would hang.
     if args.interactive && !std::io::stdin().is_terminal() {
         bail!("--interactive requires a terminal; pass --title for non-interactive naming");
     }
+
+    // Fork: resolve the parent session and clone its setup into `args` for any
+    // field the caller did not override. The resume intent is set on the built
+    // instance just before persist (see below). Done up front so the cloned
+    // path/group/tool flow through the rest of the normal `add` machinery
+    // (worktree creation, hooks, dedup, persist) unchanged.
+    let fork_parent_sid: Option<String> = if let Some(fork_ref) = args.fork.clone() {
+        let fork_storage = Storage::new_unwatched(profile)?;
+        let (fork_instances, _) = fork_storage.load_with_groups()?;
+        let parent = super::resolve_session(&fork_ref, &fork_instances)?;
+        if args.command.is_none() && args.tool.is_none() {
+            args.tool = Some(parent.tool.clone());
+        }
+        if args.path.is_none() && !args.scratch && !parent.project_path.is_empty() {
+            args.path = Some(PathBuf::from(&parent.project_path));
+        }
+        if args.group.is_none() && !parent.group_path.is_empty() {
+            args.group = Some(parent.group_path.clone());
+        }
+        if args.extra_args.is_none() && !parent.extra_args.is_empty() {
+            args.extra_args = Some(parent.extra_args.clone());
+        }
+        if args.title.is_none() {
+            args.title = Some(format!("{}-fork", parent.title));
+        }
+        // `--branch` with no explicit name auto-generates `fork/<parent-title>`.
+        if args.worktree_branch.as_deref() == Some("") {
+            let slug = crate::session::worktree_edit::worktree_leaf_from_title(&parent.title);
+            args.worktree_branch = Some(format!("fork/{}", slug));
+            args.create_branch = true;
+        } else if args.worktree_branch.is_some() {
+            args.create_branch = true;
+        }
+        // Fork must resume the parent's AGENT CONVERSATION, not its aoe instance
+        // id: claude `--resume <sid> --fork-session`, codex `fork <sid>`, and pi
+        // `--fork <sid>` all expect the agent's own session id, which aoe tracks
+        // as `agent_session_id`. If the parent has no conversation yet, there is
+        // nothing to fork — fall back to a plain same-setup session (no fork).
+        match parent.agent_session_id.clone() {
+            Some(sid) => Some(sid),
+            None => {
+                eprintln!(
+                    "Warning: '{}' has no agent conversation to fork yet; \
+                     creating a fresh same-setup session instead.",
+                    parent.title
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Scratch sessions have no project path; the scratch directory is
     // provisioned below once we know the instance id. Reject an
@@ -699,6 +804,20 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 instance.view = crate::session::View::Terminal;
             }
         }
+    }
+
+    // Fork intent: a one-shot `ResumeIntent::Fork(parent_sid)` so the first
+    // launch passes the per-tool fork flags and the poller adopts the new
+    // session id, after which it auto-promotes to `Default`.
+    //
+    // A fork is a SIBLING, not a sub-session: it appears as its own top-level
+    // row in the (cloned) parent group, mirroring Shift+N's "a new one appears"
+    // rather than nesting under the parent. So we deliberately do NOT set
+    // `parent_session_id` (which would make it a sub-session that inherits
+    // lifecycle and can't itself be a `--parent`). The fork lineage lives in
+    // the resumed conversation, not the session tree.
+    if let Some(parent_sid) = &fork_parent_sid {
+        instance.resume_intent = crate::session::ResumeIntent::Fork(parent_sid.clone());
     }
 
     // Handle sandbox setup

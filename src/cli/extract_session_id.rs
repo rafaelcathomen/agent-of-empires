@@ -14,6 +14,11 @@ use anyhow::{anyhow, Result};
 use clap::Args;
 
 const STDIN_BYTE_CAP: u64 = 1 << 20;
+// Upper bound on draining stdin past the read cap. The agent streams the full
+// hook payload then closes stdin, so we read to EOF to avoid EPIPE'ing its
+// write; this cap stops a stdin that never closes (a hung agent, or the
+// infinite-reader test) from hanging the hook forever.
+const STDIN_DRAIN_CAP: u64 = 64 << 20;
 
 #[derive(Args)]
 pub struct ExtractSessionIdArgs {}
@@ -38,11 +43,14 @@ pub async fn run(_args: ExtractSessionIdArgs) -> Result<()> {
 fn run_inner<R: Read>(mut stdin: R, instance_id: &str) -> Result<()> {
     let mut buf = String::new();
     let read_res = (&mut stdin).take(STDIN_BYTE_CAP).read_to_string(&mut buf);
-    // Drain any bytes past the cap to EOF before returning, so the agent's
-    // pipe write completes instead of failing with EPIPE: agents stream the
-    // full hook payload (multi-MB for tool results), and exiting with the pipe
-    // still buffered breaks it (the AoE-Codex PostToolUse "Broken pipe" noise).
-    std::io::copy(&mut stdin, &mut std::io::sink()).ok();
+    // Drain bytes past the read cap so the agent's pipe write completes instead
+    // of failing with EPIPE (it streams the full payload before closing stdin);
+    // bounded by STDIN_DRAIN_CAP so a stdin that never closes can't hang us.
+    std::io::copy(
+        &mut (&mut stdin).take(STDIN_DRAIN_CAP),
+        &mut std::io::sink(),
+    )
+    .ok();
     read_res?;
     let value: serde_json::Value = serde_json::from_str(&buf)?;
     let sid = value

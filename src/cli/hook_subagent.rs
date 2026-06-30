@@ -16,6 +16,9 @@ use anyhow::Result;
 use clap::Args;
 
 const STDIN_BYTE_CAP: u64 = 1 << 20;
+// See extract_session_id.rs: bounds the post-cap stdin drain so a never-closing
+// stdin can't hang the hook.
+const STDIN_DRAIN_CAP: u64 = 64 << 20;
 
 #[derive(Args)]
 pub struct HookSubagentArgs {
@@ -45,10 +48,14 @@ pub async fn run(args: HookSubagentArgs) -> Result<()> {
 fn run_inner<R: Read>(mut stdin: R, instance_id: &str, delta: i64) -> Result<()> {
     let mut buf = String::new();
     let read_res = (&mut stdin).take(STDIN_BYTE_CAP).read_to_string(&mut buf);
-    // Drain any bytes past the cap to EOF so a large payload (e.g. a big tool
-    // input on PreToolUse) doesn't EPIPE the agent's write when we return early
-    // (the +1 path bails on a non-Task tool, and the read stops at the cap).
-    std::io::copy(&mut stdin, &mut std::io::sink()).ok();
+    // Drain bytes past the read cap so a large tool input doesn't EPIPE the
+    // agent's write when we return early; bounded by STDIN_DRAIN_CAP so a
+    // never-closing stdin can't hang the hook.
+    std::io::copy(
+        &mut (&mut stdin).take(STDIN_DRAIN_CAP),
+        &mut std::io::sink(),
+    )
+    .ok();
     read_res?;
     if delta > 0 {
         // Gate the increment on the actual tool name: PreToolUse fires for

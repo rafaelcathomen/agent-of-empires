@@ -3598,7 +3598,7 @@ export function WorkspaceSidebar({
 
           {!hasResults && hasFilter && (
             <div className="px-4 py-8 text-center" data-testid="sidebar-no-matches">
-              <p className="text-sm text-text-muted">No matches for &ldquo;{query}&rdquo;</p>
+              <p className="text-sm text-text-muted">No matching sessions</p>
             </div>
           )}
 

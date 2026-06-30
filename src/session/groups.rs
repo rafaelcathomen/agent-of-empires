@@ -1247,7 +1247,7 @@ pub fn append_trash_section(items: &mut Vec<Item>, instances: &[Instance], colla
         items.push(Item::Session {
             id: inst.id.clone(),
             depth: 1,
-            ancestor_colors: Vec::new(),
+            ancestor_colors: vec![None],
         });
     }
 }

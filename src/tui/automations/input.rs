@@ -27,10 +27,8 @@ impl AutomationsView {
                     return AutomationsAction::StartEdit(Box::new(a.clone()));
                 }
             }
-            KeyCode::Char('d') => {
-                if self.selected_automation().is_some() {
-                    self.mode = Mode::ConfirmDelete;
-                }
+            KeyCode::Char('d') if self.selected_automation().is_some() => {
+                self.mode = Mode::ConfirmDelete;
             }
             KeyCode::Char('r') => self.run_now(),
             _ => {}

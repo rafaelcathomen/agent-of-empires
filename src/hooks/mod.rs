@@ -341,7 +341,7 @@ fn hook_command_with_base(status: &str, base: &str, target: HookInstallTarget) -
         HookInstallTarget::Sandbox => "",
     };
     format!(
-        "sh -c 'unset IFS; set -f; umask 077; \
+        "sh -c 'cat >/dev/null 2>&1; unset IFS; set -f; umask 077; \
          {resolve_id}\
          [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
          case \"$AOE_INSTANCE_ID\" in *[!0-9a-zA-Z_-]*) exit 0 ;; esac; \
@@ -427,7 +427,9 @@ fn hook_command_subagent(delta: i64, target: HookInstallTarget) -> String {
         // absent inside the container, so subagent tracking is intentionally a
         // no-op for v1. Emit a marker-terminated no-op so uninstall still
         // recognises the command.
-        HookInstallTarget::Sandbox => format!("sh -c 'exit 0 # {AOE_HOOK_MARKER}'"),
+        HookInstallTarget::Sandbox => {
+            format!("sh -c 'cat >/dev/null 2>&1; exit 0 # {AOE_HOOK_MARKER}'")
+        }
     }
 }
 
@@ -440,7 +442,7 @@ fn hook_command_subagent(delta: i64, target: HookInstallTarget) -> String {
 fn hook_command_heat(target: HookInstallTarget) -> String {
     match target {
         HookInstallTarget::Host => format!(
-            "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || AOE_INSTANCE_ID=$(tmux show-environment -h AOE_INSTANCE_ID 2>/dev/null | grep \"^AOE_INSTANCE_ID=\" | cut -d= -f2-); \
+            "sh -c 'cat >/dev/null 2>&1; [ -n \"$AOE_INSTANCE_ID\" ] || AOE_INSTANCE_ID=$(tmux show-environment -h AOE_INSTANCE_ID 2>/dev/null | grep \"^AOE_INSTANCE_ID=\" | cut -d= -f2-); \
              [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; export AOE_INSTANCE_ID; \
              command -v aoe >/dev/null 2>&1 || exit 0; \
              aoe __hook-heat 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
@@ -448,7 +450,9 @@ fn hook_command_heat(target: HookInstallTarget) -> String {
         // Same rationale as the subagent counter: `aoe` is absent inside the
         // container, so heat tracking is a no-op there. Marker-terminated so
         // uninstall still recognises the command.
-        HookInstallTarget::Sandbox => format!("sh -c 'exit 0 # {AOE_HOOK_MARKER}'"),
+        HookInstallTarget::Sandbox => {
+            format!("sh -c 'cat >/dev/null 2>&1; exit 0 # {AOE_HOOK_MARKER}'")
+        }
     }
 }
 
@@ -4328,6 +4332,44 @@ hooks_auto_accept: false
             logs_parse.contains("session.store"),
             "warn must carry the load_or_warn target; captured: {logs_parse}"
         );
+    }
+
+    #[test]
+    fn status_hook_drains_stdin_before_exit_no_broken_pipe() {
+        // Regression for the AoE-Codex PostToolUse "Broken pipe (os error 32)"
+        // noise: the agent streams the full tool payload (multi-MB for image
+        // results) to the hook's stdin. The generated command must drain it
+        // before any exit, or the agent's write fails with EPIPE. The invalid
+        // AOE_INSTANCE_ID forces the earliest exit-0 path (the id sanitizer),
+        // so this asserts the drain runs *before* that exit and touches no
+        // tmux/filesystem state.
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let cmd = canonical_status_command("running", HookInstallTarget::Host);
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(&cmd)
+            .env("AOE_INSTANCE_ID", "test-bad!")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn status hook");
+
+        // 4 MiB, well past the ~64 KiB pipe buffer, so an undrained reader
+        // would force this write to fail partway with EPIPE.
+        let payload = vec![b'x'; 4 * 1024 * 1024];
+        let mut stdin = child.stdin.take().expect("child stdin piped");
+        let write_res = stdin.write_all(&payload).and_then(|_| stdin.flush());
+        drop(stdin); // close so the hook's `cat` sees EOF and proceeds
+        let status = child.wait().expect("wait for status hook");
+
+        assert!(
+            write_res.is_ok(),
+            "payload write must not EPIPE: {write_res:?}"
+        );
+        assert!(status.success(), "status hook must exit 0, got {status:?}");
     }
 
     #[test]

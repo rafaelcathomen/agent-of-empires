@@ -42,9 +42,14 @@ pub async fn run(args: HookSubagentArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_inner<R: Read>(stdin: R, instance_id: &str, delta: i64) -> Result<()> {
+fn run_inner<R: Read>(mut stdin: R, instance_id: &str, delta: i64) -> Result<()> {
     let mut buf = String::new();
-    stdin.take(STDIN_BYTE_CAP).read_to_string(&mut buf)?;
+    let read_res = (&mut stdin).take(STDIN_BYTE_CAP).read_to_string(&mut buf);
+    // Drain any bytes past the cap to EOF so a large payload (e.g. a big tool
+    // input on PreToolUse) doesn't EPIPE the agent's write when we return early
+    // (the +1 path bails on a non-Task tool, and the read stops at the cap).
+    std::io::copy(&mut stdin, &mut std::io::sink()).ok();
+    read_res?;
     if delta > 0 {
         // Gate the increment on the actual tool name: PreToolUse fires for
         // every tool, but only Task spawns a counted subagent. This +1 path

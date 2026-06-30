@@ -35,9 +35,15 @@ pub async fn run(_args: ExtractSessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_inner<R: Read>(stdin: R, instance_id: &str) -> Result<()> {
+fn run_inner<R: Read>(mut stdin: R, instance_id: &str) -> Result<()> {
     let mut buf = String::new();
-    stdin.take(STDIN_BYTE_CAP).read_to_string(&mut buf)?;
+    let read_res = (&mut stdin).take(STDIN_BYTE_CAP).read_to_string(&mut buf);
+    // Drain any bytes past the cap to EOF before returning, so the agent's
+    // pipe write completes instead of failing with EPIPE: agents stream the
+    // full hook payload (multi-MB for tool results), and exiting with the pipe
+    // still buffered breaks it (the AoE-Codex PostToolUse "Broken pipe" noise).
+    std::io::copy(&mut stdin, &mut std::io::sink()).ok();
+    read_res?;
     let value: serde_json::Value = serde_json::from_str(&buf)?;
     let sid = value
         .get("session_id")

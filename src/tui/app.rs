@@ -2361,12 +2361,18 @@ impl App {
     ) -> Result<()> {
         // Global keybindings
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
+            // Gated by `!has_dialog()` to match the `q` / Ctrl+Q arms below:
+            // `has_dialog()` is true while a live-send relay is active (or any
+            // overlay is open), so Ctrl+C falls through to `home.handle_key`
+            // and is forwarded to the agent (interrupting it) instead of
+            // quitting aoe. Without the guard, hitting Ctrl+C to stop an agent
+            // from live mode killed the whole TUI.
+            (KeyCode::Char('c'), KeyModifiers::CONTROL) if !self.home.has_dialog() => {
                 if self.home.is_creating_stub_selected() {
                     self.home.cancel_creation();
                     return Ok(());
                 }
-                if self.home.is_creation_pending() && !self.home.has_dialog() {
+                if self.home.is_creation_pending() {
                     self.home.show_quit_during_creation_confirm();
                     return Ok(());
                 }

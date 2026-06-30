@@ -99,8 +99,9 @@ pub struct Config {
     pub plugins: std::collections::BTreeMap<String, PluginConfig>,
 }
 
-/// Configuration for one bundled plugin: whether it is enabled, plus its
-/// schema-free persisted settings.
+/// Configuration for one plugin: whether it is enabled, its install source and
+/// capability grant (external plugins only), plus its schema-free persisted
+/// settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginConfig {
     /// Whether the plugin is active. A disabled plugin contributes nothing to
@@ -108,14 +109,48 @@ pub struct PluginConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
 
+    /// Install source for an external plugin: a `gh:owner/repo[@ref]` slug or a
+    /// local path. Absent for builtins, which are compiled in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
     /// The plugin's persisted settings (`[plugins."<id>".settings]`). Kept as
     /// an opaque `toml::Table` so values survive on disk even while the plugin
     /// is disabled; the typed schema that validates and renders them lands
-    /// with Tier 0 registries (#2094). Declared after `enabled` so the scalar
-    /// reads above the nested table; the toml serializer emits scalars before
-    /// subtables regardless, so the order is for readability. Empty is omitted.
+    /// with Tier 0 registries (#2094). The toml serializer emits scalars before
+    /// subtables regardless, so field order here is for readability. Empty is
+    /// omitted.
     #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
     pub settings: toml::Table,
+
+    /// The capability grant the user approved for an external plugin, pinned to
+    /// the manifest hash it was approved against. Absent until granted;
+    /// builtins are auto-granted and never store one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<CapabilityGrant>,
+
+    /// An available update the user declined in-app, recorded by its content
+    /// fingerprint so the popup and auto-update notification stop nagging until
+    /// the next version. Cleared on any successful apply or uninstall. Absent
+    /// when no update has been dismissed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_update: Option<String>,
+}
+
+/// A user's approval of an external plugin's requested capabilities, pinned to
+/// the exact manifest it was approved against. When the installed manifest hash
+/// later differs (an update that changed the capability set), the grant no
+/// longer applies and the plugin's runtime contributions stay inactive until
+/// re-approved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityGrant {
+    /// `sha256:<hex>` of the manifest bytes this grant was approved against.
+    pub manifest_hash: String,
+    /// The capabilities the user approved.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// When the user approved the grant.
+    pub granted_at: chrono::DateTime<chrono::Utc>,
 }
 
 fn default_enabled() -> bool {
@@ -126,7 +161,10 @@ impl Default for PluginConfig {
     fn default() -> Self {
         Self {
             enabled: default_enabled(),
+            source: None,
             settings: toml::Table::new(),
+            grant: None,
+            dismissed_update: None,
         }
     }
 }
@@ -946,6 +984,21 @@ pub struct SessionConfig {
     #[setting(label = "Agent Status Hooks", widget = "toggle", category = "Agents")]
     pub agent_status_hooks: bool,
 
+    /// For agents whose hooks are scoped to a user-selected named agent (e.g.
+    /// Kiro's `--agent NAME`), install AoE's status hooks into that agent's own
+    /// config file so status detection keeps working, on both host and sandbox
+    /// sessions. Such CLIs have no global hooks, so without this AoE's standalone
+    /// hooks agent is never loaded for a user-selected agent and status goes
+    /// dark. When disabled, AoE installs its standalone hooks agent instead and
+    /// leaves the user's agent file untouched.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Merge Hooks Into Selected Agent",
+        widget = "toggle",
+        category = "Agents"
+    )]
+    pub merge_hooks_into_selected_agent: bool,
+
     /// Auto-rename a new structured-view (ACP) session from its first message,
     /// using the session's own agent in one-shot mode (e.g. `claude -p`). Only
     /// applies while the session still carries its auto-generated name; a
@@ -1059,6 +1112,34 @@ pub struct SessionConfig {
         validate = "range:1:43200"
     )]
     pub snooze_duration_minutes: u32,
+
+    /// Move deleted sessions to the trash instead of purging them
+    /// immediately. When enabled (default), `delete`/`rm` and the TUI/web
+    /// delete actions stop the session and hide it in a recoverable trash
+    /// bucket; durable state (transcript, worktree, branch, container) is
+    /// kept until the session is purged or its retention window expires.
+    /// When disabled, delete performs the historical irreversible purge.
+    /// An explicit purge (`aoe rm --purge`, the web "Delete permanently"
+    /// action) always purges regardless of this setting.
+    #[serde(default = "default_true")]
+    #[setting(label = "Delete to Trash", widget = "toggle")]
+    pub delete_to_trash: bool,
+
+    /// Days a session stays in the trash before it is automatically purged,
+    /// measured from when it was trashed. `0` keeps trashed sessions
+    /// forever (manual purge only). Auto-purge is enforced by the `aoe serve`
+    /// daemon (a startup sweep plus an hourly tick); without a running daemon,
+    /// expired trash is purged on the next daemon start or by an explicit
+    /// manual purge (`aoe rm --purge`, `aoe session empty-trash`).
+    #[serde(default = "default_trash_retention_days")]
+    #[setting(
+        label = "Trash Retention (days)",
+        widget = "number",
+        min = 0,
+        max = 3650,
+        validate = "range:0:3650"
+    )]
+    pub trash_retention_days: u32,
 
     /// Seconds of inactivity after which a plain TUI/tmux session that has
     /// been `Idle` this long is auto-stopped (its tmux session and any
@@ -1349,6 +1430,7 @@ impl Default for SessionConfig {
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
+            merge_hooks_into_selected_agent: true,
             smart_rename: true,
             smart_rename_agent: String::new(),
             mouse_capture: true,
@@ -1358,6 +1440,8 @@ impl Default for SessionConfig {
             acp_defaults: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
+            delete_to_trash: true,
+            trash_retention_days: default_trash_retention_days(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             restart_wake_message: default_restart_wake_message(),
             row_tag: RowTagMode::default(),
@@ -1377,6 +1461,10 @@ impl Default for SessionConfig {
 }
 
 fn default_snooze_duration_minutes() -> u32 {
+    30
+}
+
+fn default_trash_retention_days() -> u32 {
     30
 }
 
@@ -1637,7 +1725,7 @@ pub enum ColorMode {
     /// modern terminals and SSH sessions that pass RGB correctly.
     #[default]
     Truecolor,
-    /// Emit 256-palette escapes (\e[38;5;<idx>m) by converting every theme
+    /// Emit 256-palette escapes (`\e[38;5;<idx>m`) by converting every theme
     /// Rgb(r,g,b) to the nearest xterm-256 index. Use this when the transport
     /// (notably some mosh clients) mishandles 24-bit RGB; preview panes in
     /// aoe already use 256-palette via ansi-to-tui, so palette mode renders
@@ -1763,6 +1851,17 @@ pub struct UpdatesConfig {
     #[serde(default = "default_web_poll_interval_minutes")]
     #[setting(label = "Web Poll Interval (minutes)", widget = "number", min = 0)]
     pub web_poll_interval_minutes: u64,
+
+    /// Auto-update installed external plugins at TUI and `aoe serve` startup.
+    /// Off by default. The sweep applies only updates that need no new consent;
+    /// any version that changes capabilities, build steps, or UI slots is left
+    /// for a manual `aoe plugin update` so its new grant is reviewed.
+    // global_only: the startup sweep reads the global config
+    // (`Config::load_or_warn`), so a profile/repo override would be silently
+    // ignored; show it but do not offer non-global scopes.
+    #[serde(default)]
+    #[setting(label = "Auto-update plugins", widget = "toggle", global_only)]
+    pub auto_update_plugins: bool,
 }
 
 impl Default for UpdatesConfig {
@@ -1772,6 +1871,7 @@ impl Default for UpdatesConfig {
             check_interval_hours: 24,
             notify_in_cli: true,
             web_poll_interval_minutes: 60,
+            auto_update_plugins: false,
         }
     }
 }
@@ -1898,6 +1998,16 @@ pub struct WorktreeConfig {
         advanced
     )]
     pub default_base_branch: Option<String>,
+}
+
+impl WorktreeConfig {
+    /// Branch cleanup only makes sense when the worktree is also removed; a
+    /// preserved worktree keeps its branch checked out, so deleting it would
+    /// fail (#2532). Single source for that invariant across the cleanup
+    /// default and auto-purge call sites.
+    pub fn should_delete_branch_on_cleanup(&self) -> bool {
+        self.auto_cleanup && self.delete_branch_on_cleanup
+    }
 }
 
 impl Default for WorktreeConfig {

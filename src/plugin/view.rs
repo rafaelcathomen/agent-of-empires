@@ -16,9 +16,31 @@ pub struct PluginView {
     pub version: String,
     pub description: String,
     pub enabled: bool,
-    /// First-party builtin (always true in the current core; installed plugins
-    /// return in a follow-up).
+    /// First-party builtin (compiled in) versus an externally installed plugin.
     pub builtin: bool,
+    /// Validation provenance: `builtin`, `featured`, `community`, or `local`.
+    pub validation: String,
+    /// Install source for an external plugin (`gh:owner/repo` or a path).
+    pub source: Option<String>,
+    /// Capabilities the plugin's manifest declares.
+    pub capabilities: Vec<String>,
+    /// UI slots the plugin declares it will render into (#2366). Disclosed
+    /// alongside capabilities so a surface can show the user that the plugin
+    /// modifies the dashboard, even though a UI contribution needs no grant.
+    pub ui_contributions: Vec<UiContributionView>,
+    /// Whether the user's grant covers the installed manifest (always true for
+    /// builtins).
+    pub granted: bool,
+    /// Installed but inactive: a community plugin awaiting capability approval.
+    pub needs_reapproval: bool,
+}
+
+/// A declared UI contribution, flattened for display: the kebab-case slot name
+/// and the plugin-chosen entry id.
+#[derive(Debug, Clone, Serialize)]
+pub struct UiContributionView {
+    pub slot: String,
+    pub id: String,
 }
 
 impl LoadedPlugin {
@@ -30,7 +52,26 @@ impl LoadedPlugin {
             version: self.manifest.version.clone(),
             description: self.manifest.description.clone(),
             enabled: self.enabled,
-            builtin: true,
+            builtin: self.builtin(),
+            validation: self.validation.as_str().to_string(),
+            source: self.source.clone(),
+            capabilities: self
+                .manifest
+                .capabilities
+                .iter()
+                .map(|c| c.as_str().to_string())
+                .collect(),
+            ui_contributions: self
+                .manifest
+                .ui
+                .iter()
+                .map(|u| UiContributionView {
+                    slot: u.slot.as_str().to_string(),
+                    id: u.id.clone(),
+                })
+                .collect(),
+            granted: self.granted,
+            needs_reapproval: self.needs_reapproval(),
         }
     }
 }

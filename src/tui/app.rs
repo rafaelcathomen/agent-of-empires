@@ -970,6 +970,55 @@ impl App {
                                     continue;
                                 }
                             }
+                            // A double-click on the preview pane opens/attaches
+                            // the previewed session, the same as a sidebar
+                            // double-click. Checked BEFORE forwarding so the
+                            // agent doesn't swallow the second press; a single
+                            // press records its timing here and falls through to
+                            // the forward path below.
+                            if let Some(action) = self.home.preview_double_click_action(
+                                mouse.kind,
+                                mouse.modifiers,
+                                mouse.column,
+                                mouse.row,
+                            ) {
+                                let _ = self.home.clear_preview_selection();
+                                self.execute_action(action, terminal)?;
+                                // Mirror the list double-click path: an acp
+                                // session only stashes its id, so drain and open
+                                // the structured view here too.
+                                #[cfg(feature = "serve")]
+                                if let Some(session_id) =
+                                    self.pending_structured_view_open.take()
+                                {
+                                    self.run_structured_view(&session_id, terminal).await?;
+                                }
+                                self.sync_mouse_capture(terminal)?;
+                                if self.should_quit {
+                                    break;
+                                }
+                                if !self.needs_redraw {
+                                    self.draw(terminal)?;
+                                }
+                                continue;
+                            }
+                            // Mouse-tracking agent under the preview (live-send
+                            // OR passive hover): forward the press / drag /
+                            // release straight to it, exactly as a direct attach
+                            // would, so its native selection / scroll works.
+                            // Shift falls through to aoe's own preview text-
+                            // selection. Consumes the event when it forwards.
+                            if self.home.forward_mouse_to_preview(
+                                mouse.kind,
+                                mouse.modifiers,
+                                mouse.column,
+                                mouse.row,
+                            ) {
+                                if !self.needs_redraw {
+                                    self.draw(terminal)?;
+                                }
+                                continue;
+                            }
                             let hit_list = self.home.hit_list(mouse.column, mouse.row);
                             let hit_preview = self.home.hit_preview(mouse.column, mouse.row);
                             let hit_diff = self.home.is_diff_open()
@@ -1404,7 +1453,7 @@ impl App {
             // the block reads. Same `live_idle` gate; recomputing
             // `tool_hotkey_cache` mid live-send disrupts input.
             let live_idle = self.home.live_send.is_none();
-            let config_kick = take_config_refresh_kick(live_idle, &self.home.config_dirty);
+            let config_kick = take_config_refresh_kick(live_idle, &self.home.config_watch.dirty);
             if config_kick {
                 let result = self.home.try_refresh_from_config_watcher();
                 handle_tick_reload_config(result, &mut self.home.reload_failure_state);
@@ -1422,7 +1471,8 @@ impl App {
             // arrived during live-send is not silently lost.
             let dirty = if live_idle {
                 self.home
-                    .disk_dirty
+                    .disk_watch
+                    .dirty
                     .swap(false, std::sync::atomic::Ordering::Acquire)
             } else {
                 false

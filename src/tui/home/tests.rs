@@ -93,16 +93,19 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
     let current = vec!["test".to_string()];
 
     assert!(
-        view.disk_watch_handles.is_empty(),
+        view.disk_watch.handles.is_empty(),
         "construction outside a tokio runtime must not prewire subscriptions"
     );
     view.rewire_disk_subscriptions(&current);
     assert!(
-        view.disk_watch_handles.is_empty(),
+        view.disk_watch.handles.is_empty(),
         "rewire outside a tokio runtime must stay a no-op for lib tests"
     );
     assert!(
-        !view.disk_dirty.load(std::sync::atomic::Ordering::Acquire),
+        !view
+            .disk_watch
+            .dirty
+            .load(std::sync::atomic::Ordering::Acquire),
         "the noop branch must leave disk_dirty clear outside a runtime"
     );
 }
@@ -122,12 +125,14 @@ async fn config_watch_keys_distinguish_global_from_profile_named_global() {
     )
     .unwrap();
 
-    assert_eq!(view.config_watch_handles.len(), 2);
+    assert_eq!(view.config_watch.handles.len(), 2);
     assert!(view
-        .config_watch_handles
+        .config_watch
+        .handles
         .contains_key(&ConfigWatchKey::Global));
     assert!(view
-        .config_watch_handles
+        .config_watch
+        .handles
         .contains_key(&ConfigWatchKey::profile(profile_name)));
 }
 
@@ -366,6 +371,20 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
     view.flat_items = view.build_flat_items();
     view.update_selected();
     TestEnv { _temp: temp, view }
+}
+
+/// Disable trash-first delete for tests that assert the permanent-delete
+/// dialog opens on `d` / `Shift+D` / context-menu Delete. With the default
+/// (`delete_to_trash = true`) those keys move the session to the trash
+/// instead of opening the dialog; the trash-first path has its own coverage
+/// (`trash_then_restore_round_trip`). Must run after `setup_test_home` so it
+/// writes into the test HOME. See #2489.
+fn disable_delete_to_trash() {
+    let mut config = crate::session::config::load_config()
+        .unwrap()
+        .unwrap_or_default();
+    config.session.delete_to_trash = false;
+    crate::session::config::save_config(&config).unwrap();
 }
 
 fn create_test_env_with_groups() -> TestEnv {
@@ -1296,6 +1315,7 @@ fn test_search_mode_enter_exits_and_clears_state() {
 #[serial]
 fn test_d_on_session_opens_delete_dialog() {
     let mut env = create_test_env_with_sessions(3);
+    disable_delete_to_trash();
     env.view.update_selected();
     assert!(env.view.unified_delete_dialog.is_none());
     env.view.handle_key(key(KeyCode::Char('d')), None);
@@ -2268,6 +2288,7 @@ fn create_test_env_with_group_sessions() -> TestEnv {
         extra_env: None,
         custom_instruction: None,
         before_start_env: Vec::new(),
+        container_workdir: None,
     });
     instances.push(inst3);
 
@@ -2367,6 +2388,7 @@ fn test_group_has_containers() {
         extra_env: None,
         custom_instruction: None,
         before_start_env: Vec::new(),
+        container_workdir: None,
     });
 
     let mut inst2 = Instance::new("other-session", "/tmp/other");
@@ -2764,6 +2786,7 @@ fn test_delete_group_with_sessions_respects_container_option() {
         extra_env: None,
         custom_instruction: None,
         before_start_env: Vec::new(),
+        container_workdir: None,
     });
 
     {
@@ -3578,6 +3601,7 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
     // fire rename (not serve), and orphaned the diff/serve/projects arms. All
     // three Ctrl chords must keep CTRL so their secondary arms fire.
     let mut env = create_test_env_with_sessions(1);
+    disable_delete_to_trash();
     env.view.strict_hotkeys = true;
     env.view.cursor = 0;
     env.view.update_selected();
@@ -6441,6 +6465,86 @@ fn app_update_banner_takes_precedence_over_image_banner() {
     );
 }
 
+/// Issue #2220: the app-update banner reassures users that updating is safe
+/// for running sessions. The reassurance must render alongside the version and
+/// action keys so users know `u` won't tear down their work.
+#[test]
+#[serial]
+fn app_update_banner_reassures_running_sessions_are_safe() {
+    use crate::tui::styles::load_theme;
+    use crate::update::UpdateInfo;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_empty();
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let theme = load_theme("empire");
+
+    let update_info = UpdateInfo {
+        available: true,
+        current_version: "1.0.0".to_string(),
+        latest_version: "1.1.0".to_string(),
+    };
+
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view
+                .render(f, area, &theme, Some(&update_info), None, None);
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+
+    assert!(
+        out.contains("running sessions stay safe"),
+        "expected the update banner to reassure that running sessions are safe.\nFull buffer:\n{out}"
+    );
+    assert!(
+        out.contains("[u] update"),
+        "the action key must still render alongside the reassurance.\nFull buffer:\n{out}"
+    );
+
+    // Narrow-terminal contract: the reassurance is appended after the keys
+    // precisely so the action hints survive when the line is too narrow to
+    // hold everything. At 72 columns the keys fit but the reassurance clips.
+    let narrow = TestBackend::new(72, 30);
+    let mut narrow_terminal = Terminal::new(narrow).unwrap();
+    narrow_terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view
+                .render(f, area, &theme, Some(&update_info), None, None);
+        })
+        .unwrap();
+
+    let nbuf = narrow_terminal.backend().buffer();
+    let mut nout = String::new();
+    for y in 0..nbuf.area.height {
+        for x in 0..nbuf.area.width {
+            nout.push_str(nbuf[(x, y)].symbol());
+        }
+        nout.push('\n');
+    }
+
+    assert!(
+        nout.contains("[u] update") && nout.contains("[Ctrl+x] dismiss"),
+        "the action keys must survive clipping on a narrow terminal.\nFull buffer:\n{nout}"
+    );
+    assert!(
+        !nout.contains("running sessions stay safe"),
+        "the trailing reassurance is expected to clip first on a narrow terminal.\nFull buffer:\n{nout}"
+    );
+}
+
 /// Regression for the e2e CI failure (job 76034901940):
 /// `test_command_palette_fuzzy_search_settings` and
 /// `test_profile_picker_create_new_profile` failed because the harness types
@@ -6628,6 +6732,73 @@ fn toggle_archive_at_cursor_round_trip() {
     env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(!env.view.instances[0].is_archived());
+}
+
+/// Trashing a session hides it from the active list and surfaces it under
+/// the synthetic Trash section; the shelve/unshelve key (`z`) restores it.
+#[test]
+#[serial]
+fn trash_then_restore_round_trip() {
+    let mut env = create_test_env_with_sessions(2);
+    // Keep the Trash section expanded so the trashed row stays reachable.
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    assert!(!env.view.instances[0].is_trashed());
+
+    env.view.trash_session_by_id(&id);
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "session must be trashed"
+    );
+
+    // The Trash section header is present, and the trashed row is not in the
+    // active flow (it renders under that header).
+    let items = env.view.build_flat_items();
+    assert!(
+        items.iter().any(|it| matches!(
+            it,
+            Item::Group { path, .. } if crate::session::is_trash_section_path(path)
+        )),
+        "Trash section header must be present after trashing"
+    );
+
+    // Restore via the shelve/unshelve key.
+    env.view.select_session_by_id(&id);
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_trashed(),
+        "session must be restored out of trash"
+    );
+}
+
+#[test]
+#[serial]
+fn d_on_session_with_default_trash_persists_trash_marker() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "pressing d with default trash-first config must mark the row trashed in memory"
+    );
+    assert!(
+        env.view.unified_delete_dialog.is_none(),
+        "trash-first d must not open the permanent-delete dialog"
+    );
+    let disk_row = Storage::new_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|inst| inst.id == id)
+        .expect("disk row present");
+    assert!(
+        disk_row.is_trashed(),
+        "pressing d must persist trashed_at so a storage refresh cannot resurrect a killed session"
+    );
 }
 
 /// When no session is selected, the toggle is a silent no-op.
@@ -8984,6 +9155,30 @@ mod scroll_pane_isolation {
         env
     }
 
+    /// Like `live_env_with_cursor` but WITHOUT entering live-send: the
+    /// session is merely previewed (the common "hover the preview" case).
+    /// No `live_send` / `live_send_worker`; the capture worker and its
+    /// target are set so `forward_wheel_to_preview` can take the passive
+    /// one-shot path.
+    fn passive_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 200;
+        env.view.preview_scroll_offset = 10;
+        env.view
+            .sync_preview_capture_worker(Some("fake".to_string()));
+        env.view.preview_capture_target = Some("fake".to_string());
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker spawned")
+            .set_cursor_for_test(Some(cursor));
+        env
+    }
+
     fn alt_screen_cursor(
         alternate_on: bool,
         mouse_tracking: bool,
@@ -8999,6 +9194,7 @@ mod scroll_pane_isolation {
             alternate_on,
             mouse_tracking,
             mouse_sgr,
+            position_reliable: true,
         }
     }
 
@@ -9025,20 +9221,296 @@ mod scroll_pane_isolation {
         assert_eq!(env.view.preview_scroll_offset, 0);
     }
 
-    /// Guard the gate: a full-screen app WITHOUT any mouse tracking must
-    /// not get raw SGR bytes (it would read them as garbage keystrokes).
-    /// The wheel falls back to the existing capture-window scroll.
+    /// A full-screen app WITHOUT mouse tracking (e.g. Claude Code's
+    /// fullscreen renderer: `1049h` + `1007h`, no mouse) does not scroll on
+    /// arrow keys (it reads them as cursor / input-history navigation), so we
+    /// forward `PageUp`/`PageDown` named keys instead and pin the preview to
+    /// the live edge, just like the mouse-tracking case. Regression for #2407.
     #[test]
     #[serial]
-    fn wheel_over_alt_screen_without_mouse_uses_capture_scroll() {
+    fn wheel_over_alt_screen_without_mouse_forwards_page_keys() {
         let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
 
         let up = env.view.handle_scroll_up(50, 10);
-        assert!(up);
-        assert!(
-            env.view.preview_scroll_offset > 10,
-            "no mouse tracking: keep the capture-window scroll (offset advances)"
+        assert!(up, "wheel over a full-screen no-mouse pane is handled");
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "arrow-key forwarding pins the preview to the live edge, never the normal-buffer history"
         );
+
+        env.view.preview_scroll_offset = 10;
+        let down = env.view.handle_scroll_down(50, 10);
+        assert!(down);
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// Passive preview (NOT live-send) over a full-screen agent must ALSO
+    /// forward the wheel. The alternate screen has no scrollback, so the
+    /// capture-window scroll is inert; without forwarding, "hover the
+    /// preview and scroll" does literally nothing (the reported regression
+    /// after Claude Code's fullscreen renderer landed). Forwarding pins the
+    /// preview to the live edge, exactly like the live-send path.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_passive_preview_forwards() {
+        let mut env = passive_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(
+            env.view.live_send.is_none(),
+            "this exercises passive preview, not live-send"
+        );
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(
+            up,
+            "wheel over a full-screen pane in passive preview is forwarded"
+        );
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "passive forwarding pins the preview to the live edge"
+        );
+
+        env.view.preview_scroll_offset = 10;
+        let down = env.view.handle_scroll_down(50, 10);
+        assert!(down);
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// In live-send over a mouse-tracking agent, a plain (no-Shift) left
+    /// press/release is forwarded to the agent and consumed, and the held
+    /// button is tracked so its release can't be stranded.
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_left_click_forwards() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, Some(0));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+        // Forwarding never starts an aoe text selection.
+        assert!(env.view.drag_state.is_none());
+        assert!(env.view.preview_selection.is_none());
+    }
+
+    /// Passive preview (NOT live-send) over a mouse-tracking agent ALSO forwards
+    /// a plain press/drag/release, so hovering an agent and dragging drives its
+    /// native selection / scroll, exactly like the live-send case (and like the
+    /// passive wheel path). The one-shot send carries it with no live worker.
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_passive_preview_forwards() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = passive_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(
+            env.view.live_send.is_none(),
+            "this exercises passive preview, not live-send"
+        );
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, Some(0));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Drag(MouseButton::Left),
+            KeyModifiers::NONE,
+            55,
+            12
+        ));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+            55,
+            12
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+        // Forwarding never starts an aoe text selection, even passively.
+        assert!(env.view.drag_state.is_none());
+        assert!(env.view.preview_selection.is_none());
+    }
+
+    /// Shift+press is NOT forwarded: it falls through so aoe's own preview
+    /// text-selection (drag-to-copy) can run.
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_shift_falls_through() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(!env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::SHIFT,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+    }
+
+    /// A non-mouse agent never forwards; the event falls through to aoe.
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_non_mouse_agent_falls_through() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+        assert!(!env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+    }
+
+    /// Once a press is forwarded, its drag and release keep forwarding even
+    /// after the pointer leaves the preview rect, so the agent always sees the
+    /// release (no stuck button).
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_drag_and_release_track_button() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        // (1, 1) is outside the preview rect, but the drag still forwards.
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Drag(MouseButton::Left),
+            KeyModifiers::NONE,
+            1,
+            1
+        ));
+        assert_eq!(env.view.mouse_forward_btn, Some(0));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+            1,
+            1
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+    }
+
+    /// A drag or release with no forwarded press in flight is ignored (it must
+    /// not start forwarding mid-gesture).
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_orphan_drag_ignored() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(!env.view.forward_mouse_to_preview(
+            MouseEventKind::Drag(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert!(!env.view.forward_mouse_to_preview(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+    }
+
+    /// Stage an in-flight Shift-selection drag held at the preview's top
+    /// (`row == pane.y`) or bottom edge, plus a capture window with NO aoe-side
+    /// scrollback, so `tick_preview_autoscroll` exercises the agent
+    /// scroll-forward fallback rather than the capture-window line scroll.
+    fn stage_edge_drag_no_scrollback(env: &mut TestEnv, at_top: bool) {
+        use crate::tui::home::PreviewTextView;
+        // Visible == captured: `scroll_preview_offset` has nowhere to go, the
+        // alternate-screen reality the fallback exists for. The clamp reads
+        // `preview_visible_rows`, so pin it to the captured-line count to make
+        // the max offset zero (no scrollback to move into).
+        env.view.preview_cache.captured_lines = 23;
+        env.view.preview_visible_rows = 23;
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_scroll_offset = 0;
+        let pane = Rect::new(30, 0, 100, 5);
+        env.view.preview_text_view = PreviewTextView {
+            pane,
+            first_line: 0,
+            total_lines: 23,
+        };
+        // Anchor away from the held edge, then drag onto it.
+        let (start_row, edge_row) = if at_top { (4, 0) } else { (0, 4) };
+        assert!(env.view.handle_drag_start(40, start_row));
+        assert!(env.view.handle_drag_move(40, edge_row));
+    }
+
+    /// Over a full-screen mouse-tracking agent the capture window has no
+    /// scrollback, so an edge-held selection forwards the same scroll input the
+    /// wheel does (a wheel-up/down mouse report, NOT PageUp, since the agent
+    /// owns the mouse) to scroll its own transcript instead of moving the inert
+    /// offset. The fallback delegates to `wheel_forward_key`, whose byte output
+    /// per branch is asserted in `wheel_forward_key_*`; here we verify the tick
+    /// forwards and pins the offset. Regression for the "autoscroll does nothing
+    /// over a mouse-tracking agent" report (PageUp was a no-op there).
+    #[test]
+    #[serial]
+    fn autoscroll_forwards_scroll_to_mouse_tracking_agent_at_top_edge() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        stage_edge_drag_no_scrollback(&mut env, true);
+        assert!(
+            env.view.tick_preview_autoscroll(),
+            "top-edge tick forwards a wheel notch to the agent"
+        );
+        // The inert capture-window offset never moved; the agent was scrolled.
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// Same as above at the bottom edge: a wheel-down notch is forwarded.
+    #[test]
+    #[serial]
+    fn autoscroll_forwards_scroll_to_mouse_tracking_agent_at_bottom_edge() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        stage_edge_drag_no_scrollback(&mut env, false);
+        assert!(
+            env.view.tick_preview_autoscroll(),
+            "bottom-edge tick forwards a wheel notch to the agent"
+        );
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// A full-screen agent WITHOUT mouse tracking (Claude Code's fullscreen
+    /// renderer: `1049h`, no mouse) gets `PageUp`/`PageDown` from the fallback
+    /// instead, matching the wheel path's no-mouse branch.
+    #[test]
+    #[serial]
+    fn autoscroll_forwards_page_keys_to_no_mouse_agent_at_top_edge() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+        stage_edge_drag_no_scrollback(&mut env, true);
+        assert!(
+            env.view.tick_preview_autoscroll(),
+            "top-edge tick forwards a page key to the no-mouse agent"
+        );
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// A normal-buffer pane (NOT alternate-screen) that has merely bottomed out
+    /// its scrollback must NOT get scroll input injected into its shell: the
+    /// tick is a no-op there.
+    #[test]
+    #[serial]
+    fn autoscroll_does_not_forward_to_normal_pane() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(false, false, false));
+        stage_edge_drag_no_scrollback(&mut env, true);
+        assert!(
+            !env.view.tick_preview_autoscroll(),
+            "a non-alternate-screen pane never gets forwarded scroll input"
+        );
+        assert_eq!(env.view.preview_scroll_offset, 0);
     }
 
     /// A full-screen app with mouse tracking but in the LEGACY (non-SGR)
@@ -10185,6 +10657,125 @@ mod click_to_select {
         );
     }
 
+    /// A double-click on the preview pane produces the SAME activation Action a
+    /// sidebar double-click would (parity gesture): the first press is a no-op
+    /// that records timing, the second within threshold attaches the previewed
+    /// session.
+    #[test]
+    #[serial]
+    fn preview_double_click_attaches_like_sidebar() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        env.view.preview_area = Rect::new(30, 0, 100, 40);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        let expected_id = env
+            .view
+            .selected_session
+            .clone()
+            .expect("a session is selected");
+
+        // (50, 10) is inside preview_area (30, 0, 100, 40).
+        let t0 = Instant::now();
+        assert_eq!(
+            env.view.preview_double_click_action_at(
+                t0,
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                50,
+                10
+            ),
+            None,
+            "a single preview press does not activate"
+        );
+        let t1 = t0 + Duration::from_millis(150);
+        assert_eq!(
+            env.view.preview_double_click_action_at(
+                t1,
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                50,
+                10
+            ),
+            Some(crate::tui::app::Action::AttachSession(expected_id)),
+            "a double-click on the preview attaches the session, same as the sidebar"
+        );
+    }
+
+    /// Shift+press (aoe's own selection escape hatch) and presses outside the
+    /// preview never activate, even repeated within the double-click window.
+    #[test]
+    #[serial]
+    fn preview_shift_and_off_pane_presses_never_activate() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        env.view.preview_area = Rect::new(30, 0, 100, 40);
+        env.view.cursor = 1;
+        env.view.update_selected();
+
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(150);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        // Shift falls through to aoe selection: never tracked, never activates.
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t0, down, KeyModifiers::SHIFT, 50, 10),
+            None
+        );
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t1, down, KeyModifiers::SHIFT, 50, 10),
+            None
+        );
+        // A press in the list area (5, 3), outside the preview, is ignored too.
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t0, down, KeyModifiers::NONE, 5, 3),
+            None
+        );
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t1, down, KeyModifiers::NONE, 5, 3),
+            None
+        );
+    }
+
+    /// Two presses on the same preview row but different columns are unrelated
+    /// clicks (e.g. tapping two different words), not a double-click: only a
+    /// same-cell second press within the window activates.
+    #[test]
+    #[serial]
+    fn preview_two_presses_on_same_row_different_col_do_not_activate() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        env.view.preview_area = Rect::new(30, 0, 100, 40);
+        env.view.cursor = 1;
+        env.view.update_selected();
+
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(150);
+        // Same row 10, columns 40 then 70: within the time window but a
+        // different cell, so the second press is a fresh single click.
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t0, down, KeyModifiers::NONE, 40, 10),
+            None
+        );
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t1, down, KeyModifiers::NONE, 70, 10),
+            None,
+            "a different-column second press on the same row must not activate"
+        );
+    }
+
     #[test]
     #[serial]
     fn two_clicks_on_different_rows_do_not_activate() {
@@ -10805,9 +11396,11 @@ mod preview_drag_select {
         let total_lines = text.lines.len();
         env.view.preview_cache.parsed_text = Some(text);
         env.view.preview_cache.captured_lines = total_lines;
-        // `dimensions.1 - 1` is the visible-height the scroll clamp uses;
-        // pin it to the pane height so the auto-scroll max offset matches
-        // what `first_line` implies.
+        // `scroll_preview_offset` clamps the auto-scroll max offset against
+        // `preview_visible_rows` (the rendered output-body height, same as the
+        // per-frame `clamp_scroll_to_capture`); pin it to the pane height so the
+        // max offset matches what `first_line` implies.
+        env.view.preview_visible_rows = pane.height as usize;
         env.view.preview_cache.dimensions = (pane.width, pane.height + 1);
         env.view.preview_area = pane;
         env.view.preview_scroll_offset = total_lines
@@ -13181,6 +13774,7 @@ mod right_click_context_menu {
     #[serial]
     fn down_then_enter_in_menu_opens_delete_dialog() {
         let mut env = create_test_env_with_sessions(2);
+        disable_delete_to_trash();
         setup_inner(&mut env);
         // Attention sort surfaces the full session menu (New Session / Rename
         // / Archive / Snooze / Mark unread / Delete), so Delete is five Downs
@@ -13596,7 +14190,14 @@ mod apply_session_id_updates {
 
     impl TmuxSession {
         fn create(id: &str, title: &str) -> Self {
-            let name = crate::tmux::Session::generate_name(id, title);
+            Self::create_named(crate::tmux::Session::generate_name(id, title))
+        }
+
+        fn create_terminal(id: &str, title: &str) -> Self {
+            Self::create_named(crate::tmux::TerminalSession::generate_name(id, title))
+        }
+
+        fn create_named(name: String) -> Self {
             let _ = Command::new("tmux")
                 .args(["kill-session", "-t", &name])
                 .output();
@@ -13699,6 +14300,31 @@ mod apply_session_id_updates {
 
         let updated = view.apply_session_id_updates();
         assert!(updated, "Applied CAS must report a touch");
+        assert_eq!(captured_env(tmux.name()).as_deref(), Some(NEW_SID));
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_publishes_to_terminal_session() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-terminal-publish";
+        let mut inst = fresh_instance(profile, "terminal-post-cas");
+        inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+        let mut view = build_view_with_inst(profile, &inst);
+
+        let tmux = TmuxSession::create_terminal(&inst.id, &inst.title);
+        let agent_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+
+        attach_poller_with_update(&mut view, &inst.id, NEW_SID);
+
+        let updated = view.apply_session_id_updates();
+        assert!(updated, "Applied CAS must report a touch");
+        assert!(captured_env(&agent_name).is_none());
         assert_eq!(captured_env(tmux.name()).as_deref(), Some(NEW_SID));
     }
 

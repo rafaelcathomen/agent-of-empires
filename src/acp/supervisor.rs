@@ -1529,10 +1529,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         // (see `apply_yolo_mode()` in `src/session/instance.rs`); structured view
         // can't pass CLI flags through the ACP adapter, so we set the
         // mode via `session/set_mode` instead. The mode id is adapter-specific
-        // (claude: `bypassPermissions`, codex: `full-access`, gemini: `yolo`),
+        // (claude: `bypassPermissions`, codex: `agent-full-access`, gemini: `yolo`),
         // so resolve it from the agent profile rather than hard-coding Claude's
-        // id; codex advertises `full-access`, not `bypassPermissions`, so a
-        // hard-coded `bypassPermissions` was silently dropped by the
+        // id; codex advertises `agent-full-access`, not `bypassPermissions`, so
+        // a hard-coded or stale id is silently dropped by the
         // not-advertised guard and left codex sessions in their default
         // (approval-prompting) preset. Best-effort: the call is
         // fire-and-forget through cmd_tx, the connection loop warns on
@@ -2350,7 +2350,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // also taken down by an explicit "kill them all" request, not left
         // orphaned under PID 1. See #1689.
         for (session_id, pid) in registry_pids {
-            super::worker_registry::terminate_runner_group(pid);
+            crate::process::worker::terminate_process_group(pid);
             super::worker_registry::delete(&session_id).ok();
         }
         #[cfg(not(unix))]
@@ -2449,11 +2449,23 @@ impl<S: BroadcastSink> Supervisor<S> {
         // case `current_env_entries` warns and falls back to the global
         // default profile (matching pre-persistence behavior).
         let sandbox_resources = match sandbox {
-            Some(info) => Some(super::acp_client::SessionSandbox::from_info(
-                &info,
-                cwd.as_path(),
-                record.source_profile.clone(),
-            )?),
+            Some(info) => {
+                // `from_info` resolves the container workdir, which touches git2
+                // and (for a legacy session with no pinned workdir) shells out to
+                // `docker inspect`. Run it off the async executor, mirroring how
+                // `ensure_container_for_session` wraps its docker work.
+                let cwd = cwd.clone();
+                let profile = record.source_profile.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || {
+                        super::acp_client::SessionSandbox::from_info(&info, cwd.as_path(), profile)
+                    })
+                    .await
+                    .map_err(|e| {
+                        AcpError::Spawn(format!("sandbox resolve task panicked: {e}"))
+                    })??,
+                )
+            }
             None => None,
         };
         // Prefer the persisted registry key; fall back to the legacy

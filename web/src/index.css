@@ -36,6 +36,13 @@
   font-style: normal;
   font-display: swap;
 }
+@font-face {
+  font-family: "Geist Mono";
+  src: url("/fonts/GeistMono-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
 
 @import "tailwindcss";
 
@@ -279,7 +286,13 @@ body {
 .acp-markdown pre {
   margin: 0.5rem 0;
   border-radius: 0.375rem;
-  overflow: hidden;
+  /* overflow-x: auto (not hidden) so a fenced code block wider than the
+     bubble scrolls horizontally instead of clipping its long lines. `hidden`
+     here outranked the `overflow-x-auto` utility on the plain <pre> and
+     clipped shiki's inner <pre> before its wrapper could scroll. The radius
+     still clips the corners; no fixed height means no vertical scrollbar.
+     See #2443. */
+  overflow-x: auto;
   border: 1px solid var(--color-surface-700);
   background: var(--color-surface-950);
 }
@@ -410,6 +423,81 @@ body {
 @media (prefers-reduced-motion: reduce) {
   .animate-settings-highlight {
     animation: none;
+  }
+}
+/* Cheat-code easter egg effects (command palette). One-off, non-blocking. */
+@keyframes cheat-fly-ltr {
+  from {
+    transform: translateX(-20vw) translateY(-50%) rotate(-8deg);
+  }
+  to {
+    transform: translateX(120vw) translateY(-50%) rotate(8deg);
+  }
+}
+@keyframes cheat-fly-rtl {
+  from {
+    transform: translateX(120vw) translateY(-50%) rotate(8deg);
+  }
+  to {
+    transform: translateX(-20vw) translateY(-50%) rotate(-8deg);
+  }
+}
+@keyframes cheat-confetti-fall {
+  from {
+    transform: translateY(-10vh) rotate(0deg);
+    opacity: 1;
+  }
+  to {
+    transform: translateY(110vh) rotate(540deg);
+    opacity: 0;
+  }
+}
+@keyframes cheat-flash {
+  0% {
+    opacity: 0;
+  }
+  35% {
+    opacity: 0.55;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+@keyframes cheat-pulse {
+  0% {
+    transform: translate(-50%, -50%) scale(0.4);
+    opacity: 0;
+  }
+  40% {
+    transform: translate(-50%, -50%) scale(1.1);
+    opacity: 1;
+  }
+  100% {
+    transform: translate(-50%, -50%) scale(2.2);
+    opacity: 0;
+  }
+}
+.animate-cheat-fly-ltr {
+  animation: cheat-fly-ltr 1.6s ease-in forwards;
+}
+.animate-cheat-fly-rtl {
+  animation: cheat-fly-rtl 1.6s ease-in forwards;
+}
+.animate-cheat-confetti-fall {
+  animation: cheat-confetti-fall 2s ease-in forwards;
+}
+.animate-cheat-flash {
+  animation: cheat-flash 0.6s ease-out forwards;
+}
+.animate-cheat-pulse {
+  animation: cheat-pulse 1s ease-out forwards;
+}
+/* Respect reduced-motion: drop the visual flourish entirely (the toast still
+   fires as the functional signal). Hiding the overlay avoids a static
+   full-screen flash that animation:none would otherwise leave behind. */
+@media (prefers-reduced-motion: reduce) {
+  [data-testid="cheat-overlay"] {
+    display: none;
   }
 }
 

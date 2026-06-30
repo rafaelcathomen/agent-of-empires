@@ -88,6 +88,13 @@ pub struct SessionResponse {
     /// and the response simply omits the field. See #1581.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snoozed_until: Option<String>,
+    /// RFC3339 timestamp at which the session was moved to trash, or
+    /// omitted when not trashed. Trashed rows are excluded from the
+    /// default session list; the web client requests them with
+    /// `?state=trashed` and renders a dedicated Trash section with restore
+    /// and permanent-delete actions. See #2489.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trashed_at: Option<String>,
     /// Unread marker, mirroring `Instance::unread`: `true` when the session
     /// needs attention (a finished turn the user hasn't engaged with, or a
     /// manual flag), omitted when read. The web sidebar paints an unread
@@ -96,7 +103,18 @@ pub struct SessionResponse {
     /// `theme.unread`.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub unread: bool,
+    /// Strictly a single-repo aoe-managed worktree (`worktree_info`). Drives
+    /// the sidebar "Edit workdir name" action and the tie-workdir overlay,
+    /// neither of which applies to multi-repo workspace sessions. For
+    /// "is there worktree state to clean up on delete", use
+    /// `has_cleanable_worktree` instead.
     pub has_managed_worktree: bool,
+    /// Whether deleting this session has aoe-managed worktree state to remove,
+    /// covering single-repo worktrees AND multi-repo workspaces. Only the
+    /// delete dialog's worktree/branch checkboxes consume this; keeping it
+    /// separate from `has_managed_worktree` avoids lighting up worktree-only
+    /// actions (Edit workdir) for workspace sessions (#2363).
+    pub has_cleanable_worktree: bool,
     /// Whether renaming this session also moves its worktree directory (the
     /// resolved `session.tie_workdir_to_name` for an aoe-managed worktree).
     /// Populated by `list_sessions` from the per-profile config; single-session
@@ -221,6 +239,10 @@ pub struct CleanupDefaults {
     pub delete_worktree: bool,
     pub delete_branch: bool,
     pub delete_sandbox: bool,
+    /// Resolved `session.delete_to_trash`: when true, the web delete dialog
+    /// defaults to "Move to Trash" with a permanent-delete disclosure;
+    /// when false it goes straight to permanent delete. See #2489.
+    pub delete_to_trash: bool,
 }
 
 impl SessionResponse {
@@ -303,6 +325,7 @@ impl SessionResponse {
             } else {
                 None
             },
+            trashed_at: inst.trashed_at.map(|t| t.to_rfc3339()),
             // Surface the marker (omitted when read); the web gates the
             // visual on the `session.unread_indicator` setting.
             unread: inst.unread,
@@ -310,6 +333,7 @@ impl SessionResponse {
                 .worktree_info
                 .as_ref()
                 .is_some_and(|w| w.managed_by_aoe),
+            has_cleanable_worktree: inst.has_managed_worktree_or_workspace(),
             // Overlaid per-profile in list_sessions; see the field doc.
             tie_workdir_to_name: false,
             // Overlaid in list_sessions; single-session responses stay inactive.
@@ -322,6 +346,7 @@ impl SessionResponse {
                 delete_worktree: true,
                 delete_branch: false,
                 delete_sandbox: true,
+                delete_to_trash: true,
             },
             remote_owner: None,
             notify_on_waiting: inst.notify_on_waiting,
@@ -477,7 +502,7 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
             // badge is meaningless, so skip the per-poll SQLite lookups for
             // them. Unarchiving restores the queries. latest_plan stays
             // ungated: a collapsed archived row may still show a plan summary.
-            let structured_live = inst.is_structured() && !inst.is_archived();
+            let structured_live = inst.is_structured() && !inst.is_archived() && !inst.is_trashed();
             let (next_wakeup_at, next_wakeup_reason) = if structured_live {
                 match state.acp_event_store.latest_pending_wakeup(&inst.id) {
                     Some((at, reason)) => (Some(at.to_rfc3339()), reason),
@@ -554,8 +579,9 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsE
                 let cfg = crate::session::profile_config::resolve_config_or_warn(&session.profile);
                 CleanupDefaults {
                     delete_worktree: cfg.worktree.auto_cleanup,
-                    delete_branch: cfg.worktree.delete_branch_on_cleanup,
+                    delete_branch: cfg.worktree.should_delete_branch_on_cleanup(),
                     delete_sandbox: cfg.sandbox.auto_cleanup,
+                    delete_to_trash: cfg.session.delete_to_trash,
                 }
             });
         }
@@ -1874,6 +1900,26 @@ fn default_kill_pane() -> bool {
 }
 
 #[derive(Deserialize)]
+pub struct TrashSessionBody {
+    /// On trash, tear down every tmux session this instance owns. `false`
+    /// keeps tmux state alive; structured-view supervisor shutdown (which
+    /// preserves the transcript) is unconditional. Defaults to `true`.
+    #[serde(default = "default_kill_pane")]
+    pub kill_pane: bool,
+}
+
+// A no-body trash request resolves through `unwrap_or_default()`, so `Default`
+// must match the serde field default (`true`). The derived `Default` would use
+// `bool::default()` (`false`) and silently leave the pane running (#2523).
+impl Default for TrashSessionBody {
+    fn default() -> Self {
+        Self {
+            kill_pane: default_kill_pane(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
 pub struct UpdateSnoozeBody {
     /// `Some(positive minutes)` snoozes for that duration. `None` (or a
     /// missing field) unsnoozes. Validated against
@@ -2130,6 +2176,283 @@ pub async fn update_session_archive(
                 .into_response();
         }
     };
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+/// `POST /api/sessions/:id/trash`. Soft-delete a session into the trash
+/// bucket: persist `trashed_at`, then stop the live session the same way
+/// archive does (structured-view supervisor `shutdown`, which PRESERVES the
+/// transcript, plus optional tmux teardown). Durable artifacts (transcript,
+/// worktree, branch, container) are kept so `restore` is faithful; permanent
+/// teardown happens only on purge (`DELETE`). See #2489.
+pub async fn trash_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Option<Json<TrashSessionBody>>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        inst.source_profile.clone()
+    };
+
+    let persist_id = id.clone();
+    if persist_session_update(
+        profile,
+        "trash",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                inst.trash();
+            }
+        },
+    )
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    // Disk durable; apply to memory and snapshot what teardown needs.
+    let (was_structured_view, inst_clone) = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            tracing::error!(
+                target: "http.api.sessions",
+                session = %id,
+                "trash: instance vanished after persist"
+            );
+            return persist_failed_response();
+        };
+        inst.trash();
+        let structured_view;
+        #[cfg(feature = "serve")]
+        {
+            structured_view = inst.is_structured();
+        }
+        #[cfg(not(feature = "serve"))]
+        {
+            structured_view = false;
+        }
+        (structured_view, inst.clone())
+    };
+
+    // Stop the live session (mirror archive teardown). shutdown() preserves
+    // the transcript (#1710); purge is the only path that deletes it.
+    if was_structured_view {
+        #[cfg(feature = "serve")]
+        match state.acp_supervisor.shutdown(&id).await {
+            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+            Err(e) => tracing::warn!(
+                target: "acp.supervisor",
+                session = %id,
+                "shutdown during trash failed: {e}"
+            ),
+        }
+        if body.kill_pane {
+            let inst_for_kill = inst_clone.clone();
+            if let Err(e) =
+                tokio::task::spawn_blocking(move || inst_for_kill.kill_ancillary_tmux_sessions())
+                    .await
+            {
+                tracing::warn!(target: "http.api.sessions", "Trash: ancillary tmux kill join failed: {e}");
+            }
+        }
+    } else if body.kill_pane {
+        let inst_for_kill = inst_clone.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || inst_for_kill.kill_all_tmux_sessions()).await
+        {
+            tracing::warn!(target: "http.api.sessions", "Trash: tmux kill join failed: {e}");
+        }
+    }
+
+    // The session is durably trashed and its agent stopped; relocate its
+    // managed worktree out of the active dir into the holding area, then
+    // persist the repointed project_path. The git move is blocking, so it runs
+    // on a blocking thread. Best-effort: a failure leaves the worktree in
+    // place and the daemon's reconcile pass can move it later. Never blocks the
+    // trash itself, which already landed above.
+    {
+        let profile = inst_clone.source_profile.clone();
+        match tokio::task::spawn_blocking(move || {
+            let mut inst = inst_clone;
+            let outcome = crate::session::trash::relocate_worktree_to_trash(&mut inst);
+            (outcome, inst)
+        })
+        .await
+        {
+            Ok((crate::session::trash::RelocateOutcome::Relocated { .. }, moved)) => {
+                let new_path = moved.project_path.clone();
+                let pre = moved.pre_trash_project_path.clone();
+                let persist_id = id.clone();
+                let (np, pp) = (new_path.clone(), pre.clone());
+                let _ = persist_session_update(
+                    profile,
+                    "trash-relocate",
+                    state.file_watch.clone(),
+                    move |instances| {
+                        if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                            inst.project_path = np.clone();
+                            inst.pre_trash_project_path = pp.clone();
+                        }
+                    },
+                )
+                .await;
+                let mut instances = state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                    inst.project_path = new_path;
+                    inst.pre_trash_project_path = pre;
+                }
+            }
+            Ok((crate::session::trash::RelocateOutcome::Failed { reason }, _)) => {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    "trash worktree relocation skipped: {reason}"
+                );
+            }
+            Ok((crate::session::trash::RelocateOutcome::Skipped, _)) => {}
+            Err(e) => tracing::warn!(
+                target: "http.api.sessions",
+                session = %id,
+                "trash worktree relocation join failed: {e}"
+            ),
+        }
+    }
+
+    let instances = state.instances.read().await;
+    let response = match instances.iter().find(|i| i.id == id) {
+        Some(inst) => {
+            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
+        }
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        }
+    };
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
+/// `POST /api/sessions/:id/restore`. Move a session out of the trash bucket
+/// by clearing `trashed_at`. The session returns to its prior bucket (active,
+/// or archived if it was archived before trashing); the reconciler respawns a
+/// structured-view worker on the next tick since the row is no longer
+/// trashed. No teardown. See #2489.
+pub async fn restore_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "read_only",
+                "message": "Server is in read-only mode"
+            })),
+        )
+            .into_response();
+    }
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let (profile, snapshot) = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        };
+        (inst.source_profile.clone(), inst.clone())
+    };
+
+    // Move the worktree back to its pre-trash location before clearing the
+    // marker. Strict: if the original path is occupied or git refuses, keep
+    // the session trashed and surface a conflict, rather than restoring it to
+    // the holding-area path. The git move is blocking, so it runs off the
+    // async runtime.
+    let restored = match tokio::task::spawn_blocking(move || {
+        let mut inst = snapshot;
+        let outcome = crate::session::trash::restore_worktree_location(&mut inst);
+        (outcome, inst)
+    })
+    .await
+    {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "restore relocation join failed: {e}");
+            return persist_failed_response();
+        }
+    };
+    if let crate::session::trash::RestoreOutcome::Failed { reason } = &restored.0 {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "worktree_restore_failed",
+                "message": format!("Could not restore the worktree: {reason}")
+            })),
+        )
+            .into_response();
+    }
+    let restored_path = restored.1.project_path.clone();
+    let restored_pre = restored.1.pre_trash_project_path.clone();
+
+    let persist_id = id.clone();
+    let (rp, pre) = (restored_path.clone(), restored_pre.clone());
+    if persist_session_update(
+        profile,
+        "restore",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                inst.project_path = rp.clone();
+                inst.pre_trash_project_path = pre.clone();
+                inst.untrash();
+            }
+        },
+    )
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        return persist_failed_response();
+    };
+    inst.project_path = restored_path;
+    inst.pre_trash_project_path = restored_pre;
+    inst.untrash();
+    let response =
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
@@ -2869,6 +3192,281 @@ async fn mark_delete_error(state: &AppState, id: &str, message: String) {
     }
 }
 
+/// Permanently purge a session: irreversible ACP teardown (structured
+/// view), optional sidecar cleanup (worktree/branch/container/scratch per
+/// `body`), and removal from both `sessions.json` and the in-memory list.
+/// Shared by the `DELETE /api/sessions/{id}` handler and the retention
+/// auto-purge worker so the permanent-delete path can never diverge between
+/// the two. Returns the user-facing messages from `perform_deletion` on
+/// success, or a descriptive error string on failure (the caller decides how
+/// to surface it). The caller is expected to hold the per-instance lock.
+#[cfg_attr(not(feature = "serve"), allow(unused_variables))]
+async fn purge_session_artifacts(
+    state: &Arc<AppState>,
+    id: &str,
+    instance: Instance,
+    body: &DeleteSessionBody,
+    recent_entry: Option<crate::session::RecentProjectEntry>,
+) -> Result<Vec<String>, String> {
+    let profile = instance.source_profile.clone();
+
+    // True once we have crossed the irreversible line (the structured-view
+    // transcript has been deleted). After that point a sidecar-cleanup
+    // failure must NOT leave the session row restorable, since the restore
+    // would resurrect a session whose transcript is already gone. See #2489.
+    #[cfg(feature = "serve")]
+    let transcript_purged = instance.is_structured();
+    #[cfg(not(feature = "serve"))]
+    let transcript_purged = false;
+
+    // Tear down the structured view worker FIRST so the ACP subprocess + its
+    // claude-agent-acp child don't leak past the session delete. Permanent
+    // removal releases the agent's persisted transcript too (#1710); the
+    // event store purge prevents a recreated same-id session from inheriting
+    // the deleted transcript.
+    #[cfg(feature = "serve")]
+    if transcript_purged {
+        match state.acp_supervisor.shutdown_and_delete(id).await {
+            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "shutdown during purge failed: {e}"
+                );
+            }
+        }
+        state.acp_supervisor.forget_session(id);
+        state.acp_event_store.delete_session(id);
+    }
+
+    let (delete_worktree, delete_branch, delete_sandbox, force_delete, keep_scratch) = (
+        body.delete_worktree,
+        body.delete_branch,
+        body.delete_sandbox,
+        body.force_delete,
+        body.keep_scratch,
+    );
+    let deletion_id = id.to_string();
+    let deletion_result = tokio::task::spawn_blocking(move || {
+        crate::session::deletion::perform_deletion(&crate::session::deletion::DeletionRequest {
+            session_id: deletion_id,
+            instance,
+            delete_worktree,
+            delete_branch,
+            delete_sandbox,
+            force_delete,
+            detach_hooks: true,
+            keep_scratch,
+        })
+    })
+    .await
+    .map_err(|e| format!("Deletion task failed: {e}"))?;
+
+    let mut messages = deletion_result.messages.clone();
+    if !deletion_result.success {
+        let errs = if deletion_result.errors.is_empty() {
+            "Unknown error".to_string()
+        } else {
+            deletion_result.errors.join("; ")
+        };
+        if !transcript_purged {
+            // Nothing irreversible happened (no transcript to lose), so keep
+            // the row intact and let the caller surface the error; the user
+            // can retry, e.g. with force on a dirty worktree.
+            return Err(errs);
+        }
+        // The durable transcript is already gone; a kept row would only allow
+        // a broken restore. Commit the removal and surface the sidecar errors
+        // as warnings so the orphaned worktree/container can be cleaned up by
+        // hand. See #2489.
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "purge sidecar cleanup failed after the transcript was deleted; removing the session row anyway: {errs}"
+        );
+        messages.push(format!(
+            "Cleanup incomplete (session removed anyway): {errs}"
+        ));
+    }
+
+    // Disk first: if persistence fails, in-memory state stays intact and the
+    // poll loop will not re-add a half-deleted row.
+    let storage = Storage::new(&profile, state.file_watch.clone())
+        .map_err(|e| format!("Session was torn down but storage init failed: {e}"))?;
+    let id_for_save = id.to_string();
+    tokio::task::spawn_blocking(move || {
+        storage.update(|instances, _groups| {
+            instances.retain(|i| i.id != id_for_save);
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| format!("Persist task panicked: {e}"))?
+    .map_err(|e| {
+        format!("Session deletion completed on disk, but sessions.json could not be updated: {e}")
+    })?;
+
+    {
+        let mut instances = state.instances.write().await;
+        instances.retain(|i| i.id != id);
+    }
+    state.instance_locks.write().await.remove(id);
+    if let Some(entry) = recent_entry {
+        if let Err(e) = crate::session::record_recent_project(entry) {
+            tracing::warn!(target: "http.api.sessions",
+                "recording recent project after delete failed: {e}");
+        }
+    }
+    Ok(messages)
+}
+
+/// Relocate any trashed managed worktree still sitting in the active dir into
+/// the holding area, and heal a pointer left stale by a crash between the move
+/// and its persist. Backfills rows trashed before relocation existed. Runs
+/// once on daemon startup, best-effort and per-session locked; a failure on one
+/// session logs and moves on. The git move is blocking, so it runs off the
+/// async runtime.
+pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
+    let candidates: Vec<(String, String)> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| i.is_trashed())
+            .map(|i| (i.id.clone(), i.source_profile.clone()))
+            .collect()
+    };
+    for (id, profile) in candidates {
+        let lock = state.instance_lock(&id).await;
+        let _guard = lock.lock().await;
+
+        let snapshot = {
+            let instances = state.instances.read().await;
+            match instances.iter().find(|i| i.id == id) {
+                Some(i) if i.is_trashed() => i.clone(),
+                _ => continue,
+            }
+        };
+        let reconciled = match tokio::task::spawn_blocking(move || {
+            let mut inst = snapshot;
+            let changed = crate::session::trash::reconcile_trashed_location(&mut inst);
+            (changed, inst)
+        })
+        .await
+        {
+            Ok(pair) => pair,
+            Err(e) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile join failed: {e}");
+                continue;
+            }
+        };
+        if !reconciled.0 {
+            continue;
+        }
+        let moved = reconciled.1;
+        let (np, pre) = (
+            moved.project_path.clone(),
+            moved.pre_trash_project_path.clone(),
+        );
+        let persist_id = id.clone();
+        let _ = persist_session_update(
+            profile,
+            "trash-reconcile",
+            state.file_watch.clone(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    inst.project_path = np.clone();
+                    inst.pre_trash_project_path = pre.clone();
+                }
+            },
+        )
+        .await;
+        let mut instances = state.instances.write().await;
+        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+            inst.project_path = moved.project_path;
+            inst.pre_trash_project_path = moved.pre_trash_project_path;
+        }
+    }
+}
+
+/// Auto-purge trashed sessions whose retention window has elapsed
+/// (`trashed_at + session.trash_retention_days`). Runs on daemon startup and
+/// hourly thereafter. Routed through [`purge_session_artifacts`] so the
+/// permanent-delete path matches `DELETE` exactly. Each candidate is
+/// per-instance locked and its trashed+expired state re-validated under the
+/// lock, so a concurrent restore wins the race and is never purged. See
+/// #2489.
+#[cfg(feature = "serve")]
+pub(crate) async fn purge_expired_trash(state: &Arc<AppState>) {
+    use std::collections::HashMap;
+
+    let now = chrono::Utc::now();
+    let candidates: Vec<(String, String)> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| i.is_trashed())
+            .map(|i| (i.id.clone(), i.source_profile.clone()))
+            .collect()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+
+    let mut retention_by_profile: HashMap<String, u32> = HashMap::new();
+    for (id, profile) in candidates {
+        let retention = *retention_by_profile
+            .entry(profile.clone())
+            .or_insert_with(|| {
+                crate::session::profile_config::resolve_config_or_warn(&profile)
+                    .session
+                    .trash_retention_days
+            });
+        if retention == 0 {
+            continue;
+        }
+
+        let lock = state.instance_lock(&id).await;
+        let _guard = lock.lock().await;
+
+        // Re-validate under the lock: a restore (or an earlier purge) may
+        // have landed since the snapshot.
+        let (instance, recent_entry) = {
+            let instances = state.instances.read().await;
+            match instances.iter().find(|i| i.id == id) {
+                Some(inst) if crate::session::trash::is_expired(inst, retention, now) => {
+                    (inst.clone(), crate::session::recent_project_entry_for(inst))
+                }
+                _ => continue,
+            }
+        };
+
+        // Permanent retention purge cleans sidecars per the profile defaults,
+        // but forces removal so a dirty worktree can't keep an expired
+        // session pinned in the trash forever.
+        let cfg = crate::session::profile_config::resolve_config_or_warn(&instance.source_profile);
+        let body = DeleteSessionBody {
+            delete_worktree: cfg.worktree.auto_cleanup,
+            delete_branch: cfg.worktree.should_delete_branch_on_cleanup(),
+            delete_sandbox: cfg.sandbox.auto_cleanup,
+            force_delete: true,
+            keep_scratch: false,
+        };
+        match purge_session_artifacts(state, &id, instance, &body, recent_entry).await {
+            Ok(_) => tracing::info!(
+                target: "http.api.sessions",
+                session = %id,
+                "auto-purged expired trashed session"
+            ),
+            Err(e) => tracing::warn!(
+                target: "http.api.sessions",
+                session = %id,
+                "auto-purge of expired trash failed: {e}"
+            ),
+        }
+    }
+}
+
 pub async fn delete_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2905,7 +3503,6 @@ pub async fn delete_session(
         );
     };
 
-    let profile = instance.source_profile.clone();
     // Captured before `instance` moves into the deletion task; recorded into
     // the persisted recent-projects store only once the delete fully
     // succeeds, so the project survives in the wizard Recent tab (#2141).
@@ -2932,169 +3529,21 @@ pub async fn delete_session(
             }
         }
 
-        // Tear down the structured view worker FIRST so the ACP subprocess + its
-        // claude-agent-acp child don't leak past the session delete. The
-        // supervisor's shutdown is best-effort: sessions without a worker
-        // (tmux-mode, or structured view sessions whose worker never spawned)
-        // return UnknownSession, which we ignore.
-        #[cfg(feature = "serve")]
-        if instance.is_structured() {
-            // Permanent removal: release the agent's persisted transcript
-            // too, since the session is going away for good. See #1710.
-            match state.acp_supervisor.shutdown_and_delete(&id).await {
-                Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        "shutdown during delete failed: {e}"
-                    );
-                }
-            }
-            // Drop the per-session seq counter so a recreated session
-            // with the same id (rare, but possible) starts cleanly from
-            // seq=1.
-            state.acp_supervisor.forget_session(&id);
-            // On-disk history is the durable mirror; without this purge a
-            // recreated session with the same id would inherit the deleted
-            // session's transcript and the seq=1 first publish would
-            // collide with a row already in the store.
-            state.acp_event_store.delete_session(&id);
-        }
-
-        // Run deletion on a blocking thread (may do git/docker/tmux operations)
-        let deletion_id = id.clone();
-        let deletion_result = tokio::task::spawn_blocking(move || {
-            crate::session::deletion::perform_deletion(&crate::session::deletion::DeletionRequest {
-                session_id: deletion_id,
-                instance,
-                delete_worktree: body.delete_worktree,
-                delete_branch: body.delete_branch,
-                delete_sandbox: body.delete_sandbox,
-                force_delete: body.force_delete,
-                detach_hooks: true,
-                keep_scratch: body.keep_scratch,
-            })
-        })
-        .await;
-
-        match deletion_result {
-            Ok(result) if result.success => {
-                // `perform_deletion` may have produced user-facing messages
-                // (e.g. "Scratch directory kept at: <path>" when
-                // `--keep-scratch` is set). Capture them now so the
-                // success branch can echo them back; the result moves into
-                // the spawn_blocking below.
-                let messages = result.messages.clone();
-                // Disk first: if persistence fails, the in-memory state is left
-                // intact and we return 500. Otherwise the status poll loop
-                // would silently re-add the entry from disk on the next tick
-                // and the user would see "deleted" then the session
-                // reappearing seconds later.
-                let storage = match Storage::new(&profile, state.file_watch.clone()) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        let msg = format!("Session was torn down but storage init failed: {e}");
-                        mark_delete_error(&state, &id, msg.clone()).await;
-                        tracing::error!(target: "http.api.sessions",
-                        "Storage::new failed after deletion: {e}");
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({
-                                "error": "persist_failed",
-                                "message": msg,
-                            })),
-                        );
-                    }
-                };
-                let id_for_save = id.clone();
-                let persist_result = tokio::task::spawn_blocking(move || {
-                    storage.update(|instances, _groups| {
-                        instances.retain(|i| i.id != id_for_save);
-                        Ok(())
-                    })
-                })
-                .await;
-                match persist_result {
-                    Ok(Ok(())) => {
-                        {
-                            let mut instances = state.instances.write().await;
-                            instances.retain(|i| i.id != id);
-                        }
-                        state.instance_locks.write().await.remove(&id);
-                        if let Some(entry) = recent_entry {
-                            if let Err(e) = crate::session::record_recent_project(entry) {
-                                tracing::warn!(target: "http.api.sessions",
-                                    "recording recent project after delete failed: {e}");
-                            }
-                        }
-                        (
-                            StatusCode::OK,
-                            Json(serde_json::json!({
-                                "status": "deleted",
-                                "messages": messages,
-                            })),
-                        )
-                    }
-                    Ok(Err(e)) => {
-                        let msg = format!(
-                            "Session deletion completed on disk, but \
-                             sessions.json could not be updated: {e}"
-                        );
-                        mark_delete_error(&state, &id, msg.clone()).await;
-                        tracing::error!(target: "http.api.sessions",
-                        "Failed to save after deletion: {e}");
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({
-                                "error": "persist_failed",
-                                "message": msg,
-                            })),
-                        )
-                    }
-                    Err(join_err) => {
-                        mark_delete_error(&state, &id, "Persist task panicked".to_string()).await;
-                        tracing::error!(target: "http.api.sessions",
-                        "Persist task panicked: {join_err}");
-                        (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(serde_json::json!({
-                                "error": "persist_failed",
-                                "message": "Persist task panicked",
-                            })),
-                        )
-                    }
-                }
-            }
-            Ok(result) => {
-                // Deletion had errors; set status to Error
-                let error_msg = if result.errors.is_empty() {
-                    "Unknown error".to_string()
-                } else {
-                    result.errors.join("; ")
-                };
-                {
-                    let mut instances = state.instances.write().await;
-                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                        inst.status = Status::Error;
-                        inst.last_error = Some(error_msg.clone());
-                    }
-                }
+        match purge_session_artifacts(&state, &id, instance, &body, recent_entry).await {
+            Ok(messages) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "deleted",
+                    "messages": messages,
+                })),
+            ),
+            Err(msg) => {
+                mark_delete_error(&state, &id, msg.clone()).await;
+                tracing::error!(target: "http.api.sessions", "delete failed: {msg}");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
                         "error": "deletion_failed",
-                        "message": error_msg,
-                    })),
-                )
-            }
-            Err(e) => {
-                let msg = format!("Deletion task failed: {e}");
-                mark_delete_error(&state, &id, msg.clone()).await;
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "error": "internal",
                         "message": msg,
                     })),
                 )
@@ -3696,29 +4145,19 @@ pub async fn create_session(
             body.trust_hooks.unwrap_or(false),
         )?;
 
-        // When worktree_branch is empty string, generate a name from civilizations.
-        // The generated name is used as both title and branch.
         let title = body.title.unwrap_or_default();
-        let worktree_branch = match body.worktree_branch {
-            Some(b) if b.is_empty() => {
-                let generated = crate::session::civilizations::generate_random_title(&title_refs);
-                Some(generated)
-            }
-            other => other,
-        };
-        // If title is empty and we generated a branch name, use it as the title too
-        let title = if title.is_empty() {
-            worktree_branch.clone().unwrap_or_default()
-        } else {
-            title
-        };
+        let worktree_enabled = body.worktree_branch.is_some();
+        let worktree_branch = body
+            .worktree_branch
+            .map(|b| b.trim().to_string())
+            .filter(|b| !b.is_empty());
 
         let params = InstanceParams {
             title,
             path: body.path,
             group: body.group,
             tool: body.tool,
-            worktree_enabled: worktree_branch.is_some(),
+            worktree_enabled,
             worktree_branch,
             create_new_branch: body.create_new_branch,
             base_branch: if body.create_new_branch {
@@ -4405,6 +4844,7 @@ pub async fn ensure_session(
 pub async fn ensure_terminal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -4412,6 +4852,14 @@ pub async fn ensure_terminal(
             Json(
                 serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
             ),
+        )
+            .into_response();
+    }
+    let index = q.index;
+    if index > crate::server::pane::MAX_TERMINAL_INDEX {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "index_out_of_range"})),
         )
             .into_response();
     }
@@ -4435,20 +4883,22 @@ pub async fn ensure_terminal(
     let _guard = inst_lock.lock().await;
 
     // Re-check after acquiring the lock; the first caller may have created it.
-    // `has_terminal()` only checks the in-memory `terminal_info.created` flag.
-    // The pane shell can exit (Ctrl+D, `exit`, SIGHUP from a destroyed tmux
-    // client, etc.) while the flag stays true and the session keeps existing
-    // (because we set tmux's `remain-on-exit on`). When that happens the web
-    // UI would attach to a dead pane that swallows every keystroke, so do
-    // the same kill+recreate dance the TUI runs in src/tui/app.rs around the
-    // attach path.
+    // Index 0 has the in-memory `terminal_info.created` fast path; additional
+    // terminals (index >= 1) are queried straight from tmux. Either way the
+    // pane shell can exit (Ctrl+D, `exit`, SIGHUP from a destroyed tmux client,
+    // etc.) while the session keeps existing (we set `remain-on-exit on`), so a
+    // live-but-dead pane must be respawned the same way the TUI does on attach.
     {
         let instances = state.instances.read().await;
         if let Some(i) = instances.iter().find(|i| i.id == id) {
-            if i.has_terminal() {
-                let pane_dead = i
-                    .terminal_tmux_session()
-                    .ok()
+            let session = i.terminal_tmux_session_indexed(index).ok();
+            let known = if index == 0 {
+                i.has_terminal()
+            } else {
+                session.as_ref().map(|s| s.exists()).unwrap_or(false)
+            };
+            if known {
+                let pane_dead = session
                     .map(|s| s.exists() && s.is_pane_dead())
                     .unwrap_or(false);
                 if !pane_dead {
@@ -4461,6 +4911,7 @@ pub async fn ensure_terminal(
                 tracing::warn!(
                     target: "terminal.ws",
                     session = %id,
+                    index,
                     "paired terminal pane is dead, respawning"
                 );
             }
@@ -4470,17 +4921,19 @@ pub async fn ensure_terminal(
     let mut inst_clone = inst;
 
     let result = tokio::task::spawn_blocking(move || {
-        let _ = inst_clone.kill_terminal_if_dead();
-        inst_clone.start_terminal()
+        let _ = inst_clone.kill_terminal_if_dead_indexed(index);
+        inst_clone.start_terminal_with_size_indexed(index, None)
     })
     .await;
 
     match result {
         Ok(Ok(())) => {
-            // Update in-memory cache
-            let mut instances = state.instances.write().await;
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+            // Only index 0 carries an in-memory cache flag.
+            if index == 0 {
+                let mut instances = state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                    inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+                }
             }
             (
                 StatusCode::CREATED,
@@ -4510,6 +4963,7 @@ pub async fn ensure_terminal(
 pub async fn ensure_container_terminal(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -4517,6 +4971,14 @@ pub async fn ensure_container_terminal(
             Json(
                 serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
             ),
+        )
+            .into_response();
+    }
+    let index = q.index;
+    if index > crate::server::pane::MAX_TERMINAL_INDEX {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "index_out_of_range"})),
         )
             .into_response();
     }
@@ -4538,14 +5000,13 @@ pub async fn ensure_container_terminal(
 
     // Same dead-pane rescue as `ensure_terminal`: an existing-but-dead
     // pane would otherwise silently swallow every keystroke from the
-    // browser. See the longer comment in `ensure_terminal`.
+    // browser. Container terminals are always tmux-queried (no cache flag).
     {
         let instances = state.instances.read().await;
         if let Some(i) = instances.iter().find(|i| i.id == id) {
-            if i.has_container_terminal() {
-                let pane_dead = i
-                    .container_terminal_tmux_session()
-                    .ok()
+            let session = i.container_terminal_tmux_session_indexed(index).ok();
+            if session.as_ref().map(|s| s.exists()).unwrap_or(false) {
+                let pane_dead = session
                     .map(|s| s.exists() && s.is_pane_dead())
                     .unwrap_or(false);
                 if !pane_dead {
@@ -4558,6 +5019,7 @@ pub async fn ensure_container_terminal(
                 tracing::warn!(
                     target: "terminal.ws",
                     session = %id,
+                    index,
                     "container terminal pane is dead, respawning"
                 );
             }
@@ -4567,8 +5029,8 @@ pub async fn ensure_container_terminal(
     let mut inst_clone = inst;
 
     let result = tokio::task::spawn_blocking(move || {
-        let _ = inst_clone.kill_container_terminal_if_dead();
-        inst_clone.start_container_terminal_with_size(None)
+        let _ = inst_clone.kill_container_terminal_if_dead_indexed(index);
+        inst_clone.start_container_terminal_with_size_indexed(index, None)
     })
     .await;
 
@@ -4588,6 +5050,84 @@ pub async fn ensure_container_terminal(
         }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", "Container terminal creation panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Kill an additional paired terminal (host + container) at `index`. Used when
+/// the web dashboard closes an extra terminal tab so its tmux shell does not
+/// leak for the session's lifetime. Index 0 is the primary terminal shared with
+/// the native TUI; closing it in the web UI only hides the pane (the TUI keeps
+/// its shell), so this endpoint rejects index 0. See #2437.
+pub async fn kill_terminal(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let index = q.index;
+    if index == 0 || index > crate::server::pane::MAX_TERMINAL_INDEX {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "index_out_of_range"})),
+        )
+            .into_response();
+    }
+    let instances = state.instances.read().await;
+    let inst = match instances.iter().find(|i| i.id == id) {
+        Some(i) => i.clone(),
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not_found"})),
+            )
+                .into_response();
+        }
+    };
+    drop(instances);
+
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        // A missing session is success (the `kill_*` helpers no-op when the
+        // tmux session is absent); only a real tmux failure surfaces here, so
+        // the caller can retry instead of leaving an orphaned shell behind.
+        inst.kill_terminal_indexed(index)?;
+        inst.kill_container_terminal_indexed(index)?;
+        Ok(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "killed"})),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::error!(target: "http.api.sessions", "Terminal kill failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "kill_failed", "message": "Failed to kill terminal"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "Terminal kill panicked: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
@@ -5198,6 +5738,60 @@ pub async fn preview_volume_ignores_globs(
     }
 }
 
+#[derive(Deserialize)]
+pub struct SearchQuery {
+    pub q: String,
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+pub struct SearchHit {
+    pub session_id: String,
+    pub seq: u64,
+    pub kind: String,
+    pub snippet: String,
+    pub match_count: usize,
+}
+
+#[derive(Serialize)]
+pub struct SearchResponse {
+    pub results: Vec<SearchHit>,
+}
+
+/// Full-text search over session conversation content (#2515). Scans the
+/// structured-view event store on its read-only connection and returns
+/// one hit per matching session, newest first. The response carries only
+/// the session id; the web client already holds the session list and
+/// resolves the title and state from it. Read-only; allowed in
+/// `--read-only` mode.
+pub async fn search_sessions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<SearchQuery>,
+) -> Json<SearchResponse> {
+    let limit = q.limit.unwrap_or(10);
+    // search_content does synchronous SQLite I/O plus JSON decoding; the
+    // palette fires it repeatedly as the user types, so run it on the
+    // blocking pool to keep slow scans off the Tokio worker threads.
+    let store = Arc::clone(&state.acp_event_store);
+    let query = q.q.clone();
+    let results = tokio::task::spawn_blocking(move || {
+        store
+            .search_content(&query, limit)
+            .into_iter()
+            .map(|h| SearchHit {
+                session_id: h.session_id,
+                seq: h.seq,
+                kind: h.kind.to_string(),
+                snippet: h.snippet,
+                match_count: h.match_count,
+            })
+            .collect()
+    })
+    .await
+    .unwrap_or_default();
+    Json(SearchResponse { results })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5207,6 +5801,24 @@ mod tests {
         inst.status = Status::Running;
         inst.group_path = "work/projects".to_string();
         inst
+    }
+
+    #[test]
+    fn trash_body_default_keeps_kill_pane_true() {
+        // #2523: a no-body trash request resolves through
+        // `unwrap_or_default()`. The derived `Default` would yield
+        // `kill_pane = false` and leave the pane running; the hand impl must
+        // match the serde field default.
+        assert!(TrashSessionBody::default().kill_pane);
+
+        // An empty JSON object goes through serde, which honors the field
+        // default helper.
+        let from_empty: TrashSessionBody = serde_json::from_str("{}").unwrap();
+        assert!(from_empty.kill_pane);
+
+        // An explicit `false` is still respected.
+        let explicit: TrashSessionBody = serde_json::from_str(r#"{"kill_pane": false}"#).unwrap();
+        assert!(!explicit.kill_pane);
     }
 
     #[test]
@@ -5246,6 +5858,41 @@ mod tests {
         upsert_instance(&mut instances, other);
         assert_eq!(instances.len(), 2);
         assert!(instances.iter().any(|i| i.id == other_id));
+    }
+
+    // Regression for #2363: a multi-repo workspace session carries
+    // `workspace_info` and no `worktree_info`. The DTO must report
+    // `has_cleanable_worktree: true` so the web delete dialog shows the
+    // "Delete worktree" checkbox, while keeping `has_managed_worktree: false`
+    // so worktree-only actions (sidebar "Edit workdir name", tie overlay) stay
+    // hidden for workspace sessions.
+    #[test]
+    fn from_instance_reports_managed_worktree_for_workspace_session() {
+        let mut inst = make_test_instance();
+        inst.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feature/abc".to_string(),
+            workspace_dir: "/tmp/ws".to_string(),
+            repos: vec![crate::session::WorkspaceRepo {
+                name: "repo-a".to_string(),
+                source_path: "/tmp/src/repo-a".to_string(),
+                branch: "feature/abc".to_string(),
+                worktree_path: "/tmp/ws/repo-a".to_string(),
+                main_repo_path: "/tmp/src/repo-a".to_string(),
+                managed_by_aoe: true,
+            }],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+
+        let resp = SessionResponse::from_instance(&inst, false);
+        assert!(
+            resp.has_cleanable_worktree,
+            "workspace session must report a cleanable worktree so the delete checkbox shows"
+        );
+        assert!(
+            !resp.has_managed_worktree,
+            "workspace session must NOT report a single-repo managed worktree (keeps Edit-workdir hidden)"
+        );
     }
 
     #[test]
@@ -7178,6 +7825,7 @@ mod workspace_ordering_tests {
             is_sandboxed: false,
             scratch: false,
             has_managed_worktree: false,
+            has_cleanable_worktree: false,
             tie_workdir_to_name: false,
             smart_rename: crate::session::smart_rename::SmartRenameState::Inactive,
             default_name: false,
@@ -7187,7 +7835,9 @@ mod workspace_ordering_tests {
                 delete_worktree: false,
                 delete_branch: false,
                 delete_sandbox: false,
+                delete_to_trash: true,
             },
+            trashed_at: None,
             remote_owner: None,
             notify_on_waiting: None,
             notify_on_idle: None,

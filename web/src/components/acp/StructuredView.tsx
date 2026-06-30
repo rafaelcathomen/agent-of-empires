@@ -33,7 +33,8 @@ import { Markdown } from "./Markdown";
 import { isQueuedPromptLong, queuedStripLayout } from "./queuedPromptsLayout";
 import { StartupErrorScreen } from "./StartupErrorScreen";
 import { pickWorkerStoppedVariant } from "./workerStoppedBanner";
-import { SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
+import { BackgroundAgentsContext } from "./backgroundAgentsContext";
+import { AsyncSubagentCard, SubagentCard, ToolCard, ToolGroupCard, TodoGroupCard } from "./ToolCards";
 import { DiffCommentsUserCard } from "../diff/comments/DiffCommentsUserCard";
 import { isDiffCommentsCardPayload, parseDiffCommentsSentinel } from "../diff/comments/buildPrompt";
 import { ElicitationAnswerCard } from "./ElicitationAnswerCard";
@@ -49,7 +50,7 @@ import { useAcpPrefs } from "../../lib/acpPrefs";
 import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { AttentionChime } from "./AttentionChime";
-import { useRespawnSession } from "../../hooks/useRespawnSession";
+import { useRespawnSession, type RespawnState } from "../../hooks/useRespawnSession";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { dispatchFocusTerminal } from "../../lib/terminalFocus";
@@ -88,6 +89,11 @@ interface Props {
    *  timestamps come back as null and we fall through to the live
    *  variant. See #1581. */
   snoozedUntil: string | null;
+  /** RFC3339 trashed-at timestamp, or null. Drives the trash-specific
+   *  "worker stopped" banner: a trashed session is recoverable only by
+   *  restoring it, so the banner replaces the composer and points at the
+   *  Trash section. Takes precedence over archived/snoozed. See #2489. */
+  trashedAt: string | null;
   /** Open a local file reference cited in the transcript (Codex
    *  `path:line` markdown links). Provided to the markdown anchor
    *  override via context so a click opens the in-app file viewer
@@ -97,6 +103,9 @@ interface Props {
   /** Repo roots for this session, forwarded to the tool cards so file
    *  paths render repo-relative instead of absolute. See #2143. */
   fileRefSession?: FileRefSession | null;
+  /** Open (or focus) the Sub agents dock pane. Lets an inline async
+   *  sub-agent card jump to its panel entry. */
+  onOpenAgentsPane?: () => void;
 }
 
 const STARTER_PROMPTS = [
@@ -106,7 +115,17 @@ const STARTER_PROMPTS = [
 ];
 
 export function StructuredView(props: Props) {
-  const { sessionId, acpWorkerState, tool, archivedAt, snoozedUntil, onOpenFileRef, fileRefSession } = props;
+  const {
+    sessionId,
+    acpWorkerState,
+    tool,
+    archivedAt,
+    snoozedUntil,
+    trashedAt,
+    onOpenFileRef,
+    fileRefSession,
+    onOpenAgentsPane,
+  } = props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
   // the view (not the reducer) because it's a UI preference, not
@@ -127,17 +146,22 @@ export function StructuredView(props: Props) {
             showClearedTurns={showClearedTurns}
           >
             {(ctx) => (
-              <AcpChrome
-                sessionId={sessionId}
-                acpWorkerState={acpWorkerState}
-                showClearedTurns={showClearedTurns}
-                onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
-                toolDensity={toolDensity}
-                onToggleToolDensity={toggleToolDensity}
-                archivedAt={archivedAt}
-                snoozedUntil={snoozedUntil}
-                {...ctx}
-              />
+              <BackgroundAgentsContext.Provider
+                value={{ agents: ctx.state.backgroundAgents, openPane: onOpenAgentsPane }}
+              >
+                <AcpChrome
+                  sessionId={sessionId}
+                  acpWorkerState={acpWorkerState}
+                  showClearedTurns={showClearedTurns}
+                  onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
+                  toolDensity={toolDensity}
+                  onToggleToolDensity={toggleToolDensity}
+                  archivedAt={archivedAt}
+                  snoozedUntil={snoozedUntil}
+                  trashedAt={trashedAt}
+                  {...ctx}
+                />
+              </BackgroundAgentsContext.Provider>
             )}
           </AcpRuntime>
         </ToolDisplayModeProvider>
@@ -191,6 +215,7 @@ function AcpChrome({
   onToggleToolDensity,
   archivedAt,
   snoozedUntil,
+  trashedAt,
   state,
   status,
   hasEverOpened,
@@ -227,6 +252,7 @@ function AcpChrome({
   onToggleToolDensity: () => void;
   archivedAt: string | null;
   snoozedUntil: string | null;
+  trashedAt: string | null;
 }) {
   // Count how many activity rows precede the latest `session_cleared`
   // divider so the banner can say "12 earlier turns hidden". The
@@ -262,6 +288,11 @@ function AcpChrome({
       id: `rate-limit-recovery-${Date.now()}`,
       text,
     });
+  const {
+    state: rateLimitResumeState,
+    error: rateLimitResumeError,
+    respawn: resumeRateLimitedSession,
+  } = useRespawnSession(sessionId, state.rateLimit?.resets_at ?? null);
 
   // Re-pin the chat viewport to the bottom when the composer (or any
   // sibling below it: queued strip, primer banner) grows. assistant-ui's
@@ -436,6 +467,9 @@ function AcpChrome({
               maxRetries={maxRetries}
               manualReconnect={manualReconnect}
               onSwitchAgent={onSwitchAgent}
+              onResumeRateLimit={() => void resumeRateLimitedSession()}
+              rateLimitResumeState={rateLimitResumeState}
+              rateLimitResumeError={rateLimitResumeError}
             />
           ) : null
         }
@@ -446,9 +480,13 @@ function AcpChrome({
         const variant = pickWorkerStoppedVariant({
           workerStopped: state.workerStopped,
           startupError: state.startupError,
+          trashedAt,
           archivedAt,
           snoozedUntil,
         });
+        if (variant === "trashed") {
+          return <TrashedWorkerStoppedBanner sessionId={sessionId} />;
+        }
         if (variant === "archived") {
           return <ArchivedWorkerStoppedBanner sessionId={sessionId} />;
         }
@@ -566,66 +604,79 @@ function AcpChrome({
           </div>
         </ThreadPrimitive.Viewport>
 
+        {/* The ref host stays mounted always: the transcript's pinned-bottom
+            sampling and earlier-history resize anchoring (the useLayoutEffect
+            above) depend on `belowViewportRef.current` being present, and a
+            trashed session still scrolls its read-only transcript. Only the
+            interactive controls are gated. A trashed session is read-only until
+            restored (the reconciler will never resume it), so the queue strips
+            and composer, which would only stash input into a queue that never
+            drains, are not rendered. Archived / snoozed sessions are resumable,
+            so they keep their composer. See #2529. */}
         <div ref={belowViewportRef}>
-          <QueuedPromptsStrip
-            queued={state.queuedPrompts}
-            onRemove={removeQueuedPrompt}
-            onEdit={editQueuedPrompt}
-            onClear={clearQueue}
-            pendingResume={
-              status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
-            }
-          />
+          {!trashedAt && (
+            <>
+              <QueuedPromptsStrip
+                queued={state.queuedPrompts}
+                onRemove={removeQueuedPrompt}
+                onEdit={editQueuedPrompt}
+                onClear={clearQueue}
+                pendingResume={
+                  status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
+                }
+              />
 
-          <RejectedPromptsStrip
-            rejected={state.rejectedPrompts}
-            onRetry={sendPrompt}
-            onDismiss={dismissRejectedPrompt}
-            disabled={state.workerRestarting || state.workerStopped || Boolean(state.startupError)}
-          />
+              <RejectedPromptsStrip
+                rejected={state.rejectedPrompts}
+                onRetry={sendPrompt}
+                onDismiss={dismissRejectedPrompt}
+                disabled={state.workerRestarting || state.workerStopped || Boolean(state.startupError)}
+              />
 
-          <ModeSwitchFailedNotice failure={state.modeSwitchFailed} onDismiss={dismissModeSwitchFailed} />
+              <ModeSwitchFailedNotice failure={state.modeSwitchFailed} onDismiss={dismissModeSwitchFailed} />
 
-          <ConfigOptionSwitchFailedNotice
-            failure={state.configOptionSwitchFailed}
-            configOptions={state.configOptions}
-            onDismiss={dismissConfigOptionSwitchFailed}
-          />
+              <ConfigOptionSwitchFailedNotice
+                failure={state.configOptionSwitchFailed}
+                configOptions={state.configOptions}
+                onDismiss={dismissConfigOptionSwitchFailed}
+              />
 
-          <ContextPrimerBanner
-            sessionId={sessionId}
-            available={state.contextPrimerAvailable}
-            onInsertPrimer={(text) =>
-              setPrimerPrefill({
-                id: `primer-${state.contextPrimerAvailable?.resetSeq ?? 0}-${Date.now()}`,
-                text,
-              })
-            }
-            onDismiss={dismissPrimer}
-          />
+              <ContextPrimerBanner
+                sessionId={sessionId}
+                available={state.contextPrimerAvailable}
+                onInsertPrimer={(text) =>
+                  setPrimerPrefill({
+                    id: `primer-${state.contextPrimerAvailable?.resetSeq ?? 0}-${Date.now()}`,
+                    text,
+                  })
+                }
+                onDismiss={dismissPrimer}
+              />
 
-          <Composer
-            sessionId={sessionId}
-            currentAgent={state.agent}
-            availableModes={state.availableModes}
-            currentModeId={state.currentModeId}
-            legacyMode={state.mode}
-            configOptions={state.configOptions}
-            pendingConfigOption={state.pendingConfigOption}
-            setConfigOption={setConfigOption}
-            sessionUsage={state.sessionUsage}
-            availableCommands={state.availableCommands}
-            connected={status === "open" && !state.workerStopped && !state.workerRestarting}
-            turnActive={state.turnActive}
-            queuedCount={state.queuedPrompts.length}
-            enqueuePrompt={sendPrompt}
-            promptCapabilities={state.promptCapabilities}
-            pendingAttachments={pendingAttachments}
-            setPendingAttachments={setPendingAttachments}
-            primerPrefill={primerPrefill}
-            queuedPrompts={state.queuedPrompts}
-            editQueuedPrompt={editQueuedPrompt}
-          />
+              <Composer
+                sessionId={sessionId}
+                currentAgent={state.agent}
+                availableModes={state.availableModes}
+                currentModeId={state.currentModeId}
+                legacyMode={state.mode}
+                configOptions={state.configOptions}
+                pendingConfigOption={state.pendingConfigOption}
+                setConfigOption={setConfigOption}
+                sessionUsage={state.sessionUsage}
+                availableCommands={state.availableCommands}
+                connected={status === "open" && !state.workerStopped && !state.workerRestarting}
+                turnActive={state.turnActive}
+                queuedCount={state.queuedPrompts.length}
+                enqueuePrompt={sendPrompt}
+                promptCapabilities={state.promptCapabilities}
+                pendingAttachments={pendingAttachments}
+                setPendingAttachments={setPendingAttachments}
+                primerPrefill={primerPrefill}
+                queuedPrompts={state.queuedPrompts}
+                editQueuedPrompt={editQueuedPrompt}
+              />
+            </>
+          )}
         </div>
       </ThreadPrimitive.Root>
     </StructuredViewRoot>
@@ -930,6 +981,10 @@ function AssistantTodoGroup({ argsText }: { argsText?: string }) {
 interface SubagentPayload {
   parent: GroupChild;
   children: GroupChild[];
+  /** True for an async sub-agent launch: the `Task` completed at launch
+   *  and the work runs off-protocol, so there are no children and the
+   *  card renders a neutral "runs in background" state. */
+  async?: boolean;
 }
 
 /** Reconstructs the parent Task tool plus its sub-agent children from
@@ -984,6 +1039,11 @@ function AssistantSubagentTask({ argsText }: { argsText?: string }) {
   };
 
   const parent = reconstruct(payload.parent);
+  // An async launch has no inline children; it links to its live entry in
+  // the Background agents panel by the launching tool-call id.
+  if (payload.async) {
+    return <AsyncSubagentCard tool={parent.tool} />;
+  }
   const children = payload.children.map(reconstruct);
   return <SubagentCard tool={parent.tool} result={parent.result} children={children} />;
 }
@@ -1368,6 +1428,9 @@ export function SystemNotices({
   maxRetries,
   manualReconnect,
   onSwitchAgent,
+  onResumeRateLimit,
+  rateLimitResumeState = "idle",
+  rateLimitResumeError = null,
 }: {
   status: AcpContext["status"];
   lagged: boolean;
@@ -1379,6 +1442,9 @@ export function SystemNotices({
   maxRetries: number;
   manualReconnect: () => void;
   onSwitchAgent?: () => void;
+  onResumeRateLimit?: () => void;
+  rateLimitResumeState?: RespawnState;
+  rateLimitResumeError?: string | null;
 }) {
   const messages: { kind: string; text: string }[] = [];
   // Retry envelope exhausted: the auto-reconnect chain stopped after
@@ -1428,6 +1494,7 @@ export function SystemNotices({
       text: `Rate-limited (${rateLimit.kind}); resets at ${reset}.`,
     });
   }
+  const resumePending = rateLimitResumeState === "retrying" || rateLimitResumeState === "ok";
   if (messages.length === 0 && !retriesExhausted) return null;
   return (
     <div className="border-b border-surface-800 px-4 py-2 space-y-1">
@@ -1436,16 +1503,38 @@ export function SystemNotices({
           {m.text}
         </div>
       ))}
-      {rateLimit && onSwitchAgent && (
-        <div className="flex items-center justify-end pt-1">
-          <button
-            type="button"
-            onClick={onSwitchAgent}
-            className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60"
-          >
-            Continue in another agent
-          </button>
+      {rateLimit && (onResumeRateLimit || onSwitchAgent) && (
+        <div className="flex flex-wrap items-center justify-end gap-2 pt-1">
+          {onResumeRateLimit && (
+            <button
+              type="button"
+              onClick={onResumeRateLimit}
+              disabled={resumePending}
+              className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {rateLimitResumeState === "retrying"
+                ? "Resuming…"
+                : rateLimitResumeState === "ok"
+                  ? "Resume requested"
+                  : "Resume now"}
+            </button>
+          )}
+          {onSwitchAgent && (
+            <button
+              type="button"
+              onClick={onSwitchAgent}
+              className="shrink-0 rounded-md border border-brand-700 bg-brand-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-brand-100 hover:bg-brand-900/60"
+            >
+              Continue in another agent
+            </button>
+          )}
         </div>
+      )}
+      {rateLimit && rateLimitResumeState === "ok" && (
+        <div className="pt-1 text-xs text-text-muted">Resume requested. New events should start streaming shortly.</div>
+      )}
+      {rateLimit && rateLimitResumeState === "failed" && rateLimitResumeError && (
+        <div className="pt-1 text-xs text-brand-400">Resume failed: {rateLimitResumeError}</div>
       )}
       {retriesExhausted && (
         <div className="flex items-center justify-between gap-3 text-xs text-brand-400">
@@ -1465,15 +1554,15 @@ export function SystemNotices({
 
 function InteractionErrorBanner({ message, onDismiss }: { message: string; onDismiss: () => void }) {
   return (
-    <div className="flex items-start justify-between gap-3 border-b border-amber-900/60 bg-amber-950/40 px-4 py-2 text-amber-200">
+    <div className="flex items-start justify-between gap-3 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-status-warning">
       <div className="flex-1 min-w-0">
         <div className="text-xs font-medium">Action did not complete</div>
-        <div className="mt-0.5 text-xs text-amber-100/90 break-words">{message}</div>
+        <div className="mt-0.5 text-xs text-status-warning/90 break-words">{message}</div>
       </div>
       <button
         type="button"
         onClick={onDismiss}
-        className="shrink-0 rounded-md border border-amber-800/60 bg-amber-900/40 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-amber-100 hover:bg-amber-900/60"
+        className="shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-2 py-1 text-[10px] font-mono uppercase tracking-wide text-status-warning hover:bg-status-warning/30"
       >
         Dismiss
       </button>
@@ -1519,8 +1608,8 @@ export function WorkerRestartingBanner({
  *  nothing to be still-available. See #1106. */
 function SpawningBanner() {
   return (
-    <div className="flex items-center gap-2 border-b border-amber-900/60 bg-amber-950/40 px-4 py-2 text-xs text-amber-200">
-      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400" aria-hidden />
+    <div className="flex items-center gap-2 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-xs text-status-warning">
+      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-status-warning" aria-hidden />
       <span>Starting structured view worker for new session… this can take a few seconds.</span>
     </div>
   );
@@ -1534,8 +1623,8 @@ function WorkerResumingBanner() {
   // `running` state (typically within a few hundred ms of completion).
   // See #1088.
   return (
-    <div className="flex items-center gap-2 border-b border-amber-900/60 bg-amber-950/40 px-4 py-2 text-xs text-amber-200">
-      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-amber-400" aria-hidden />
+    <div className="flex items-center gap-2 border-b border-status-warning/30 bg-status-warning/10 px-4 py-2 text-xs text-status-warning">
+      <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-status-warning" aria-hidden />
       <span>
         Resuming structured view worker… cached transcript still available. Queued prompts will send once the agent is
         back online.
@@ -1641,12 +1730,12 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
   const { state: retryState, error: retryError, respawn: handleReconnect } = useRespawnSession(sessionId);
 
   return (
-    <div className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200">
+    <div className="border-b border-status-warning/30 bg-status-warning/10 px-4 py-3 text-status-warning">
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
           <div className="text-sm font-medium">Structured view worker stopped</div>
-          <div className="mt-1 text-xs text-amber-100/90">
-            The agent was terminated via <code className="rounded bg-amber-900/60 px-1">aoe acp stop</code> or an
+          <div className="mt-1 text-xs text-status-warning/90">
+            The agent was terminated via <code className="rounded bg-status-warning/30 px-1">aoe acp stop</code> or an
             equivalent external teardown. New prompts are disabled until you reconnect.
           </div>
         </div>
@@ -1654,7 +1743,7 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
           type="button"
           onClick={handleReconnect}
           disabled={retryState === "retrying"}
-          className="shrink-0 rounded-md border border-amber-800/60 bg-amber-900/40 px-3 py-1 text-xs font-medium text-amber-100 hover:bg-amber-900/60 disabled:cursor-not-allowed disabled:opacity-60"
+          className="shrink-0 rounded-md border border-status-warning/40 bg-status-warning/20 px-3 py-1 text-xs font-medium text-status-warning hover:bg-status-warning/30 disabled:cursor-not-allowed disabled:opacity-60"
         >
           {retryState === "retrying" ? "Reconnecting…" : "Reconnect"}
         </button>
@@ -1665,7 +1754,7 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
         </div>
       )}
       {retryState === "failed" && retryError && (
-        <div className="mt-2 text-xs text-amber-100/90">Reconnect failed: {retryError}</div>
+        <div className="mt-2 text-xs text-status-warning/90">Reconnect failed: {retryError}</div>
       )}
     </div>
   );
@@ -1677,14 +1766,35 @@ function WorkerStoppedBanner({ sessionId }: { sessionId: string }) {
  *  startup recovery path both skip archived sessions, so a fresh
  *  spawn would not survive the next reconciliation tick. The user
  *  unblocks by unarchiving from the sidebar context menu. See #1581. */
+/** Replacement for `WorkerStoppedBanner` when the session is in the trash
+ *  (#2489). The transcript is still readable (the event store keeps it until
+ *  purge), but the worker is stopped and the reconciler will not respawn a
+ *  trashed session, so the composer is disabled and the banner points at the
+ *  sidebar Trash section to restore. */
+export function TrashedWorkerStoppedBanner({ sessionId }: { sessionId: string }) {
+  return (
+    <div
+      className="border-b border-status-warning/30 bg-status-warning/10 px-4 py-3 text-status-warning"
+      data-testid={`acp-trashed-banner-${sessionId}`}
+    >
+      <div className="text-sm font-medium">Session in trash</div>
+      <div className="mt-1 text-xs text-status-warning/90">
+        This session is in the trash. Its transcript and workspace are kept and shown here read-only, but the worker is
+        stopped and will not respawn. Restore it from the Trash section in the sidebar to resume, or delete it
+        permanently from there.
+      </div>
+    </div>
+  );
+}
+
 export function ArchivedWorkerStoppedBanner({ sessionId }: { sessionId: string }) {
   return (
     <div
-      className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200"
+      className="border-b border-status-warning/30 bg-status-warning/10 px-4 py-3 text-status-warning"
       data-testid={`acp-archived-banner-${sessionId}`}
     >
       <div className="text-sm font-medium">Session archived</div>
-      <div className="mt-1 text-xs text-amber-100/90">
+      <div className="mt-1 text-xs text-status-warning/90">
         This session is parked. The structured view worker was shut down and the reconciler will not respawn it.
         Unarchive from the sidebar (right-click the row, then Unarchive) to bring it back.
       </div>
@@ -1702,11 +1812,11 @@ export function SnoozedWorkerStoppedBanner({ sessionId, snoozedUntil }: { sessio
   const wallClock = Number.isFinite(target.getTime()) ? target.toLocaleString() : snoozedUntil;
   return (
     <div
-      className="border-b border-amber-900/60 bg-amber-950/40 px-4 py-3 text-amber-200"
+      className="border-b border-status-warning/30 bg-status-warning/10 px-4 py-3 text-status-warning"
       data-testid={`acp-snoozed-banner-${sessionId}`}
     >
       <div className="text-sm font-medium">Session snoozed</div>
-      <div className="mt-1 text-xs text-amber-100/90">
+      <div className="mt-1 text-xs text-status-warning/90">
         The structured view worker was shut down until <span className="font-mono">{wallClock}</span>. The reconciler
         will respawn it automatically once the snooze expires, or you can Unsnooze from the sidebar (right-click the
         row) to wake it sooner.

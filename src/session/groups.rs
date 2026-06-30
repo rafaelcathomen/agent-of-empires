@@ -17,9 +17,27 @@ use super::Instance;
 pub const ARCHIVED_SECTION_PATH: &str = "__aoe_archived_section__";
 pub const ARCHIVED_SECTION_NAME: &str = "Archived";
 
+/// Synthetic group path for the Trash shelf, sibling of the Archived
+/// section. Same caveat: code walking `flat_items` must skip this sentinel
+/// before invoking GroupTree-mutating ops, since no matching group exists.
+pub const TRASH_SECTION_PATH: &str = "__aoe_trash_section__";
+pub const TRASH_SECTION_NAME: &str = "Trash";
+
 #[inline]
 pub fn is_archived_section_path(path: &str) -> bool {
     path == ARCHIVED_SECTION_PATH
+}
+
+#[inline]
+pub fn is_trash_section_path(path: &str) -> bool {
+    path == TRASH_SECTION_PATH
+}
+
+/// True for the Trash section sentinel or anything nested under it. Mirrors
+/// [`is_within_archived_section`] for the trash shelf.
+#[inline]
+pub fn is_within_trash_section(path: &str) -> bool {
+    path == TRASH_SECTION_PATH || path.starts_with(&format!("{}/", TRASH_SECTION_PATH))
 }
 
 /// True for both the top-level Archived section sentinel and any synthetic
@@ -612,7 +630,9 @@ fn group_members<'a>(
 ) -> impl Iterator<Item = &'a Instance> + 'a {
     let prefix = format!("{}/", path);
     instances.iter().filter(move |i| {
-        (i.group_path == path || i.group_path.starts_with(&prefix)) && !i.is_archived()
+        (i.group_path == path || i.group_path.starts_with(&prefix))
+            && !i.is_archived()
+            && !i.is_trashed()
     })
 }
 
@@ -675,7 +695,7 @@ fn last_activity_group_key(
 /// in italic+dim by the row formatter); only the sort order is suppressed.
 fn attention_tier(inst: &Instance) -> u8 {
     use crate::session::Status::*;
-    if inst.is_archived() || inst.is_snoozed() || inst.pane_dead_observed {
+    if inst.is_archived() || inst.is_snoozed() || inst.is_trashed() || inst.pane_dead_observed {
         // Tier 99 sinks: archived and snoozed (snoozed = temporary archive,
         // wakes automatically when timer expires). Both read as "do not
         // bother me with this row" so they share the bottom tier.
@@ -856,7 +876,7 @@ fn attention_group_key(
     let favorite_bias = min_tier != 99
         && members
             .iter()
-            .any(|i| !i.is_archived() && !i.is_snoozed() && i.is_favorited());
+            .any(|i| !i.is_archived() && !i.is_snoozed() && !i.is_trashed() && i.is_favorited());
 
     if min_tier == 99 {
         // All members archived: sort archived block by latest archived_at.
@@ -918,7 +938,7 @@ pub fn flatten_tree_all_profiles(
     // `append_archived_section`.
     let mut ungrouped: Vec<&Instance> = instances
         .iter()
-        .filter(|i| i.group_path.is_empty() && !i.is_archived())
+        .filter(|i| i.group_path.is_empty() && !i.is_archived() && !i.is_trashed())
         .collect();
 
     sort_sessions(&mut ungrouped, sort_order);
@@ -993,7 +1013,10 @@ pub fn flatten_sessions_by_attention(instances: &[Instance]) -> Vec<Item> {
     // `append_archived_section`. Snoozed and pane-dead rows still sink to
     // tier 99 inline because they are transient attention sinks, not
     // lifecycle terminals.
-    let mut refs: Vec<&Instance> = instances.iter().filter(|i| !i.is_archived()).collect();
+    let mut refs: Vec<&Instance> = instances
+        .iter()
+        .filter(|i| !i.is_archived() && !i.is_trashed())
+        .collect();
     refs.sort_by_key(|i| attention_session_key(i));
     refs.into_iter()
         .map(|inst| Item::Session {
@@ -1016,7 +1039,7 @@ pub fn flatten_tree(
     // `append_archived_section`.
     let mut ungrouped: Vec<&Instance> = instances
         .iter()
-        .filter(|i| i.group_path.is_empty() && !i.is_archived())
+        .filter(|i| i.group_path.is_empty() && !i.is_archived() && !i.is_trashed())
         .collect();
 
     sort_sessions(&mut ungrouped, sort_order);
@@ -1098,7 +1121,7 @@ fn flatten_group(
     // section appended by the caller.
     let mut group_sessions: Vec<&Instance> = instances
         .iter()
-        .filter(|i| i.group_path == group.path && !i.is_archived())
+        .filter(|i| i.group_path == group.path && !i.is_archived() && !i.is_trashed())
         .collect();
 
     sort_sessions(&mut group_sessions, sort_order);
@@ -1153,7 +1176,10 @@ fn count_sessions_in_group(path: &str, instances: &[Instance]) -> usize {
 /// No-op when there are no archived sessions, so users who never archive
 /// anything don't see a phantom "Archived (0)" header.
 pub fn append_archived_section(items: &mut Vec<Item>, instances: &[Instance], collapsed: bool) {
-    let mut archived: Vec<&Instance> = instances.iter().filter(|i| i.is_archived()).collect();
+    let mut archived: Vec<&Instance> = instances
+        .iter()
+        .filter(|i| i.is_archived() && !i.is_trashed())
+        .collect();
     if archived.is_empty() {
         return;
     }
@@ -1185,6 +1211,47 @@ pub fn append_archived_section(items: &mut Vec<Item>, instances: &[Instance], co
     }
 }
 
+/// Append the synthetic Trash section to `items`: a depth-0 header followed
+/// by every `is_trashed()` session, most-recently-trashed first (the row a
+/// user just deleted is the one they are most likely to want back). When
+/// `collapsed` is true only the header is pushed; the header still shows the
+/// count. No-op when nothing is trashed, so users who never delete don't see
+/// a phantom "Trash (0)" header. Rendered as a sibling of the Archived
+/// section, pinned to the very bottom (see `HomeView::build_flat_items`).
+/// Flat in every grouping mode: trash is a recovery shelf, not a workspace,
+/// so it is not nested by project the way the Archived section is.
+pub fn append_trash_section(items: &mut Vec<Item>, instances: &[Instance], collapsed: bool) {
+    let mut trashed: Vec<&Instance> = instances.iter().filter(|i| i.is_trashed()).collect();
+    if trashed.is_empty() {
+        return;
+    }
+    trashed.sort_by_key(|i| Reverse(i.trashed_at));
+
+    items.push(Item::Group {
+        path: TRASH_SECTION_PATH.to_string(),
+        name: TRASH_SECTION_NAME.to_string(),
+        depth: 0,
+        collapsed,
+        session_count: trashed.len(),
+        profile: None,
+        archived_at: None,
+        color: None,
+        ancestor_colors: Vec::new(),
+    });
+
+    if collapsed {
+        return;
+    }
+
+    for inst in trashed {
+        items.push(Item::Session {
+            id: inst.id.clone(),
+            depth: 1,
+            ancestor_colors: Vec::new(),
+        });
+    }
+}
+
 /// Project-grouping variant of `append_archived_section`: nests archived
 /// sessions under a sub-header per project. Caller must have already
 /// rewritten `inst.group_path` to the project name (see
@@ -1193,7 +1260,7 @@ pub fn append_archived_section(items: &mut Vec<Item>, instances: &[Instance], co
 ///
 /// Layout:
 /// - Archived (depth 0)
-///   - <project name> (depth 1)
+///   - `<project name>` (depth 1)
 ///     - session row (depth 2)
 ///
 /// `section_collapsed` hides everything below the top header; per-project
@@ -1215,7 +1282,10 @@ pub fn append_archived_section_by_project(
     project_collapsed: &HashMap<String, bool>,
     sort_order: SortOrder,
 ) {
-    let archived: Vec<&Instance> = instances.iter().filter(|i| i.is_archived()).collect();
+    let archived: Vec<&Instance> = instances
+        .iter()
+        .filter(|i| i.is_archived() && !i.is_trashed())
+        .collect();
     if archived.is_empty() {
         return;
     }

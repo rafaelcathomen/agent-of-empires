@@ -64,6 +64,11 @@ export interface SessionResponse {
    *  comes back as null on the wire; the web therefore only needs to
    *  treat any non-null value as an active snooze. See #1581. */
   snoozed_until?: string | null;
+  /** RFC3339 timestamp at which the session was moved to trash, or null /
+   *  undefined when not trashed. Trashed sessions are bucketed into a
+   *  dedicated Trash section with restore and permanent-delete actions; they
+   *  are excluded from the active and archived buckets. See #2489. */
+  trashed_at?: string | null;
   /** Unread marker mirroring `Instance::unread`: `true` when the session
    *  needs attention (a finished turn the user hasn't engaged with, or a
    *  manual flag), false / undefined when read. The sidebar paints an unread
@@ -72,6 +77,12 @@ export interface SessionResponse {
    *  session currently open, which also clears the marker. */
   unread?: boolean;
   has_managed_worktree: boolean;
+  /** True when deleting this session has aoe-managed worktree state to clean
+   *  up, covering single-repo worktrees AND multi-repo workspaces. Only the
+   *  delete dialog's worktree/branch checkboxes read this; worktree-only
+   *  actions (Edit workdir) keep reading `has_managed_worktree`. Always sent
+   *  by the server; optional only so existing test fixtures need not set it. */
+  has_cleanable_worktree?: boolean;
   /** True when renaming this session also moves its worktree directory (the
    *  resolved `session.tie_workdir_to_name` for an aoe-managed worktree). The
    *  sidebar uses this to collapse the standalone "edit workdir name" action
@@ -164,6 +175,9 @@ export interface CleanupDefaults {
   delete_worktree: boolean;
   delete_branch: boolean;
   delete_sandbox: boolean;
+  /** Resolved `session.delete_to_trash`: the delete dialog defaults to
+   *  "Move to Trash" when true, permanent delete when false. See #2489. */
+  delete_to_trash: boolean;
 }
 
 export type SessionStatus =
@@ -557,4 +571,8 @@ export interface SettingsFieldDescriptor {
   validation: SettingsValidation;
   /** Operational tuning shown under an "Advanced" fold. */
   advanced: boolean;
+  /** Default value shown before anything is stored. Present on plugin
+   *  (`plugin:<id>`) fields, which have no value in the config until saved;
+   *  omitted for core fields (their value always exists in the config). */
+  default?: unknown;
 }

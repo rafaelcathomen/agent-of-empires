@@ -213,7 +213,7 @@ const NPM_INSTALLABLE_ACP: &[(&str, &str)] = &[
         "claude-agent-acp",
         "@agentclientprotocol/claude-agent-acp@latest",
     ),
-    ("codex-acp", "@zed-industries/codex-acp"),
+    ("codex-acp", "@agentclientprotocol/codex-acp@latest"),
     ("pi-acp", "pi-acp"),
 ];
 
@@ -574,7 +574,7 @@ fn kill_now(session: &str) -> Result<()> {
     // liveness would skip the killpg and leak surviving descendants.
     // killpg ignores ESRCH, so signaling an already-empty group is a
     // harmless no-op.
-    worker_registry::kill_runner_group(record.pid);
+    crate::process::worker::kill_process_group(record.pid);
     println!("Killed agent worker for {} (PID {}).", session, record.pid);
     Ok(())
 }
@@ -585,7 +585,7 @@ async fn signal_and_wait(record: &crate::acp::worker_registry::WorkerRecord, tim
     // goes down together, not just the runner pid. Sent unconditionally:
     // the group can outlive its leader pid, so gating on leader liveness
     // would skip the SIGTERM and leak surviving descendants. See #1689.
-    worker_registry::terminate_runner_group(record.pid);
+    crate::process::worker::terminate_process_group(record.pid);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     while std::time::Instant::now() < deadline {
         if !worker_registry::is_pid_alive(record.pid) {
@@ -593,7 +593,7 @@ async fn signal_and_wait(record: &crate::acp::worker_registry::WorkerRecord, tim
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    worker_registry::kill_runner_group(record.pid);
+    crate::process::worker::kill_process_group(record.pid);
 }
 
 fn logs(session: Option<String>, follow: bool) -> Result<()> {
@@ -672,7 +672,7 @@ fn restart(session: &str) -> Result<()> {
     // runner rather than orphaning under PID 1 before respawn (#1689).
     // Unconditional: the group can outlive its leader pid, so gating on
     // leader liveness would skip the killpg and leak descendants.
-    worker_registry::terminate_runner_group(record.pid);
+    crate::process::worker::terminate_process_group(record.pid);
     println!(
         "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
         session, record.pid
@@ -881,6 +881,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
     match event {
         Event::PlanUpdated { .. } => "plan_updated",
         Event::TodoListUpdated { .. } => "todo_list_updated",
+        Event::SessionTitleSuggested { .. } => "session_title_suggested",
         Event::ToolCallStarted { .. } => "tool_call_started",
         Event::ToolCallCompleted { .. } => "tool_call_completed",
         Event::ToolCallContent { .. } => "tool_call_content",
@@ -903,6 +904,10 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::ConfigOptionsUpdated { .. } => "config_options_updated",
         Event::ConfigOptionSwitchFailed { .. } => "config_option_switch_failed",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
+        Event::BackgroundAgentLaunched { .. } => "background_agent_launched",
+        Event::BackgroundAgentProgress { .. } => "background_agent_progress",
+        Event::BackgroundAgentCompleted { .. } => "background_agent_completed",
+        Event::PromptRuntimeError { .. } => "prompt_runtime_error",
         Event::AgentMessageChunk { .. } => "agent_message_chunk",
         Event::CancelRequested { .. } => "cancel_requested",
         Event::Stopped { .. } => "stopped",

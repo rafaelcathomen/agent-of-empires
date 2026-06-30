@@ -19,7 +19,7 @@ pub enum ThemeCommands {
         /// Theme name to export
         name: String,
 
-        /// Output file path (defaults to <name>.toml in the themes directory)
+        /// Output file path (defaults to `<name>.toml` in the themes directory)
         #[arg(short, long)]
         output: Option<String>,
     },

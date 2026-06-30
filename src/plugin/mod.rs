@@ -6,11 +6,47 @@
 //! installs, capability grants, and the Tier 0 / Tier 1 contribution surface
 //! return in follow-up PRs.
 
+pub mod auto_update;
+pub mod contributions;
+pub mod discover;
+pub mod featured;
+pub mod fetch;
 pub mod install;
+pub mod integrity;
+pub mod lockfile;
 pub mod registry;
+pub mod source;
+pub mod update_check;
 pub mod view;
 
+// The Tier 1 worker host runs only in the `aoe serve` daemon, where the event
+// store and session storage it serves over the capability-gated API live. A
+// TUI-only build has no host, so these modules are gated with it.
+#[cfg(feature = "serve")]
+pub mod host;
+#[cfg(feature = "serve")]
+pub mod host_api;
+#[cfg(feature = "serve")]
+pub mod protocol;
+#[cfg(feature = "serve")]
+pub mod sandbox;
+#[cfg(feature = "serve")]
+pub mod ui_state;
+
+// Launch resolution is pure (PATH / filesystem probing) and is shared by the
+// serve-only host and the always-present installer, which runs a plugin's
+// build steps with the same argv-resolution policy. It carries no host state,
+// so it is not gated.
+pub mod launch;
+
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+
+/// Directory holding externally installed plugins, one subdir per plugin id:
+/// `<app_dir>/plugins/<id>/`.
+pub fn plugins_dir() -> anyhow::Result<PathBuf> {
+    Ok(crate::session::get_app_dir()?.join("plugins"))
+}
 
 pub use registry::{LoadedPlugin, PluginRegistry};
 pub use view::PluginView;
@@ -50,6 +86,14 @@ pub fn registry() -> Arc<PluginRegistry> {
     let reg = Arc::new(PluginRegistry::load(&config));
     *slot = Some(reg.clone());
     reg
+}
+
+/// Themes contributed by the active plugin set, as `(name, resolved path)`
+/// pairs. The theme registry layers these below builtins and user themes.
+pub fn active_plugin_themes() -> Vec<(String, PathBuf)> {
+    let reg = registry();
+    let active: Vec<&LoadedPlugin> = reg.active().collect();
+    contributions::active_themes(&active)
 }
 
 /// Rebuild the registry from the current on-disk config (after an

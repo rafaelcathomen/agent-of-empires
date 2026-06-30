@@ -9,7 +9,17 @@ interface Props {
   isSandboxed: boolean;
   isScratch: boolean;
   cleanupDefaults: CleanupDefaults;
+  /** When true (session.delete_to_trash), the dialog defaults to "Move to
+   *  Trash" with a "Delete permanently" disclosure; when false it goes
+   *  straight to the permanent-delete options. See #2489. */
+  defaultToTrash: boolean;
+  /** Number of sibling sessions in the workspace beyond the one named above.
+   *  A workspace shares one worktree across all its sessions, and delete acts
+   *  on the whole workspace, so when this is >0 the dialog discloses that more
+   *  than the named session will be removed. See #2530. */
+  extraSessionCount?: number;
   onConfirm: (options: DeleteSessionOptions) => Promise<void>;
+  onTrash: () => Promise<void>;
   onCancel: () => void;
 }
 
@@ -20,7 +30,10 @@ export function DeleteSessionDialog({
   isSandboxed,
   isScratch,
   cleanupDefaults,
+  defaultToTrash,
+  extraSessionCount = 0,
   onConfirm,
+  onTrash,
   onCancel,
 }: Props) {
   const [deleteWorktree, setDeleteWorktree] = useState(hasManagedWorktree && cleanupDefaults.delete_worktree);
@@ -31,6 +44,10 @@ export function DeleteSessionDialog({
   // realize mid-delete they want to rescue the files.
   const [keepScratch, setKeepScratch] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  // Permanent-delete mode. Off by default when trash-first is enabled; the
+  // user reveals the destructive options via "Delete permanently". When
+  // trash-first is disabled there is no trash step, so start permanent.
+  const [permanent, setPermanent] = useState(!defaultToTrash);
   const confirmButtonRef = useRef<HTMLButtonElement | null>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
@@ -39,17 +56,21 @@ export function DeleteSessionDialog({
   const handleConfirm = useCallback(async () => {
     setDeleting(true);
     try {
-      await onConfirm({
-        delete_worktree: deleteWorktree,
-        delete_branch: deleteBranch,
-        delete_sandbox: deleteSandbox,
-        force_delete: forceDelete,
-        keep_scratch: isScratch ? keepScratch : undefined,
-      });
+      if (permanent) {
+        await onConfirm({
+          delete_worktree: deleteWorktree,
+          delete_branch: deleteBranch,
+          delete_sandbox: deleteSandbox,
+          force_delete: forceDelete,
+          keep_scratch: isScratch ? keepScratch : undefined,
+        });
+      } else {
+        await onTrash();
+      }
     } catch {
       setDeleting(false);
     }
-  }, [onConfirm, deleteWorktree, deleteBranch, deleteSandbox, forceDelete, isScratch, keepScratch]);
+  }, [permanent, onConfirm, onTrash, deleteWorktree, deleteBranch, deleteSandbox, forceDelete, isScratch, keepScratch]);
 
   // Capture the previously focused element on mount and restore focus on
   // unmount so keyboard users return to the trigger (the sidebar row /
@@ -99,6 +120,7 @@ export function DeleteSessionDialog({
       onClick={onCancel}
     >
       <div
+        data-testid="delete-session-dialog-panel"
         className="bg-surface-800 border border-surface-700/50 rounded-lg w-[420px] max-w-[90vw] shadow-2xl animate-slide-up"
         onClick={(e) => e.stopPropagation()}
       >
@@ -112,10 +134,32 @@ export function DeleteSessionDialog({
         {/* Body */}
         <div className="px-5 py-4 space-y-3">
           <p className="text-[13px] text-text-secondary">
-            Delete <span className="font-mono text-text-primary">{sessionTitle}</span>?
+            Delete <span className="font-mono text-text-primary break-all">{sessionTitle}</span>?
           </p>
 
-          {hasOptions && (
+          {extraSessionCount > 0 && (
+            <p className="text-[12px] text-text-dim" data-testid="delete-session-extra-count">
+              {permanent
+                ? `This permanently deletes all ${extraSessionCount + 1} sessions in this workspace.`
+                : `This moves all ${extraSessionCount + 1} sessions in this workspace to Trash.`}
+            </p>
+          )}
+
+          {/* When trash is the default, deleting moves the session to the
+              Trash (restore later); this checkbox opts into erasing it now.
+              When trash-first is off (or the session is already trashed),
+              there is no checkbox and delete is always permanent. See #2489. */}
+          {defaultToTrash && (
+            <Checkbox
+              checked={permanent}
+              onChange={setPermanent}
+              label="Delete permanently"
+              detail="Skip the trash and erase now, including the transcript. Off: move to Trash, restore later."
+              testId="delete-session-permanent"
+            />
+          )}
+
+          {permanent && hasOptions && (
             <div className="space-y-2 pt-1">
               {hasManagedWorktree && (
                 <>
@@ -181,7 +225,8 @@ export function DeleteSessionDialog({
             ref={confirmButtonRef}
             onClick={handleConfirm}
             disabled={deleting}
-            className="px-3 py-1.5 text-sm text-white bg-status-error/90 hover:bg-status-error rounded-md cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-2"
+            data-testid="delete-session-confirm"
+            className="px-3 py-1.5 text-sm text-white rounded-md cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-2 bg-status-error/90 hover:bg-status-error"
           >
             {deleting && (
               <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24">

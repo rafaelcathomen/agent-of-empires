@@ -855,6 +855,7 @@ pub async fn run(profile: &str, mut args: AddArgs) -> Result<()> {
                 extra_env: None,
                 custom_instruction: config.sandbox.custom_instruction.clone(),
                 before_start_env: Vec::new(),
+                container_workdir: None,
             });
         }
     }

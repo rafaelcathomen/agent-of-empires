@@ -1,4 +1,5 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Puzzle } from "lucide-react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
@@ -6,13 +7,17 @@ import { useSessions } from "./hooks/useSessions";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
-import { safeGetItem, safeRemoveItem, safeSetItem } from "./lib/safeStorage";
+import { safeGetItem, safeRemoveItem } from "./lib/safeStorage";
 import { isAutomatedSession } from "./lib/onboarding";
 import { useWorkspaces } from "./hooks/useWorkspaces";
 import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
+import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
+import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
+import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
+import { workspaceIsTrashed } from "./lib/sidebarSort";
 import { useSidebarSortMode } from "./hooks/useSidebarSortMode";
 import { useSidebarAxis } from "./hooks/useSidebarAxis";
 import { repoGroupToSidebarGroup, type SidebarGroup } from "./lib/sidebarGroups";
@@ -24,16 +29,21 @@ import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
 import { clearStoredComments, sweepOrphanComments } from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
-import { useCommandActions } from "./hooks/useCommandActions";
+import { useCommandActions, buildConversationActions } from "./hooks/useCommandActions";
+import { usePluginCommands } from "./hooks/usePluginCommands";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
+import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab } from "./lib/paneLayout";
+import { isPluginPaneId, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
+import { PluginPaneBody } from "./components/plugin/PluginSlots";
+import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
+import { deleteWorkspaceSessions, restoreSessions, trashSessions } from "./lib/trashActions";
 import {
   loginStatus,
   logout,
-  deleteSession,
   stopSession,
   startSession,
   fetchAbout,
@@ -48,6 +58,7 @@ import {
   setProjectPinned,
   deleteProject,
   setSessionUnread,
+  killTerminal,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
@@ -74,7 +85,15 @@ const StructuredView = lazy(() =>
     default: m.StructuredView,
   })),
 );
-import { RightPanel } from "./components/RightPanel";
+import { type PaneDisplay } from "./components/Dock";
+import { DockGroups, type DockGroupView } from "./components/DockGroups";
+import { BottomDock } from "./components/BottomDock";
+import { PaneDndController } from "./components/PaneDndController";
+import { visibleToFullIndex, type DropTarget } from "./components/paneDnd";
+import { BackgroundAgentsPanel } from "./components/acp/BackgroundAgentsPanel";
+import { DiffPane } from "./components/DiffPane";
+import { PairedShellPane } from "./components/PairedTerminal";
+import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
@@ -97,12 +116,12 @@ import { TelemetryConsentModal } from "./components/TelemetryConsentModal";
 import { TipsModal } from "./components/TipsModal";
 import { useTips, shouldAutoPopTips } from "./hooks/useTips";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
+import { useConversationSearch } from "./hooks/useConversationSearch";
 import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
 
-const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
 // Pre-#1832 per-browser tour-seen flag. Read once on load to migrate users who
 // already dismissed the tour to the backend; no longer written.
 const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
@@ -191,7 +210,12 @@ export default function App() {
   return (
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <UnreadIndicatorContext.Provider value={unreadIndicatorEnabled}>
-        <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
+        {/* PluginUiProvider must sit above AppContent: AppContent itself reads
+            the plugin UI snapshot (usePluginPanes), so the provider can't live
+            inside its own return. */}
+        <PluginUiProvider>
+          <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
+        </PluginUiProvider>
         <ElevationPrompt />
       </UnreadIndicatorContext.Provider>
     </IdleDecayWindowContext.Provider>
@@ -248,8 +272,15 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     loaded: sessionsLoaded,
     injectSession,
     setSessionStatus,
+    applySession,
   } = useSessions();
   const workspaces = useWorkspaces(sessions);
+  // Trash is a whole-workspace concern, so it is derived here from the
+  // authoritative unsliced workspace list rather than reconstructed from the
+  // sidebar's per-`group_path` slice views. A workspace is in Trash only when
+  // every one of its sessions is trashed, and Restore/Delete then cover all of
+  // them. See #2533.
+  const trashedWorkspaces = useMemo(() => workspaces.filter(workspaceIsTrashed), [workspaces]);
 
   // Remember the active session and restore it on a PWA relaunch (#2103).
   useLastSessionRestore({ activeSessionId, sessions, sessionsLoaded });
@@ -285,6 +316,40 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const [sidebarSortMode, setSidebarSortMode] = useSidebarSortMode();
   const [sidebarAxis, setSidebarAxis] = useSidebarAxis();
 
+  // Active plugin sort (#2401): an ephemeral selection of a live `sort-key`
+  // entry. Not persisted (plugin entries die with the daemon). The ref is only
+  // ever read by resolving it against the live snapshot, so a stale ref (entry
+  // gone after a daemon restart) is inert and the sidebar falls back to the
+  // built-in sort; if the entry reappears on a later poll the selection
+  // resumes. Selecting a built-in mode clears it via `selectSidebarSortMode`.
+  const pluginUiEntries = usePluginUiEntries();
+  const [pluginSortRef, setPluginSortRef] = useState<{ pluginId: string; entryId: string } | null>(null);
+  const activePluginSort = useMemo(() => {
+    if (!pluginSortRef) return null;
+    return (
+      pluginSortSpecs(pluginUiEntries).find(
+        (s) => s.pluginId === pluginSortRef.pluginId && s.entryId === pluginSortRef.entryId,
+      ) ?? null
+    );
+  }, [pluginUiEntries, pluginSortRef]);
+  const pluginSort = useMemo<PluginSortContext | undefined>(
+    () =>
+      activePluginSort
+        ? {
+            direction: activePluginSort.direction,
+            values: buildSortValueMap(pluginUiEntries, activePluginSort.pluginId, activePluginSort.column),
+          }
+        : undefined,
+    [activePluginSort, pluginUiEntries],
+  );
+  const selectSidebarSortMode = useCallback(
+    (mode: SidebarSortMode) => {
+      setPluginSortRef(null);
+      setSidebarSortMode(mode);
+    },
+    [setSidebarSortMode],
+  );
+
   const { projects, refresh: refreshProjects } = useProjects();
   const {
     groups: repoGroups,
@@ -292,13 +357,17 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     toggleRepoCollapsed,
     updateRepoAppearance,
     reorderRepoGroups,
-  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode, projects);
-  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(workspaces, sidebarSortMode);
+  } = useRepoGroups(workspaces, workspaceOrdering, sidebarSortMode, projects, pluginSort);
+  const { groups: sessionGroups, toggleGroupCollapsed } = useSessionGroups(workspaces, sidebarSortMode, pluginSort);
   // The nested `repo+group` axis reuses the already-built repo groups for
   // its top level (so repo collapse, appearance, and ordering are shared
   // with the repo axis) and splits each repo by `group_path` underneath.
   // See #1720.
-  const { groups: nestedGroups, toggleSubgroupCollapsed } = useNestedSidebarGroups(repoGroups, sidebarSortMode);
+  const { groups: nestedGroups, toggleSubgroupCollapsed } = useNestedSidebarGroups(
+    repoGroups,
+    sidebarSortMode,
+    pluginSort,
+  );
 
   // The sidebar render path consumes one honest model (SidebarGroup): the
   // repo axis maps in via an adapter, the user-group axis is already in
@@ -344,15 +413,147 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const selectedFilePath = selectedFile?.path ?? null;
   const selectedRepoName = selectedFile?.repoName;
   const selectedFileLine = selectedFile?.line;
-  const [diffCollapsed, setDiffCollapsed] = useState(() => {
-    const stored = safeGetItem(RIGHT_PANEL_COLLAPSED_KEY);
-    if (stored === "1") return true;
-    if (stored === "0") return false;
-    return window.innerWidth < 768;
-  });
+  // Dock panes render as tabbed groups (#2437): each dock holds an ordered set
+  // of tabs (diff, one-or-more terminals, plugin panes) with one active body.
+  // The tab membership + active tab + terminal count are persisted per session;
+  // dock sizes stay global (Dock/BottomDock own those localStorage keys).
+  const {
+    layout: paneLayout,
+    openTab,
+    addTerminal,
+    closeTab,
+    activateTab,
+    moveTab,
+    placeTab,
+    toggleKind,
+    togglePlugin,
+    syncPlugins,
+  } = usePaneLayout(activeSessionId);
+  const pluginPanes = usePluginPanes(activeSessionId);
+  const pluginPaneById = useMemo(() => {
+    const m = new Map<string, PluginPane>();
+    for (const p of pluginPanes) m.set(p.id, p);
+    return m;
+  }, [pluginPanes]);
+
+  // Auto-add newly available plugin panes as tabs in their default dock; the
+  // layout suppresses any the user explicitly closed.
   useEffect(() => {
-    safeSetItem(RIGHT_PANEL_COLLAPSED_KEY, diffCollapsed ? "1" : "0");
-  }, [diffCollapsed]);
+    syncPlugins(pluginPanes.map((p) => ({ id: p.id, defaultDock: p.defaultDock })));
+  }, [pluginPanes, syncPlugins]);
+
+  const paneDescriptor = useCallback(
+    (id: string): PaneDisplay => {
+      const plugin = pluginPaneById.get(id);
+      if (plugin) return { title: plugin.title, icon: plugin.icon ?? Puzzle };
+      if (isTerminalTabId(id)) {
+        const idx = terminalIndexOf(id);
+        const term = BUILTIN_PANES.find((p) => p.id === "terminal")!;
+        return { title: idx === 0 ? term.title : `${term.title} ${idx + 1}`, icon: term.icon };
+      }
+      const d = BUILTIN_PANES.find((p) => p.id === id)!;
+      return { title: d.title, icon: d.icon };
+    },
+    [pluginPaneById],
+  );
+
+  // A persisted tab is visible only if its backing pane currently exists: diff
+  // and terminals always do; a plugin tab does only while its plugin is loaded.
+  const tabAvailable = useCallback(
+    (id: string) => !id.startsWith("plugin:") || pluginPaneById.has(id),
+    [pluginPaneById],
+  );
+  // A dock's groups reduced to what's actually shown: each surviving group keeps
+  // its persisted index (so a drop addresses the right group) and a valid active
+  // tab. Groups with no visible tab (only unloaded plugins) are not rendered.
+  const renderGroups = useCallback(
+    (dock: DockLocation): DockGroupView[] =>
+      dockGroups(paneLayout, dock)
+        .map((g, group) => {
+          const tabs = g.tabs.filter(tabAvailable);
+          const active = g.active && tabs.includes(g.active) ? g.active : (tabs[0] ?? null);
+          return { group, tabs, active };
+        })
+        .filter((g) => g.tabs.length > 0),
+    [paneLayout, tabAvailable],
+  );
+
+  const rightGroups = renderGroups("right");
+  const bottomGroups = renderGroups("bottom");
+  const groupsByDock = useMemo(
+    () => ({
+      right: rightGroups.map((g) => ({ group: g.group, tabs: g.tabs })),
+      bottom: bottomGroups.map((g) => ({ group: g.group, tabs: g.tabs })),
+    }),
+    [rightGroups, bottomGroups],
+  );
+  const rightDockCollapsed = rightGroups.length === 0;
+  const terminalOpen = (["right", "bottom"] as DockLocation[]).some((d) =>
+    dockTabs(paneLayout, d).some(isTerminalTabId),
+  );
+
+  // Activity-bar entries are pane KINDS (diff, terminal, each plugin), not
+  // individual tabs; the strip's +/x manage terminal instances.
+  const isPaneOpen = (kind: string): boolean => {
+    if (kind === "terminal") return terminalOpen;
+    return dockOf(paneLayout, kind) !== null;
+  };
+  const togglePaneAny = useCallback(
+    (kind: string) => {
+      const defaultDock: DockLocation =
+        pluginPaneById.get(kind)?.defaultDock ?? BUILTIN_PANES.find((p) => p.id === kind)?.defaultDock ?? "right";
+      if (isPluginPaneId(kind)) togglePlugin(kind, defaultDock);
+      else toggleKind(kind as "diff" | "terminal" | "agents", defaultDock);
+    },
+    [toggleKind, togglePlugin, pluginPaneById],
+  );
+  // Open (or focus) the Sub agents pane. Used by an inline async
+  // sub-agent card to jump to its panel entry.
+  const openAgentsPane = useCallback(() => {
+    const dock = dockOf(paneLayout, "agents");
+    if (dock) activateTab(dock, "agents");
+    else toggleKind("agents", "right");
+  }, [paneLayout, activateTab, toggleKind]);
+  const closePaneAny = useCallback(
+    (id: string) => {
+      // Closing an extra terminal tab kills its tmux shell so it does not leak;
+      // terminal 0 (shared with the native TUI) only hides. Diff/plugin tabs
+      // have no backend shell to reap.
+      if (isTerminalTabId(id)) {
+        const idx = terminalIndexOf(id);
+        if (idx >= 1) {
+          // Remove the tab only once the shell is actually killed; if the
+          // DELETE fails, keep the tab so the user can retry instead of
+          // silently leaking the shell with no way to close it.
+          if (activeSessionId) {
+            void killTerminal(activeSessionId, idx).then((ok) => {
+              if (ok) closeTab(id);
+            });
+          }
+          return;
+        }
+      }
+      closeTab(id);
+    },
+    [closeTab, activeSessionId],
+  );
+  const movePaneAny = useCallback((id: string, dock: DockLocation) => moveTab(id, dock), [moveTab]);
+  // The dnd controller works in visible-tab space; map a drop index back to the
+  // target group's full persisted tab list, since a hidden (unloaded) plugin tab
+  // still holds a slot the visible index does not count. A split target carries
+  // no index (the new group starts with just the dragged tab).
+  const placeVisibleTab = useCallback(
+    (id: string, target: DropTarget) => {
+      if (target.newGroup) {
+        placeTab(id, { dock: target.dock, group: target.group, newGroup: true });
+        return;
+      }
+      const fullBase = (dockGroups(paneLayout, target.dock)[target.group]?.tabs ?? []).filter((tab) => tab !== id);
+      const index = visibleToFullIndex(fullBase, target.index ?? fullBase.length, tabAvailable);
+      placeTab(id, { dock: target.dock, group: target.group, index });
+    },
+    [paneLayout, placeTab, tabAvailable],
+  );
   // Layout topology is width-driven so it stays aligned with the `md:`
   // Tailwind classes the rest of the layout uses. At md and up the
   // side-by-side ContentSplit renders; below md a single full-viewport
@@ -378,6 +579,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // unit-tested directly.
   const tips = useTips();
   const [showPalette, setShowPalette] = useState(false);
+  // Palette content-search query (#2515); declared here so the keyboard
+  // handlers below can clear it on close/toggle. Consumed lower down by
+  // useConversationSearch.
+  const [paletteQuery, setPaletteQuery] = useState("");
   const [showAbout, setShowAbout] = useState(false);
   const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
   // Whether the telemetry status fetch has settled. `telemetryConsentNeeded`
@@ -399,10 +604,18 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     return workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId));
   }, [workspaces, activeSessionId]);
   const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
+  const allPaneIds: string[] = [
+    "diff",
+    "terminal",
+    // The background-agents panel only applies to structured-view (ACP)
+    // sessions; a plain terminal session never launches sub-agents.
+    ...(activeSession?.view === "structured" ? ["agents"] : []),
+    ...pluginPanes.map((p) => p.id),
+  ];
 
   // Fetch the diff when the panel is actually showing: on desktop when the
   // split is expanded, on mobile when the diff view is the active pane.
-  const diffPanelActive = isMdUp ? !diffCollapsed : rightPanelView === "diff";
+  const diffPanelActive = isMdUp ? dockOf(paneLayout, "diff") !== null : rightPanelView === "diff";
   const {
     files: diffFiles,
     perRepoBases,
@@ -413,7 +626,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   } = useDiffFiles(activeSessionId, diffPanelActive);
 
   // Diff-viewer comments (#928). Acp-only and session-scoped. The
-  // banner lives in RightPanel while the inline UI lives inside
+  // banner lives in the diff pane while the inline UI lives inside
   // DiffFileViewer, so the store is lifted here and threaded to both.
   const diffComments = useDiffComments(activeSessionId);
   const commentsEnabled = activeSession?.view === "structured";
@@ -474,6 +687,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // Mount the paired shell on first activation and keep it mounted after.
   if (rightPanelView === "paired" && !pairedMounted) {
     setPairedMounted(true);
+  }
+
+  // A plugin pane promoted into the mobile main pane can vanish (plugin
+  // unloaded, or the new session has no such pane). Fall back to the agent
+  // view so the user is never stranded on a blank pane. Mirrors the diff /
+  // paired guards above; render-phase derivation per the block at the top.
+  if (isPluginPaneId(rightPanelView) && !pluginPanes.some((p) => p.id === rightPanelView)) {
+    setRightPanelView("agent");
   }
 
   // Refit the newly active terminal after a single-pane view switch: the
@@ -642,45 +863,59 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   const handleConfirmDelete = useCallback(
     async (options: DeleteSessionOptions) => {
-      if (!deletingSession) return;
-      const sessionId = deletingSession.id;
-      const wasActive = sessionId === activeSessionId;
-
-      // Close dialog and show "Deleting" status immediately
+      if (!deletingWorkspace) return;
+      const sessions = deletingWorkspace.sessions;
+      // Close the dialog immediately; the loop, ordering, and toast logic live
+      // in deleteWorkspaceSessions so they are unit-testable without the bundle.
       setDeletingWorkspaceId(null);
-      setSessionStatus(sessionId, "Deleting");
-
-      if (wasActive) {
-        navigate("/");
-      }
-
-      const result = await deleteSession(sessionId, options);
-      if (!result.ok) {
-        // Revert status on failure
-        setSessionStatus(sessionId, "Error");
-        toastBus.handler?.error(result.error || "Failed to delete session");
-        return;
-      }
-
-      // Drop the per-session acp cache so a recreated session with
-      // the same id doesn't briefly show the prior transcript on
-      // remount before fetchReplay clears it.
-      clearAcpCache(sessionId);
-      // Drop the persisted composer draft for the deleted session so its
-      // localStorage key doesn't linger (#1358). Cross-tab / cross-device
-      // deletes go through the startup sweep instead.
-      clearDraft(sessionId);
-      // Same hygiene for persisted diff-comments storage (#1842); cross-tab /
-      // cross-device deletes still fall to the startup sweep.
-      clearStoredComments(sessionId);
-
-      // Server returns `messages` from `perform_deletion` when there's something
-      // user-facing to report (e.g. "Scratch directory kept at: <path>" when
-      // `keep_scratch` is set). Surface the first one so the kept-path is visible.
-      const toast = result.messages?.[0] ?? "Session deleted";
-      toastBus.handler?.info(toast);
+      await deleteWorkspaceSessions(sessions, options, activeSessionId, {
+        setStatus: setSessionStatus,
+        // Drop a deleted session's local-only state (#1358 acp cache + draft,
+        // #1842 diff comments). Cross-tab / cross-device deletes fall to the
+        // startup sweep.
+        purgeLocal: (id) => {
+          clearAcpCache(id);
+          clearDraft(id);
+          clearStoredComments(id);
+        },
+        navigateHome: () => navigate("/"),
+        notify: toastBus.handler,
+      });
     },
-    [deletingSession, activeSessionId, setSessionStatus, navigate],
+    [deletingWorkspace, activeSessionId, setSessionStatus, navigate],
+  );
+
+  // Move-to-trash path (#2489): the safe default. Unlike permanent delete it
+  // deliberately KEEPS the per-session acp cache, draft, and stored comments
+  // so a restore is faithful; only purge clears them. Trashes every session
+  // in the workspace so a multi-session workspace sinks as a whole.
+  const handleConfirmTrash = useCallback(async () => {
+    if (!deletingWorkspace) return;
+    const ids = deletingWorkspace.sessions.map((s) => s.id);
+    if (ids.length === 0) return;
+    const wasActive = activeSessionId != null && ids.includes(activeSessionId);
+
+    setDeletingWorkspaceId(null);
+    for (const id of ids) setSessionStatus(id, "Stopped");
+    if (wasActive) {
+      navigate("/");
+    }
+
+    // The returned snapshot re-buckets each row into Trash immediately
+    // instead of on the next poll. See trashSessions.
+    await trashSessions(ids, {
+      applySession,
+      onError: (id) => setSessionStatus(id, "Error"),
+      notify: toastBus.handler,
+    });
+  }, [deletingWorkspace, activeSessionId, setSessionStatus, applySession, navigate]);
+
+  // Restore a trashed workspace from the sidebar Trash section (#2489).
+  // Restores every session in the workspace (a workspace only lands in Trash
+  // when all of its sessions are trashed), not just the first.
+  const handleRestoreSession = useCallback(
+    (sessionIds: string[]) => restoreSessions(sessionIds, { applySession, notify: toastBus.handler }),
+    [applySession],
   );
 
   const stoppingWorkspace = stoppingWorkspaceId ? workspaces.find((w) => w.id === stoppingWorkspaceId) : null;
@@ -815,11 +1050,31 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // is no split to collapse: it opens the view picker instead (#1452).
   const toggleDiff = useCallback(() => {
     if (isMdUp) {
-      setDiffCollapsed((c) => !c);
+      toggleKind("diff", "right");
     } else {
       setPickerOpen((o) => !o);
     }
-  }, [isMdUp]);
+  }, [isMdUp, toggleKind]);
+
+  // Collapse or restore the whole right dock (the "toggle right panel"
+  // shortcut). Collapse closes every pane docked right; restore reopens the
+  // built-in diff + terminal that live there. ponytail: restore reopens the
+  // defaults rather than remembering the exact pre-collapse set, which is a
+  // fine approximation for a collapse/expand toggle.
+  const toggleRightDock = useCallback(() => {
+    if (!isMdUp) {
+      setPickerOpen((o) => !o);
+      return;
+    }
+    if (rightDockCollapsed) {
+      // Restore the built-in defaults into the right dock.
+      openTab("diff", "right");
+      openTab(terminalTabId(0), "right");
+    } else {
+      // Collapse: close every tab currently in the right dock.
+      for (const id of dockTabs(paneLayout, "right")) closeTab(id);
+    }
+  }, [isMdUp, rightDockCollapsed, paneLayout, openTab, closeTab]);
 
   const handlePickView = useCallback((view: RightPanelView) => {
     setRightPanelView(view);
@@ -898,11 +1153,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const openSidebar = useCallback(() => setSidebarOpen(true), []);
   const openDiff = useCallback(() => {
     if (isMdUp) {
-      setDiffCollapsed(false);
+      openTab("diff", "right");
     } else {
       setPickerOpen(true);
     }
-  }, [isMdUp]);
+  }, [isMdUp, openTab]);
   useEdgeSwipe({
     edge: "left",
     enabled: !sidebarOpen,
@@ -914,7 +1169,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   });
   useEdgeSwipe({
     edge: "right",
-    enabled: diffCollapsed && !!activeSessionId,
+    enabled: rightDockCollapsed && !!activeSessionId,
     onSwipe: openDiff,
   });
 
@@ -973,12 +1228,27 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return;
     }
 
-    if (target === "paired" && diffCollapsed) {
-      // Right panel is collapsed; paired terminal is unmounted. Set the
-      // pending intent so PairedTerminal grabs focus once it mounts and
-      // its PTY is ready, then expand the panel.
+    if (target === "paired") {
+      // The paired shell only mounts when a terminal tab is the active tab of
+      // its group. Prefer a terminal that is already active (and thus mounted)
+      // over the first one, so multi-group layouts focus the live terminal
+      // instead of switching another group's tab.
+      const terminalTabs = (["right", "bottom"] as DockLocation[])
+        .flatMap((d) => dockTabs(paneLayout, d))
+        .filter(isTerminalTabId);
+      const termTab = terminalTabs.find((id) => isActiveTab(paneLayout, id)) ?? terminalTabs[0] ?? terminalTabId(0);
+      const termDock = dockOf(paneLayout, termTab);
+      if (termDock && isActiveTab(paneLayout, termTab)) {
+        // Already the active tab (mounted): move focus synchronously so rapid
+        // agent<->paired toggles stay deterministic.
+        dispatchFocusTerminal("paired");
+        return;
+      }
+      // Not mounted yet: latch the intent and activate/open its tab; the paired
+      // panel grabs focus once its PTY is ready.
       setPendingTerminalFocus("paired");
-      setDiffCollapsed(false);
+      if (termDock) activateTab(termDock, termTab);
+      else openTab(termTab, "right");
       return;
     }
     if (target === "agent" && selectedFilePath) {
@@ -990,7 +1260,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return;
     }
     dispatchFocusTerminal(target);
-  }, [activeSessionId, singlePane, diffCollapsed, selectedFilePath]);
+  }, [activeSessionId, singlePane, paneLayout, openTab, activateTab, selectedFilePath]);
 
   useKeyboardShortcuts(
     useCallback(
@@ -1019,6 +1289,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           }
           if (showPalette) {
             setShowPalette(false);
+            setPaletteQuery("");
             return;
           }
           setShowSessionWizard(false);
@@ -1029,7 +1300,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         },
         onHelp: () => setShowHelp((h) => !h),
         onSettings: () => (showSettings ? handleCloseSettings() : navigate("/settings")),
-        onPalette: () => setShowPalette((p) => !p),
+        onPalette: () => {
+          setPaletteQuery("");
+          setShowPalette((p) => !p);
+        },
         onToggleSidebar: () => setSidebarOpen((o) => !o),
         onSessionSearch: () =>
           setSessionSearchOpen((o) => {
@@ -1044,11 +1318,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             }
             return next;
           }),
-        onToggleRightPanel: () => toggleDiff(),
+        onToggleRightPanel: () => toggleRightDock(),
         onToggleTerminalFocus: handleToggleTerminalFocus,
       }),
       [
         toggleDiff,
+        toggleRightDock,
         showPalette,
         sessionSearchOpen,
         closeSessionSearch,
@@ -1088,6 +1363,20 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     readOnly: !!serverAbout?.read_only,
     onOpenSettingsTab: openSettingsTab,
   });
+  const pluginCommandActions = usePluginCommands(pluginUiEntries, activeSessionId);
+
+  // Conversation-content search for the palette (#2515). paletteQuery is
+  // declared above (near showPalette) so the keyboard handlers can clear it
+  // on close/toggle; consumed here.
+  const { results: conversationHits, loading: conversationSearching } = useConversationSearch(paletteQuery);
+  const conversationActions = useMemo(
+    () =>
+      buildConversationActions(conversationHits, sessions, activeSessionId).map(({ sessionId, ...rest }) => ({
+        ...rest,
+        perform: () => handleSelectSession(sessionId),
+      })),
+    [conversationHits, sessions, activeSessionId, handleSelectSession],
+  );
 
   const renderContent = () => {
     if (showSettings) {
@@ -1146,6 +1435,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       return (
         <MobileMainPane
           view={rightPanelView}
+          pluginPanes={pluginPanes}
           onBackToAgent={() => setRightPanelView("agent")}
           pairedMounted={pairedMounted}
           activeSession={activeSession ?? null}
@@ -1177,72 +1467,120 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       );
     }
 
+    // Render a pane body by id. Passed to the docks as a callback (rather than
+    // building an array of {icon, body} objects here) so the per-session JSX is
+    // constructed inside the dock, not threaded through a prop object.
+    const renderPaneBody = (id: string): ReactNode => {
+      const plugin = pluginPaneById.get(id);
+      if (plugin) return <PluginPaneBody entry={plugin.entry} />;
+      if (id === "agents") {
+        return <BackgroundAgentsPanel sessionId={activeSessionId} />;
+      }
+      if (id === "diff") {
+        return (
+          <DiffPane
+            session={activeSession ?? null}
+            sessionId={activeSessionId}
+            files={diffFiles}
+            perRepoBases={perRepoBases}
+            warning={warning}
+            filesLoading={diffFilesLoading}
+            selectedFilePath={selectedFilePath}
+            selectedRepoName={selectedRepoName}
+            onSelectFile={handleSelectFile}
+            onDiffRefresh={refreshDiffFiles}
+            commentsEnabled={commentsEnabled}
+            commentsCount={diffComments.count}
+            commentsSendEnabled={commentSendEnabled}
+            commentsSendDisabledReason={commentSendDisabledReason}
+            onOpenSendDialog={() => setSendDialogOpen(true)}
+            onDiscardAllComments={diffComments.clearComments}
+          />
+        );
+      }
+      return (
+        <PairedShellPane
+          session={activeSession ?? null}
+          sessionId={activeSessionId}
+          terminalIndex={isTerminalTabId(id) ? terminalIndexOf(id) : 0}
+        />
+      );
+    };
     return (
       <div className="flex-1 flex flex-col min-h-0">
-        <ContentSplit
-          collapsed={diffCollapsed}
-          onToggleCollapse={toggleDiff}
-          left={
-            <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
-              <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
-                {activeSession?.view === "structured" ? (
-                  <Suspense fallback={<AcpLoadingFallback />}>
-                    <StructuredView
-                      key={activeSessionId}
-                      sessionId={activeSessionId!}
-                      acpWorkerState={activeSession.acp_worker_state ?? "absent"}
-                      tool={activeSession.tool}
-                      archivedAt={activeSession.archived_at ?? null}
-                      snoozedUntil={activeSession.snoozed_until ?? null}
-                      onOpenFileRef={handleOpenFileRef}
-                      fileRefSession={activeSession}
+        <PaneDndController groupsByDock={groupsByDock} descriptorFor={paneDescriptor} onPlaceTab={placeVisibleTab}>
+          <ContentSplit
+            collapsed={rightDockCollapsed}
+            onToggleCollapse={toggleDiff}
+            left={
+              <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
+                <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
+                  {activeSession?.view === "structured" ? (
+                    <Suspense fallback={<AcpLoadingFallback />}>
+                      <StructuredView
+                        key={activeSessionId}
+                        sessionId={activeSessionId!}
+                        acpWorkerState={activeSession.acp_worker_state ?? "absent"}
+                        tool={activeSession.tool}
+                        archivedAt={activeSession.archived_at ?? null}
+                        snoozedUntil={activeSession.snoozed_until ?? null}
+                        trashedAt={activeSession.trashed_at ?? null}
+                        onOpenFileRef={handleOpenFileRef}
+                        fileRefSession={activeSession}
+                        onOpenAgentsPane={openAgentsPane}
+                      />
+                    </Suspense>
+                  ) : (
+                    <TerminalSessionStack
+                      activeSessionId={activeSessionId!}
+                      sessions={sessions.filter((session) => session.view !== "structured")}
+                      persistent={webSettings.persistentTerminals}
+                      maxPersistentTerminals={webSettings.maxPersistentTerminals}
                     />
-                  </Suspense>
-                ) : (
-                  <TerminalSessionStack
-                    activeSessionId={activeSessionId!}
-                    sessions={sessions.filter((session) => session.view !== "structured")}
-                    persistent={webSettings.persistentTerminals}
-                    maxPersistentTerminals={webSettings.maxPersistentTerminals}
+                  )}
+                </div>
+
+                {selectedFilePath && activeSessionId && (
+                  <DiffFileViewer
+                    sessionId={activeSessionId}
+                    filePath={selectedFilePath}
+                    repoName={selectedRepoName}
+                    targetLine={selectedFileLine}
+                    revision={revision}
+                    onClose={handleCloseFile}
+                    commentsEnabled={commentsEnabled}
+                    commentsStore={diffComments}
                   />
                 )}
               </div>
-
-              {selectedFilePath && activeSessionId && (
-                <DiffFileViewer
-                  sessionId={activeSessionId}
-                  filePath={selectedFilePath}
-                  repoName={selectedRepoName}
-                  targetLine={selectedFileLine}
-                  revision={revision}
-                  onClose={handleCloseFile}
-                  commentsEnabled={commentsEnabled}
-                  commentsStore={diffComments}
+            }
+            right={
+              <div {...tourAnchor(TOUR_ANCHORS.rightPanel)} className="flex min-h-0 min-w-0 flex-1">
+                <DockGroups
+                  location="right"
+                  groups={rightGroups}
+                  descriptorFor={paneDescriptor}
+                  renderBody={renderPaneBody}
+                  onActivate={(id) => activateTab("right", id)}
+                  onMove={movePaneAny}
+                  onClose={closePaneAny}
+                  onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("right")}
                 />
-              )}
-            </div>
-          }
-          right={
-            <RightPanel
-              session={activeSession ?? null}
-              sessionId={activeSessionId}
-              files={diffFiles}
-              perRepoBases={perRepoBases}
-              warning={warning}
-              filesLoading={diffFilesLoading}
-              selectedFilePath={selectedFilePath}
-              selectedRepoName={selectedRepoName}
-              onSelectFile={handleSelectFile}
-              onDiffRefresh={refreshDiffFiles}
-              commentsEnabled={commentsEnabled}
-              commentsCount={diffComments.count}
-              commentsSendEnabled={commentSendEnabled}
-              commentsSendDisabledReason={commentSendDisabledReason}
-              onOpenSendDialog={() => setSendDialogOpen(true)}
-              onDiscardAllComments={diffComments.clearComments}
+              </div>
+            }
+          />
+          {bottomGroups.length > 0 && (
+            <BottomDock
+              groups={bottomGroups}
+              descriptorFor={paneDescriptor}
+              renderBody={renderPaneBody}
+              onActivate={(id) => activateTab("bottom", id)}
+              onMove={movePaneAny}
+              onClose={closePaneAny}
+              onNewTerminal={serverAbout?.read_only ? undefined : () => addTerminal("bottom")}
             />
-          }
-        />
+          )}
+        </PaneDndController>
         {sendDialogOpen && commentsEnabled && activeSessionId && (
           <SendCommentsDialog
             sessionId={activeSessionId}
@@ -1422,7 +1760,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           onToggleSidebar={handleToggleSidebar}
           onOpenPalette={() => setShowPalette(true)}
           onToggleDiff={toggleDiff}
-          diffCollapsed={diffCollapsed}
+          paneIds={allPaneIds}
+          paneDescriptor={paneDescriptor}
+          isPaneOpen={isPaneOpen}
+          onTogglePane={togglePaneAny}
           onOpenHelp={handleOpenHelp}
           onOpenAbout={handleOpenAbout}
           onStartTutorial={tour.startTour}
@@ -1433,7 +1774,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           onOpenTips={tips.open}
           onGoDashboard={handleGoDashboard}
           sidebarColumnVisible={!showSettings && sidebarOpen}
-          rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !diffCollapsed}
+          rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
         />
 
         <DisconnectBanner />
@@ -1445,6 +1786,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             <WorkspaceSidebar
               groups={sidebarGroups}
               nestedGroups={nestedGroups}
+              trashedWorkspaces={trashedWorkspaces}
               onToggleSubgroup={toggleSubgroupCollapsed}
               onReorderWorkspaces={handleReorderWorkspaces}
               onReorderGroups={reorderRepoGroups}
@@ -1472,11 +1814,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               onRemoveProject={handleRemoveProject}
               onSettings={handleOpenSettings}
               onDeleteSession={handleDeleteSession}
+              onRestoreSession={handleRestoreSession}
               onStopSession={handleStopSession}
               onStartSession={handleStartSession}
               readOnly={serverAbout?.read_only}
               sortMode={sidebarSortMode}
-              onSortModeChange={setSidebarSortMode}
+              onSortModeChange={selectSidebarSortMode}
+              pluginSortRef={pluginSortRef}
+              onPluginSortChange={setPluginSortRef}
               axis={sidebarAxis}
               onAxisChange={setSidebarAxis}
             />
@@ -1536,11 +1881,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           <DeleteSessionDialog
             sessionTitle={deletingSession.title}
             branchName={deletingSession.branch}
-            hasManagedWorktree={deletingSession.has_managed_worktree}
+            hasManagedWorktree={deletingSession.has_cleanable_worktree ?? false}
             isSandboxed={deletingSession.is_sandboxed}
             isScratch={deletingSession.scratch}
             cleanupDefaults={deletingSession.cleanup_defaults}
+            defaultToTrash={!deletingSession.trashed_at && deletingSession.cleanup_defaults.delete_to_trash}
+            extraSessionCount={deletingWorkspace ? deletingWorkspace.sessions.length - 1 : 0}
             onConfirm={handleConfirmDelete}
+            onTrash={handleConfirmTrash}
             onCancel={() => setDeletingWorkspaceId(null)}
           />
         )}
@@ -1555,14 +1903,20 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
         <CommandPalette
           open={showPalette}
-          onClose={() => setShowPalette(false)}
-          actions={[...commandActions, ...settingsCommands]}
+          onClose={() => {
+            setShowPalette(false);
+            setPaletteQuery("");
+          }}
+          actions={[...commandActions, ...conversationActions, ...settingsCommands, ...pluginCommandActions]}
+          onSearchChange={setPaletteQuery}
+          searching={conversationSearching}
         />
 
         {activeWorkspace && activeSession && (
           <MobileRightPanelPicker
             open={pickerOpen && singlePane}
             active={rightPanelView}
+            pluginPanes={pluginPanes}
             onSelect={handlePickView}
             onClose={() => setPickerOpen(false)}
           />

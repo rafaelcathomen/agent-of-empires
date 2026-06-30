@@ -3,6 +3,7 @@ import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import { ansiToLines, wrapLine } from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
+import { writeClipboard } from "../lib/clipboard";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
@@ -81,6 +82,17 @@ export interface MobileLiveTerminalProps {
    *  Used instead of capture-window scrolling when the frame reports the
    *  pane is such an app. */
   forwardWheel: (up: boolean, sgr: boolean, col: number, row: number) => void;
+  /** Forward a mouse button press/drag/release to a full-screen mouse app.
+   *  Used only when the frame reports the pane is such an app (altScreen &&
+   *  mouse), so a click drives the app instead of selecting page text. */
+  forwardButton: (
+    baseButton: number,
+    release: boolean,
+    motion: boolean,
+    sgr: boolean,
+    col: number,
+    row: number,
+  ) => void;
   /** Virtual Ctrl modifier from the mobile toolbar. */
   ctrlActiveRef: RefObject<boolean>;
   clearCtrl: () => void;
@@ -207,6 +219,7 @@ export function MobileLiveTerminal({
   returnToLive,
   sendData,
   forwardWheel,
+  forwardButton,
   ctrlActiveRef,
   clearCtrl,
   inputRef,
@@ -428,6 +441,12 @@ export function MobileLiveTerminal({
   // touch Y while forwarding a single-finger drag.
   const wheelAccumRef = useRef(0);
   const touchForwardYRef = useRef<number | null>(null);
+  // Base button (0/1/2) of an in-progress forwarded mouse press, so drag/
+  // release only forward if the press was (latches like the TUI's
+  // `mouse_forward_btn`), plus the last forwarded cell so a pixel-granular
+  // drag emits at most one motion report per cell.
+  const forwardBtnRef = useRef<number | null>(null);
+  const lastForwardCellRef = useRef<{ col: number; row: number } | null>(null);
   useEffect(() => {
     rowsRef.current = screenRows || rowsRef.current;
   }, [screenRows]);
@@ -626,6 +645,60 @@ export function MobileLiveTerminal({
       forwardWheelDelta(e.deltaY * factor, e.clientX, e.clientY);
     },
     [lineH, forwardWheelDelta],
+  );
+
+  // Mouse button (click/drag) forwarding for a full-screen mouse app, the
+  // pointer analog of the wheel path above. Touch keeps its own scroll/drag
+  // handlers, so this is gated to physical mouse input; Shift stays local so
+  // the user can still select page text. Coordinates come from `pointerCell`.
+  const onPointerDown = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerType !== "mouse" || !forwardModeRef.current || e.shiftKey) return;
+      const base = e.button === 1 ? 1 : e.button === 2 ? 2 : e.button === 0 ? 0 : -1;
+      if (base < 0) return;
+      e.preventDefault();
+      // Keep the hidden input focused so the physical keyboard still types
+      // even though we suppressed the click's default focus.
+      inputRef.current?.focus();
+      const { col, row } = pointerCell(e.clientX, e.clientY);
+      forwardButton(base, false, false, mouseSgrRef.current, col, row);
+      forwardBtnRef.current = base;
+      lastForwardCellRef.current = { col, row };
+      try {
+        (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      } catch {
+        // jsdom / unsupported: capture is a nicety, not required.
+      }
+    },
+    [pointerCell, forwardButton, inputRef],
+  );
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerType !== "mouse" || forwardBtnRef.current == null) return;
+      const { col, row } = pointerCell(e.clientX, e.clientY);
+      const last = lastForwardCellRef.current;
+      if (last && last.col === col && last.row === row) return; // one report per cell
+      e.preventDefault();
+      lastForwardCellRef.current = { col, row };
+      forwardButton(forwardBtnRef.current, false, true, mouseSgrRef.current, col, row);
+    },
+    [pointerCell, forwardButton],
+  );
+  const endPointerForward = useCallback(
+    (e: React.PointerEvent) => {
+      if (e.pointerType !== "mouse" || forwardBtnRef.current == null) return;
+      e.preventDefault();
+      const { col, row } = pointerCell(e.clientX, e.clientY);
+      forwardButton(forwardBtnRef.current, true, false, mouseSgrRef.current, col, row);
+      forwardBtnRef.current = null;
+      lastForwardCellRef.current = null;
+      try {
+        (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+      } catch {
+        // Capture may never have been taken (see onPointerDown).
+      }
+    },
+    [pointerCell, forwardButton],
   );
 
   // --- pinch zoom (two-finger) ---------------------------------------------
@@ -914,7 +987,7 @@ export function MobileLiveTerminal({
           case "Backspace":
             return "\x7f";
           case "Tab":
-            return "\t";
+            return e.shiftKey ? "\x1b[Z" : "\t";
           case "Escape":
             return "\x1b";
           case "ArrowUp":
@@ -934,8 +1007,24 @@ export function MobileLiveTerminal({
         sendData(seq);
         return;
       }
-      // Hardware Ctrl+letter chords (bluetooth keyboards).
-      if (e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1) {
+      // Ctrl+Shift+C copies the current terminal selection (the terminal-
+      // emulator convention), distinct from plain Ctrl+C below which stays
+      // SIGINT. The hidden input is focused, so the browser's own copy would
+      // target the empty textarea rather than the rendered selection; read the
+      // document selection and copy it explicitly. No selection is a no-op, not
+      // a control code.
+      if (e.ctrlKey && e.shiftKey && !e.metaKey && !e.altKey && e.key.toLowerCase() === "c") {
+        e.preventDefault();
+        const text = window.getSelection()?.toString() ?? "";
+        if (text) void writeClipboard(text);
+        return;
+      }
+      // Hardware Ctrl+letter chords (bluetooth keyboards). Ctrl+V (and
+      // Ctrl+Shift+V) is the exception: on Linux/Windows it is the paste
+      // shortcut, so let the browser's native paste event fire (onPaste turns
+      // it into a bracketed paste) instead of swallowing it into a literal ^V
+      // to tmux. Mac's Cmd+C / Cmd+V already fall through via the metaKey guard.
+      if (e.ctrlKey && !e.metaKey && !e.altKey && e.key.length === 1 && e.key.toLowerCase() !== "v") {
         const code = e.key.toUpperCase().charCodeAt(0);
         if (code >= 65 && code <= 90) {
           e.preventDefault();
@@ -1001,11 +1090,29 @@ export function MobileLiveTerminal({
         onScroll={onScroll}
         onWheel={onWheel}
         onClick={focusInputOnTap}
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={endPointerForward}
+        onPointerCancel={endPointerForward}
+        // A forwarded right-click is the app's to handle; don't pop the
+        // browser context menu over it.
+        onContextMenu={(e) => {
+          if (forwardModeRef.current) e.preventDefault();
+        }}
         onTouchStart={onTouchStart}
         onTouchMove={onTouchMove}
         onTouchEnd={onTouchEnd}
         onTouchCancel={onTouchCancel}
-        className={`absolute inset-0 font-mono flex flex-col ${
+        // Leave 8px of breathing room below the grid so the cursor/input row
+        // doesn't sit flush against the pane's bottom edge. This is a bottom
+        // inset rather than padding on purpose: an `absolute inset-0` child
+        // fills its containing block's padding box, so padding here would be
+        // overlapped (no gap), and padding that DID register would inflate
+        // `clientHeight`, over-counting the rows reported to tmux below. A
+        // bottom inset shrinks the measured box instead, so the grid math stays
+        // honest and the exposed strip shows the wrapper's matching --term-bg,
+        // reading as terminal inner-padding.
+        className={`absolute inset-x-0 top-0 bottom-[8px] font-mono flex flex-col ${
           forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-hidden"
         }`}
         style={{
@@ -1013,8 +1120,17 @@ export function MobileLiveTerminal({
           lineHeight: `${lineH}px`,
           background: "var(--term-bg, #1c1c1f)",
           color: "var(--term-fg, #e4e4e7)",
+          // A terminal is a fixed grid: never ligate or substitute contextual
+          // glyphs (e.g. `->`, `!=`, `==`), which would merge cells and read as
+          // fuzz. Inherited by the row spans below.
+          fontVariantLigatures: "none",
+          fontFeatureSettings: '"liga" 0, "calt" 0',
           overscrollBehavior: "contain",
-          WebkitOverflowScrolling: "touch",
+          // Do NOT set `-webkit-overflow-scrolling: touch` here. It promotes
+          // this opaque scroll region to a composited layer that macOS/iOS
+          // Safari rasterizes at 1x, making the DOM terminal text look
+          // pixelated/low-res. It is deprecated and a no-op on iOS 13+
+          // (momentum scrolling is always on), so omitting it costs nothing.
           // The spacer model keeps above-viewport pixels invariant by
           // construction, so a preserved scrollTop is always correct.
           // The browser's own scroll anchoring doesn't know that: when

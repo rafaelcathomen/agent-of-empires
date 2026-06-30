@@ -24,7 +24,7 @@ pub enum HookProgress {
 /// active [`crate::session::recovery::HookTimeoutScope`].
 ///
 /// `run_hook_with_timeout` is the sole producer of this value, and it only
-/// runs when [`crate::session::recovery::current_hook_timeout`] returns
+/// runs when `crate::session::recovery::current_hook_timeout` returns
 /// `Some`, which production code installs only inside the startup-recovery
 /// cascade (`run_recovery_for_instance`). Current production callers rely on
 /// this invariant: observing a `HookTimeout` in the error chain implies the
@@ -62,7 +62,7 @@ const REPO_OVERRIDABLE_SECTIONS: &[&str] = &[
 /// Repository-level configuration loaded from `.agent-of-empires/config.toml`.
 ///
 /// Stored as a sparse override tree like [`ProfileConfig`] (#1692): section
-/// tables keyed by config-section name. Only [`REPO_OVERRIDABLE_SECTIONS`] are
+/// tables keyed by config-section name. Only `REPO_OVERRIDABLE_SECTIONS` are
 /// honored; any other section is dropped on merge and on save, so a repo can
 /// never override personal/global settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -144,7 +144,7 @@ impl HooksConfig {
 /// Unlike [`HooksConfig`], which runs inside the container for sandboxed
 /// sessions, these run on the host before a sandbox container comes up. They
 /// are profile/global only and are never honored from a repo's
-/// `.agent-of-empires/config.toml` (see [`REPO_OVERRIDABLE_SECTIONS`]), because
+/// `.agent-of-empires/config.toml` (see `REPO_OVERRIDABLE_SECTIONS`), because
 /// a checked-out repo must not be able to run host commands.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostHooksConfig {
@@ -1099,7 +1099,7 @@ fn run_hooks_streamed(
 
 /// Execute a list of hook commands in the given directory.
 ///
-/// `extra_env` is exported to each hook process; see [`lifecycle_env_vars`]
+/// `extra_env` is exported to each hook process; see `lifecycle_env_vars`
 /// for the canonical set of session env vars. Pass `&[]` if no session context
 /// is available.
 pub fn execute_hooks(
@@ -1129,10 +1129,10 @@ pub fn execute_hooks_in_container(
 
 /// Resolve `host_hooks.before_start` from global + profile config only.
 ///
-/// Deliberately resolved without repo overrides ([`resolve_config_or_warn`]
+/// Deliberately resolved without repo overrides ([`super::profile_config::resolve_config_or_warn`]
 /// rather than [`resolve_config_with_repo_or_warn`]) so a repo can never
 /// contribute host commands; this is belt-and-suspenders on top of
-/// `host_hooks` being excluded from [`REPO_OVERRIDABLE_SECTIONS`].
+/// `host_hooks` being excluded from `REPO_OVERRIDABLE_SECTIONS`.
 pub fn resolve_before_start_hooks(profile: &str) -> Vec<String> {
     let resolved = super::config::effective_profile(profile);
     super::profile_config::resolve_config_or_warn(&resolved)

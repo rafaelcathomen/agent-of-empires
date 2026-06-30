@@ -27,6 +27,7 @@ pub mod smart_rename;
 pub mod stop;
 mod storage;
 pub(crate) mod sync;
+pub mod trash;
 pub mod worktree_edit;
 
 pub use crate::sound::SoundConfig;
@@ -34,23 +35,25 @@ pub use crate::status_hooks::StatusHookConfig;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_telemetry_settings, get_update_settings, load_config, save_config,
-    validate_snooze_duration, ClickAction, Config, ContainerRuntimeName, DefaultTerminalMode,
-    GroupByMode, NewSessionAttachMode, PluginConfig, RowTagMode, SandboxConfig, SessionConfig,
-    TelemetryConfig, ThemeConfig, TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode,
-    UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
+    validate_snooze_duration, CapabilityGrant, ClickAction, Config, ContainerRuntimeName,
+    DefaultTerminalMode, GroupByMode, NewSessionAttachMode, PluginConfig, RowTagMode,
+    SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxClipboardMode, TmuxMouseMode,
+    TmuxStatusBarMode, UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
 pub use groups::{
-    append_archived_section, append_archived_section_by_project, archived_project_sub_path,
-    flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles,
-    is_archived_section_path, is_within_archived_section, resolve_group_path, FolderColor, Group,
-    GroupTree, Item, ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH,
+    append_archived_section, append_archived_section_by_project, append_trash_section,
+    archived_project_sub_path, flatten_sessions_by_attention, flatten_tree,
+    flatten_tree_all_profiles, is_archived_section_path, is_trash_section_path,
+    is_within_archived_section, is_within_trash_section, resolve_group_path, FolderColor, Group,
+    GroupTree, Item, ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, TRASH_SECTION_NAME,
+    TRASH_SECTION_PATH,
 };
 pub(crate) use instance::{persist_session_to_storage, ResumeIntent, SidWrite};
 pub use instance::{
-    EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, StartOutcome,
-    Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, SessionBucket,
+    StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
     TMUX_SESSION_GONE_ERROR,
 };
 
@@ -100,7 +103,7 @@ use std::time::Duration;
 
 /// App dir name under the XDG config base (`$XDG_CONFIG_HOME`, default
 /// `~/.config`). Always used on Linux; used on macOS when the user opts into
-/// the XDG layout (see [`get_app_dir_path`] and issue #1948). Debug builds use
+/// the XDG layout (see `get_app_dir_path` and issue #1948). Debug builds use
 /// a `-dev` suffix so a `cargo run` instance shares no state with an installed
 /// release binary.
 pub const APP_DIR_NAME_XDG: &str = if cfg!(debug_assertions) {
@@ -306,7 +309,7 @@ pub fn get_profile_dir(profile: &str) -> Result<PathBuf> {
 /// Use this for read-only operations (loading config, looking up paths)
 /// where the directory-creation side effect of [`get_profile_dir`] would
 /// pollute `profiles/` with empty stub directories. Notably, GET
-/// /api/settings?profile=<name> for an unknown profile used to create
+/// `/api/settings?profile=<name>` for an unknown profile used to create
 /// that profile's directory as a side effect of the read, which then
 /// made the unknown profile appear in subsequent GET /api/profiles
 /// responses. Routing those reads through this helper keeps the lookup

@@ -424,10 +424,9 @@ mod serve {
             return;
         };
 
-        // Serialize against manual rename / worktree edits on this session.
-        let lock = state.instance_lock(&session_id).await;
-        let _serialized = lock.lock().await;
-        apply_title_only(&state, &session_id, &profile, &new_title).await;
+        // Serialization against manual rename / worktree edits is handled
+        // inside apply_auto_title via the per-session instance lock.
+        apply_auto_title(&state, &session_id, &profile, &new_title).await;
     }
 
     /// Run the agent one-shot in the session's working directory, capturing
@@ -483,10 +482,23 @@ mod serve {
         }
     }
 
-    /// Persist the new title (re-checking the still-default gate under the
-    /// storage lock) then mirror it into the in-memory instance list so
-    /// connected clients see it without waiting for a reload.
-    async fn apply_title_only(state: &Arc<AppState>, id: &str, profile: &str, new_title: &str) {
+    /// Apply an automatically-generated title to a session, persisting to
+    /// storage and mirroring the in-memory instance list so connected clients
+    /// see it without a reload. The write happens only while the current title
+    /// is still a default civ name or still equals the last auto title we wrote
+    /// (`title_is_auto_overwritable`), so a manual rename is never clobbered.
+    /// Serializes against manual renames / worktree edits on this session via
+    /// the per-session instance lock, and mirrors memory only when the storage
+    /// write actually happened so the two never diverge.
+    pub(crate) async fn apply_auto_title(
+        state: &Arc<AppState>,
+        id: &str,
+        profile: &str,
+        new_title: &str,
+    ) {
+        let lock = state.instance_lock(id).await;
+        let _serialized = lock.lock().await;
+
         let storage = match crate::session::storage::Storage::new(profile, state.file_watch.clone())
         {
             Ok(s) => s,
@@ -499,17 +511,20 @@ mod serve {
         let title_owned = new_title.to_string();
         let persisted = tokio::task::spawn_blocking(move || {
             storage.update(|instances, _groups| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
-                    if is_default_civ_name(&inst.title) {
-                        inst.title = title_owned.clone();
-                    }
+                let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) else {
+                    return Ok(false);
+                };
+                if title_is_auto_overwritable(inst) {
+                    inst.title = title_owned.clone();
+                    inst.last_auto_title = Some(title_owned.clone());
+                    return Ok(true);
                 }
-                Ok(())
+                Ok(false)
             })
         })
         .await;
-        match persisted {
-            Ok(Ok(())) => {}
+        let wrote = match persisted {
+            Ok(Ok(wrote)) => wrote,
             Ok(Err(e)) => {
                 tracing::warn!(target: "smart_rename", session = %id, "persist failed: {e}");
                 return;
@@ -518,15 +533,27 @@ mod serve {
                 tracing::warn!(target: "smart_rename", session = %id, "persist join failed: {e}");
                 return;
             }
+        };
+        if !wrote {
+            return;
         }
 
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            if is_default_civ_name(&inst.title) {
-                tracing::info!(target: "smart_rename", session = %id, old = %inst.title, new = %new_title, "renamed session from first message");
-                inst.title = new_title.to_string();
-            }
+            tracing::info!(target: "smart_rename", session = %id, old = %inst.title, new = %new_title, "auto-renamed session");
+            inst.title = new_title.to_string();
+            inst.last_auto_title = Some(new_title.to_string());
         }
+    }
+
+    /// Whether an automatic renamer may overwrite this session's title: either
+    /// it is still a default civ name (never explicitly set), or it still
+    /// matches the last title an auto renamer wrote. A manual rename leaves
+    /// `title` diverged from `last_auto_title`, which freezes it against auto
+    /// writes.
+    pub(crate) fn title_is_auto_overwritable(inst: &crate::session::instance::Instance) -> bool {
+        is_default_civ_name(&inst.title)
+            || inst.last_auto_title.as_deref() == Some(inst.title.as_str())
     }
 
     #[cfg(test)]
@@ -544,6 +571,28 @@ mod serve {
                 "title this".to_string(),
             ];
             assert!(run_oneshot(&argv, "").await.is_none());
+        }
+
+        #[test]
+        fn auto_overwritable_tracks_until_manual_rename() {
+            use crate::session::instance::Instance;
+            // A still-default civ name is overwritable.
+            let mut inst = Instance::new("Britons", "/tmp");
+            assert!(title_is_auto_overwritable(&inst));
+            // After an auto write, title == last_auto_title, so a forced
+            // retry can still replace an automatic title.
+            inst.title = "Fix login redirect".to_string();
+            inst.last_auto_title = Some("Fix login redirect".to_string());
+            assert!(title_is_auto_overwritable(&inst));
+            // A manual rename diverges title from last_auto_title: frozen.
+            inst.title = "Production hotfix".to_string();
+            assert!(!title_is_auto_overwritable(&inst));
+            // Legacy record: a non-default title with no recorded auto title
+            // is left untouched.
+            let mut legacy = Instance::new("Vikings", "/tmp");
+            legacy.title = "Hand-picked name".to_string();
+            legacy.last_auto_title = None;
+            assert!(!title_is_auto_overwritable(&legacy));
         }
     }
 }

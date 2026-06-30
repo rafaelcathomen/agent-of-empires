@@ -368,6 +368,14 @@ pub struct AppState {
     #[cfg(feature = "serve")]
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
+    /// The Tier 1 plugin worker host. `None` in test harnesses that do not
+    /// stand up a host; `Some` in a live daemon.
+    #[cfg(feature = "serve")]
+    pub plugin_host: Option<Arc<crate::plugin::host::PluginHost>>,
+    /// Tracks in-flight web plugin install / update / uninstall jobs so the
+    /// dashboard can tail their host-side log. In-memory; see
+    /// `api::plugins::PluginJobRegistry`.
+    pub plugin_jobs: Arc<crate::server::api::plugins::PluginJobRegistry>,
     /// Epoch-millis timestamp of the most recent authenticated API request.
     /// Updated by auth middleware on every successful auth. The push consumer
     /// checks this to suppress notifications when someone is actively using
@@ -748,6 +756,31 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         supervisor.hydrate_seqs(acp_event_store.all_session_seqs());
         supervisor
     };
+    // The Tier 1 plugin worker host. Opening it (the plugin event-bus database,
+    // the worker log dir) is cheap and side-effect-free until workers launch,
+    // which happens after the daemon is up. A failure here is logged, not fatal:
+    // the daemon serves fine without plugin workers.
+    // The host API includes mutating session.meta.set/cas, so a read-only
+    // daemon must not run plugin workers at all: gate the host on !read_only.
+    #[cfg(feature = "serve")]
+    let plugin_host = if read_only {
+        tracing::info!(target: "plugin.host", "plugin host disabled in read-only serve mode");
+        None
+    } else {
+        match crate::session::get_app_dir() {
+            Ok(app_dir) => match crate::plugin::host::PluginHost::new(&app_dir, profile) {
+                Ok(host) => Some(host),
+                Err(e) => {
+                    tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
+                None
+            }
+        }
+    };
 
     // Telemetry (opt-in, no-op otherwise): announce the serve surface on boot.
     // The boot announcement fires here, before transport setup, so a launch
@@ -977,6 +1010,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         acp_event_store: acp_event_store.clone(),
         #[cfg(feature = "serve")]
         acp_supervisor: acp_supervisor.clone(),
+        #[cfg(feature = "serve")]
+        plugin_host: plugin_host.clone(),
+        plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),
         push: push_state,
         push_enabled,
         web_config: config.web.clone(),
@@ -1042,6 +1078,39 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                     tokio::select! {
                         _ = interval.tick() => {
                             crate::session::recovery::gc_recently_restarted(&gc_map);
+                        }
+                        _ = shutdown.cancelled() => break,
+                    }
+                }
+            },
+        );
+    }
+
+    // Trash retention sweep: auto-purge trashed sessions past their
+    // retention window. First tick fires immediately (startup sweep), then
+    // hourly. The daemon is the sole enforcer so there is no multi-process
+    // purge race; without a daemon, expired trash is purged on the next
+    // daemon start or by an explicit manual purge. Skipped entirely in
+    // read-only mode: a read-only daemon must not permanently delete
+    // sessions in the background, since that bypasses every handler's
+    // read-only guard. See #2489.
+    if !state.read_only {
+        let sweep_state = state.clone();
+        let shutdown = state.shutdown.clone();
+        crate::task_util::spawn_supervised(
+            "server.trash_retention_sweep",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                // One-shot startup backfill: relocate trashed worktrees still
+                // in the active dir (rows trashed before relocation existed)
+                // and heal any pointer a crash left stale. See #2522.
+                crate::server::api::reconcile_trashed_worktrees(&sweep_state).await;
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            crate::server::api::purge_expired_trash(&sweep_state).await;
                         }
                         _ = shutdown.cancelled() => break,
                     }
@@ -1168,6 +1237,28 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // dwell + cooldown, sends pushes. No-op when push_state is None
     // (feature disabled via web.notifications_enabled=false).
     push::spawn_consumer(state.clone());
+
+    // Launch plugin workers for every active plugin that declares a runtime.
+    // Non-blocking: each worker runs in its own supervised task. A daemon with
+    // no community plugin workers (the common case) does nothing here.
+    #[cfg(feature = "serve")]
+    if let Some(host) = state.plugin_host.clone() {
+        host.start(&crate::plugin::registry()).await;
+    }
+
+    // Opt-in clean-only plugin auto-update sweep (off by default). Spawned
+    // non-blocking so daemon startup never waits on git/network; freshly applied
+    // updates are picked up on the next daemon restart. The plugin host (when
+    // running) is passed as the notifier so a consent-needed skip surfaces as a
+    // dashboard notification, not just a log line.
+    let update_notifier = state
+        .plugin_host
+        .clone()
+        .map(|h| h as std::sync::Arc<dyn crate::plugin::auto_update::UpdateNotifier>);
+    crate::plugin::auto_update::spawn_if_enabled(
+        &crate::session::Config::load_or_warn(),
+        update_notifier,
+    );
 
     rate_limiter.spawn_cleanup_task(state.shutdown.clone());
     login_manager.spawn_cleanup_task(state.shutdown.clone());
@@ -1319,6 +1410,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
         shutdown_state.shutdown.cancel();
+        // Reap plugin workers before the force-exit deadline so no worker tree
+        // is left behind when the daemon stops.
+        #[cfg(feature = "serve")]
+        if let Some(host) = shutdown_state.plugin_host.clone() {
+            host.shutdown().await;
+        }
         tokio::spawn(async {
             tokio::time::sleep(SHUTDOWN_GRACE).await;
             tracing::warn!(
@@ -1372,6 +1469,9 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions",
             get(api::list_sessions).post(api::create_session),
         )
+        // Static segment; registered before /api/sessions/{id} so the
+        // literal "search" never resolves as a session id. See #2515.
+        .route("/api/sessions/search", get(api::search_sessions))
         .route("/api/recent-projects", get(api::get_recent_projects))
         .route(
             "/api/workspace-ordering",
@@ -1419,6 +1519,8 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/snooze",
             patch(api::update_session_snooze),
         )
+        .route("/api/sessions/{id}/trash", post(api::trash_session))
+        .route("/api/sessions/{id}/restore", post(api::restore_session))
         .route(
             "/api/sessions/{id}/unread",
             patch(api::update_session_unread),
@@ -1429,7 +1531,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             post(api::force_smart_rename),
         )
         .route("/api/sessions/{id}/start", post(api::start_session))
-        .route("/api/sessions/{id}/terminal", post(api::ensure_terminal))
+        .route(
+            "/api/sessions/{id}/terminal",
+            post(api::ensure_terminal).delete(api::kill_terminal),
+        )
         .route(
             "/api/sessions/{id}/container-terminal",
             post(api::ensure_container_terminal),
@@ -1468,13 +1573,42 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api::get_settings).patch(api::update_settings),
         )
         .route("/api/settings/schema", get(api::get_settings_schema))
+        .route("/api/settings/resolved", get(api::get_settings_resolved))
         .route("/api/tips", get(api::get_tips))
         .route("/api/tips/show", post(api::set_show_tips))
         .route("/api/app-state/tip-seen", post(api::mark_tip_seen))
         // Plugin management. The enable/disable toggle gates on read-only +
         // elevation inside the handler.
         .route("/api/plugins", get(api::list_plugins))
+        .route("/api/plugins/commands", get(api::plugin_commands))
+        .route("/api/plugins/ui-state", get(api::plugin_ui_state))
+        .route("/api/plugins/updates", get(api::plugin_updates))
+        .route("/api/plugins/discover", get(api::plugin_discover))
+        .route("/api/plugins/details", get(api::plugin_details))
         .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
+        .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
+        .route(
+            "/api/plugins/install/preview",
+            post(api::preview_plugin_install),
+        )
+        .route("/api/plugins/install", post(api::start_plugin_install))
+        .route(
+            "/api/plugins/{id}/uninstall",
+            post(api::start_plugin_uninstall),
+        )
+        .route("/api/plugins/jobs/{job_id}", get(api::plugin_job_status))
+        .route(
+            "/api/plugins/{id}/update/preview",
+            get(api::plugin_update_preview),
+        )
+        .route(
+            "/api/plugins/{id}/update/apply",
+            post(api::apply_plugin_update),
+        )
+        .route(
+            "/api/plugins/{id}/update/dismiss",
+            post(api::dismiss_plugin_update),
+        )
         .route(
             "/api/app-state/web-tour-seen",
             post(api::mark_web_tour_seen),
@@ -1700,10 +1834,12 @@ async fn http_request_span(
 ///   runtime (terminal font-size updates) and Tailwind v4 emits inline
 ///   `<style>` blocks in dev. Blocking inline styles breaks xterm.js's
 ///   rendered viewport.
-/// - `img-src 'self' data: https://github.com https://avatars.githubusercontent.com`:
+/// - `img-src 'self' data: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com`:
 ///   repo-owner avatars are loaded from `github.com/{user}.png` which 302s
 ///   to `avatars.githubusercontent.com`; CSP checks both URLs across the
 ///   redirect, so both hosts must be allowed. `data:` covers inline icons.
+///   `raw.githubusercontent.com` serves plugin screenshots resolved by the
+///   plugin detail endpoint (#2484).
 /// - `font-src 'self'`: Geist fonts are bundled under /fonts/.
 /// - `connect-src 'self' ws: wss:`: REST + PTY WebSocket to same origin.
 /// - `frame-ancestors 'none'`: CSP-native equivalent of X-Frame-Options.
@@ -1712,7 +1848,7 @@ async fn http_request_span(
 const CSP: &str = "default-src 'self'; \
     script-src 'self' 'wasm-unsafe-eval'; \
     style-src 'self' 'unsafe-inline'; \
-    img-src 'self' data: https://github.com https://avatars.githubusercontent.com; \
+    img-src 'self' data: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com; \
     font-src 'self'; \
     connect-src 'self' ws: wss:; \
     frame-ancestors 'none'; \
@@ -3595,14 +3731,32 @@ async fn acp_event_listener(state: Arc<AppState>) {
             let session_id = frame.session_id.clone();
             let approval_title = approval.tool_call.name.clone();
             let destructive = approval.destructive;
+            let seq = frame.seq;
             tokio::spawn(async move {
                 acp_ws::trigger_approval_push(
                     &state_for_push,
                     &session_id,
                     &approval_title,
                     destructive,
+                    seq,
                 )
                 .await;
+            });
+        }
+
+        // Clear push: when the approval is handled (on any device), retract
+        // the "needs approval" notification that the request push raised, so
+        // a backgrounded phone or second computer does not keep showing a
+        // stale alert for an already-resolved request. See #2491.
+        if matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::ApprovalResolved { .. }
+        ) {
+            let state_for_push = state.clone();
+            let session_id = frame.session_id.clone();
+            let seq = frame.seq;
+            tokio::spawn(async move {
+                acp_ws::trigger_approval_clear_push(&state_for_push, &session_id, seq).await;
             });
         }
 
@@ -3616,8 +3770,23 @@ async fn acp_event_listener(state: Arc<AppState>) {
             let state_for_push = state.clone();
             let session_id = frame.session_id.clone();
             let question = elicitation.message.clone();
+            let seq = frame.seq;
             tokio::spawn(async move {
-                acp_ws::trigger_question_push(&state_for_push, &session_id, &question).await;
+                acp_ws::trigger_question_push(&state_for_push, &session_id, &question, seq).await;
+            });
+        }
+
+        // Clear push for an answered question, mirroring the approval clear
+        // above. See #2491.
+        if matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::ElicitationResolved { .. }
+        ) {
+            let state_for_push = state.clone();
+            let session_id = frame.session_id.clone();
+            let seq = frame.seq;
+            tokio::spawn(async move {
+                acp_ws::trigger_question_clear_push(&state_for_push, &session_id, seq).await;
             });
         }
 
@@ -3998,6 +4167,8 @@ pub mod test_support {
             acp_events_tx,
             acp_event_store: event_store,
             acp_supervisor: supervisor,
+            plugin_host: None,
+            plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),
             push: None,
             push_enabled: false,
             web_config: crate::session::config::WebConfig::default(),
@@ -5028,7 +5199,7 @@ mod tests {
         for needle in [
             "default-src 'self'",
             "script-src 'self' 'wasm-unsafe-eval'",
-            "img-src 'self' data: https://github.com https://avatars.githubusercontent.com",
+            "img-src 'self' data: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com",
             "connect-src 'self' ws: wss:",
             "frame-ancestors 'none'",
         ] {

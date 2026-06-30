@@ -85,7 +85,7 @@ impl InfoDialog {
     }
 
     /// Choose which end of an overflowing message stays visible. Defaults to
-    /// [`ScrollMode::Top`]; error dialogs override to [`ScrollMode::Tail`] so
+    /// `ScrollMode::Top`; error dialogs override to `ScrollMode::Tail` so
     /// the trailing payload (panic message, hook output) isn't scrolled off.
     pub fn with_scroll_mode(mut self, mode: ScrollMode) -> Self {
         self.scroll_mode = mode;

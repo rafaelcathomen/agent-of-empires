@@ -233,7 +233,11 @@ pub async fn reconcile_acp_workers(
         instances
             .iter()
             .filter(|i| {
-                i.is_structured() && !i.is_archived() && !i.is_snoozed() && !i.is_idle_dormant()
+                i.is_structured()
+                    && !i.is_archived()
+                    && !i.is_snoozed()
+                    && !i.is_trashed()
+                    && !i.is_idle_dormant()
             })
             .map(|i| {
                 (
@@ -506,7 +510,11 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
         instances
             .iter()
             .filter(|i| {
-                i.is_structured() && !i.is_archived() && !i.is_snoozed() && !i.is_idle_dormant()
+                i.is_structured()
+                    && !i.is_archived()
+                    && !i.is_snoozed()
+                    && !i.is_trashed()
+                    && !i.is_idle_dormant()
             })
             .map(|i| (i.id.clone(), i.source_profile.clone()))
             .collect()
@@ -826,6 +834,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
                 i.is_structured()
                     && !i.is_archived()
                     && !i.is_snoozed()
+                    && !i.is_trashed()
                     && !i.is_idle_dormant()
                     && attempted.contains(&i.id)
             })
@@ -1252,6 +1261,7 @@ async fn resume_target_for_session(state: &Arc<AppState>, id: &str) -> Option<Re
             && i.is_structured()
             && !i.is_archived()
             && !i.is_snoozed()
+            && !i.is_trashed()
             && !i.is_idle_dormant()
     })?;
     Some(ResumeTarget {
@@ -1427,7 +1437,7 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
         // signal; the next daemon boot re-sweeps it, so this is acceptable.
         // See #1921.
         #[cfg(unix)]
-        tokio::spawn(crate::acp::worker_registry::reap_group_escalating(
+        tokio::spawn(crate::process::worker::reap_group_escalating(
             record.pid,
             std::time::Duration::from_secs(2),
         ));

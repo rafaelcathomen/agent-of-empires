@@ -10,6 +10,7 @@
 mod dir_guard;
 pub(crate) mod heat;
 mod status_file;
+mod targets;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -29,6 +30,9 @@ pub(crate) use dir_guard::{clear_base_override_for_test, override_base_for_test,
 pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_heat, read_hook_session_id,
     read_hook_status, read_hook_subagent_active, read_hook_urgent,
+};
+pub(crate) use targets::{
+    has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
 };
 
 /// Single source of truth for the `aoe-hooks` identity token. Defined as a
@@ -492,335 +496,9 @@ fn hook_command_session_id_sandbox(base: &str) -> String {
 /// command literally contains the un-expanded `$AOE_INSTANCE_ID` reference
 /// adjacent to `aoe-hooks/`. The out-of-band marker scheme proposed in
 /// issue #2191 (Option B) is the future-proof fix.
-fn is_aoe_hook_command(cmd: &str) -> bool {
+pub(super) fn is_aoe_hook_command(cmd: &str) -> bool {
     let trimmed_tail = cmd.trim_end_matches(|c: char| c == '\'' || c == '"' || c.is_whitespace());
     trimmed_tail.ends_with(AOE_HOOK_TRAILING_SENTINEL) || cmd.contains(AOE_HOOK_PATH_SENTINEL)
-}
-
-/// Per-agent dispatch shape for the hook target enumerator. Each kind picks a
-/// different installer/uninstaller and a different marker-presence walker.
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum HookTargetKind {
-    /// Generic JSON settings (Claude/OpenCode/Cursor/Gemini/Qwen/Kiro):
-    /// `hooks.<event>[].hooks[].command`.
-    JsonSettings,
-    /// Codex `config.toml`: file-locked, symlink-resolved, with a user-trust
-    /// `[hooks.state]` block to preserve. Only the v018 legacy-cleanup
-    /// migration constructs this variant; no agent declares
-    /// `HookFormat::CodexToml`.
-    CodexToml,
-    /// Codex `hooks.json`: same JSON payload shape as `JsonSettings`, but
-    /// the path is resolved through `codex_hooks_json_path_in`
-    /// (`CODEX_HOME` aware).
-    CodexJson,
-    /// settl/hermes/kiro: a config format the JSON path cannot emit; install
-    /// goes through the agent's bundled `SidecarHooks` function pointers.
-    Sidecar(&'static crate::agents::SidecarHooks),
-}
-
-/// One reachable on-disk location where AoE may have written status hooks.
-///
-/// Produced by [`iter_hook_targets`] (single source of truth for both
-/// `uninstall_all_hooks` and the v015 hook-rewrite migration).
-#[derive(Debug)]
-pub(crate) struct HookTarget {
-    pub agent_name: &'static str,
-    pub kind: HookTargetKind,
-    pub path: PathBuf,
-    /// Hook events to register; empty for `Sidecar` (sidecar installers carry
-    /// their own static event tables internally).
-    pub events: &'static [crate::agents::HookEvent],
-}
-
-/// Enumerate every hook target reachable from the running AoE process: the
-/// home-relative default for each agent, plus every profile-overridden path
-/// (CLAUDE_CONFIG_DIR / CODEX_HOME / etc.) from the global config and each
-/// profile's `environment` list. Deduplicated by `(kind discriminant, path)`.
-///
-/// Used by [`uninstall_all_hooks`] (read-modify-write removal) and the v015
-/// migration (read-modify-write rewrite). Both share this enumerator so a
-/// future agent added to `crate::agents::AGENTS` automatically appears in
-/// both flows.
-pub(crate) fn iter_hook_targets() -> Vec<HookTarget> {
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return Vec::new(),
-    };
-    iter_hook_targets_in(&home, &collect_env_lists_from_session())
-}
-
-/// Home-injectable variant of [`iter_hook_targets`]. Tests construct a
-/// synthetic `home` and `env_lists` directly without touching the AoE
-/// process env or `Config::load()`.
-pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Vec<HookTarget> {
-    let mut out: Vec<HookTarget> = Vec::new();
-    for agent in crate::agents::AGENTS {
-        if let Some(hook_cfg) = agent.hook_config.as_ref() {
-            let mut paths: Vec<PathBuf> = Vec::new();
-            let resolve = |env: &[String]| -> PathBuf {
-                match hook_cfg.format {
-                    crate::agents::HookFormat::JsonSettings => {
-                        agent_settings_path_in(home, hook_cfg, env)
-                    }
-                    crate::agents::HookFormat::CodexJson => codex_hooks_json_path_in(home, env),
-                }
-            };
-            push_unique_target_path(&mut paths, resolve(&[]));
-            for env in env_lists {
-                push_unique_target_path(&mut paths, resolve(env));
-            }
-            let kind = match hook_cfg.format {
-                crate::agents::HookFormat::JsonSettings => HookTargetKind::JsonSettings,
-                crate::agents::HookFormat::CodexJson => HookTargetKind::CodexJson,
-            };
-            for path in paths {
-                out.push(HookTarget {
-                    agent_name: agent.name,
-                    kind,
-                    path,
-                    events: hook_cfg.events,
-                });
-            }
-        }
-        if let Some(sidecar) = agent.sidecar_hooks.as_ref() {
-            out.push(HookTarget {
-                agent_name: agent.name,
-                kind: HookTargetKind::Sidecar(sidecar),
-                path: home.join(sidecar.host_config_subpath),
-                events: &[],
-            });
-        }
-    }
-    out
-}
-
-fn push_unique_target_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
-    if !paths.contains(&path) {
-        paths.push(path);
-    }
-}
-
-/// Best-effort env-list collector for the running AoE process: global config
-/// `environment` plus each profile's `environment`. Both the global load and
-/// the profile listing degrade to defaults on failure with a `tracing::warn!`,
-/// matching the warn-and-continue convention used elsewhere in this module.
-///
-/// Missing `config.toml` is silent: `Config::load` maps `!path.exists()` to
-/// `Ok(Config::default())`, so any `Err` reaching `load_or_warn` is a real
-/// TOML parse or I/O failure that the operator should see surfaced.
-fn collect_env_lists_from_session() -> Vec<Vec<String>> {
-    let mut out = Vec::new();
-    out.push(crate::session::config::Config::load_or_warn().environment);
-    match crate::session::list_profiles() {
-        Ok(profiles) => {
-            for p in profiles {
-                out.push(crate::session::profile_config::resolve_config_or_warn(&p).environment);
-            }
-        }
-        Err(e) => {
-            tracing::warn!(target: "hooks", "Failed to list profiles: {}", e);
-        }
-    }
-    out
-}
-
-/// Marker-presence gate for the v015 hook-rewrite migration.
-///
-/// Returns `true` iff the target's on-disk file already contains at least one
-/// AoE-managed hook command (i.e. one whose `command` string contains
-/// [`AOE_HOOK_MARKER`]). Fails closed on every I/O / parse / wrong-shape
-/// error: a file we cannot identify is a file we must not rewrite.
-///
-/// Why this exists: the install functions (`install_hooks`,
-/// `install_codex_hooks_with_preserved_state`, sidecar installers) create
-/// the file when absent. Calling them unconditionally on every reachable
-/// target would resurrect hooks for users who explicitly uninstalled. The
-/// migration must only touch files it already owns.
-pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
-    if !target.path.exists() {
-        return false;
-    }
-    match target.kind {
-        HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
-            json_settings_has_aoe_marker(&target.path)
-        }
-        HookTargetKind::CodexToml => codex_config_has_aoe_marker(&target.path),
-        HookTargetKind::Sidecar(sidecar) => match sidecar.format {
-            crate::agents::SidecarFormat::SettlToml => settl_config_has_aoe_marker(&target.path),
-            crate::agents::SidecarFormat::HermesYaml => hermes_config_has_aoe_marker(&target.path),
-            crate::agents::SidecarFormat::KiroJson => kiro_config_has_aoe_marker(&target.path),
-        },
-    }
-}
-
-fn json_settings_has_aoe_marker(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&content) else {
-        return false;
-    };
-    let Some(hooks_obj) = value.get("hooks").and_then(|h| h.as_object()) else {
-        return false;
-    };
-    for matchers in hooks_obj.values() {
-        let Some(arr) = matchers.as_array() else {
-            continue;
-        };
-        for matcher in arr {
-            let Some(hooks_arr) = matcher.get("hooks").and_then(|h| h.as_array()) else {
-                continue;
-            };
-            for hook in hooks_arr {
-                if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
-                    if is_aoe_hook_command(cmd) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-fn codex_config_has_aoe_marker(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(doc) = content.parse::<toml_edit::DocumentMut>() else {
-        return false;
-    };
-    let Some(hooks) = doc.as_table().get("hooks").and_then(|h| h.as_table_like()) else {
-        return false;
-    };
-    for event_name in CODEX_HOOK_EVENT_NAMES {
-        let Some(event_item) = hooks.get(event_name) else {
-            continue;
-        };
-        if let Some(matchers) = event_item.as_array_of_tables() {
-            for matcher in matchers.iter() {
-                if codex_matcher_group_contains_aoe(matcher) {
-                    return true;
-                }
-            }
-        } else if let Some(matchers) = event_item.as_array() {
-            for matcher in matchers.iter() {
-                if let Some(group) = matcher.as_inline_table() {
-                    if codex_inline_group_contains_aoe(group) {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
-fn codex_matcher_group_contains_aoe(group: &toml_edit::Table) -> bool {
-    let Some(hooks_item) = group.get("hooks") else {
-        return false;
-    };
-    if let Some(handlers) = hooks_item.as_array_of_tables() {
-        return handlers
-            .iter()
-            .any(|handler| codex_toml_table_command(handler).is_some_and(is_aoe_hook_command));
-    }
-    if let Some(handlers) = hooks_item.as_array() {
-        return handlers.iter().any(codex_inline_hook_handler_is_aoe);
-    }
-    false
-}
-
-fn codex_inline_group_contains_aoe(group: &toml_edit::InlineTable) -> bool {
-    let Some(hooks_item) = group.get("hooks") else {
-        return false;
-    };
-    let Some(handlers) = hooks_item.as_array() else {
-        return false;
-    };
-    handlers.iter().any(codex_inline_hook_handler_is_aoe)
-}
-
-fn settl_config_has_aoe_marker(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = toml::from_str::<toml::Value>(&content) else {
-        return false;
-    };
-    let Some(arr) = value.get("hooks").and_then(|h| h.as_array()) else {
-        return false;
-    };
-    arr.iter().any(|hook| {
-        hook.get("command")
-            .and_then(|c| c.as_str())
-            .is_some_and(is_aoe_hook_command)
-    })
-}
-
-fn hermes_config_has_aoe_marker(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    if content.trim().is_empty() {
-        return false;
-    }
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&content) else {
-        return false;
-    };
-    let Some(hooks_map) = value
-        .as_mapping()
-        .and_then(|m| m.get(serde_yaml::Value::String("hooks".into())))
-        .and_then(|h| h.as_mapping())
-    else {
-        return false;
-    };
-    for entries in hooks_map.values() {
-        let Some(seq) = entries.as_sequence() else {
-            continue;
-        };
-        for entry in seq {
-            if let Some(cmd) = entry
-                .as_mapping()
-                .and_then(|m| m.get(serde_yaml::Value::String("command".into())))
-                .and_then(|c| c.as_str())
-            {
-                if is_aoe_hook_command(cmd) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Kiro's per-agent JSON uses a flat `hooks.{event}: [{command, ...}]` shape
-/// (no nested matcher group), unlike Claude/OpenCode-style settings which
-/// nest under `hooks.{event}[].hooks[].command`. Kiro therefore needs its
-/// own walker rather than reusing [`json_settings_has_aoe_marker`].
-fn kiro_config_has_aoe_marker(path: &Path) -> bool {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return false;
-    };
-    let Ok(value) = serde_json::from_str::<Value>(&content) else {
-        return false;
-    };
-    let Some(hooks_obj) = value.get("hooks").and_then(|h| h.as_object()) else {
-        return false;
-    };
-    for entries in hooks_obj.values() {
-        let Some(arr) = entries.as_array() else {
-            continue;
-        };
-        for entry in arr {
-            if let Some(cmd) = entry.get("command").and_then(|c| c.as_str()) {
-                if is_aoe_hook_command(cmd) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 /// Build the AoE hooks JSON structure from agent-defined events.
@@ -838,6 +516,12 @@ fn kiro_config_has_aoe_marker(path: &Path) -> bool {
 ///
 /// An event with both produces two `hooks` array entries under the same
 /// matcher block. An event with neither is skipped.
+///
+/// Multiple events may share a `name` with different matchers (e.g. Claude's
+/// `Notification` splits `permission_prompt|elicitation_dialog` → waiting from
+/// `idle_prompt` → idle). Each becomes its own matcher block appended to that
+/// event name's array, so they coexist instead of the later one clobbering the
+/// earlier.
 fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarget) -> Value {
     let mut hooks_obj = serde_json::Map::new();
     for event in events {
@@ -878,10 +562,14 @@ fn build_aoe_hooks(events: &[crate::agents::HookEvent], target: HookInstallTarge
             })
             .collect();
         entry.insert("hooks".to_string(), Value::Array(hook_entries));
-        hooks_obj.insert(
-            event.name.to_string(),
-            Value::Array(vec![Value::Object(entry)]),
-        );
+        match hooks_obj
+            .entry(event.name.to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+        {
+            Value::Array(groups) => groups.push(Value::Object(entry)),
+            // or_insert_with only ever seeds an Array, so this arm is unreachable.
+            _ => unreachable!("hook event group is always a JSON array"),
+        }
     }
 
     Value::Object(hooks_obj)
@@ -984,7 +672,7 @@ pub fn install_hooks(
     })
 }
 
-const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
+pub(super) const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
@@ -1329,14 +1017,14 @@ fn codex_inline_matcher_group_is_all_aoe(group: &toml_edit::Value) -> bool {
     !handlers.is_empty() && handlers.iter().all(codex_inline_hook_handler_is_aoe)
 }
 
-fn codex_inline_hook_handler_is_aoe(handler: &toml_edit::Value) -> bool {
+pub(super) fn codex_inline_hook_handler_is_aoe(handler: &toml_edit::Value) -> bool {
     handler
         .as_inline_table()
         .and_then(|handler| codex_toml_table_command(handler))
         .is_some_and(is_aoe_hook_command)
 }
 
-fn codex_toml_table_command(table: &dyn toml_edit::TableLike) -> Option<&str> {
+pub(super) fn codex_toml_table_command(table: &dyn toml_edit::TableLike) -> Option<&str> {
     table.get("command").and_then(toml_edit::Item::as_str)
 }
 
@@ -1879,9 +1567,13 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
 
         let before = config.clone();
 
+        let default_name = agent_config_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(KIRO_HOOKS_AGENT_NAME);
         config
             .entry("name".to_string())
-            .or_insert_with(|| Value::String(KIRO_HOOKS_AGENT_NAME.to_string()));
+            .or_insert_with(|| Value::String(default_name.to_string()));
         config
             .entry("tools".to_string())
             .or_insert_with(|| serde_json::json!(["*"]));
@@ -1925,6 +1617,58 @@ pub fn install_kiro_hooks(agent_config_path: &Path, target: HookInstallTarget) -
         tracing::info!(target: "hooks.install", "Installed AoE hooks in {}", agent_config_path.display());
         Ok(())
     })
+}
+
+/// Resolve which file under `agents_dir` holds the agent Kiro loads for
+/// `--agent <name>`, returning the path AoE installs its status hooks into.
+///
+/// Kiro resolves `--agent <name>` by the `name` field inside each
+/// `<agents_dir>/*.json`, not by the filename stem. Generators (plugin/managed
+/// agent tooling) render files as `<prefix>-<name>.json`, so filename and
+/// logical name diverge; assuming `filename == name` installs into a file Kiro
+/// never loads and status detection silently fails. Matching the `name` field
+/// is therefore mandatory, not a nicety.
+///
+/// Falls back to `<agents_dir>/<name>.json` when no file declares that name:
+/// the correct create-path for a brand-new agent, which Kiro then reads `name`
+/// from. The caller validates `name` (rejecting path separators and `..`, see
+/// [`crate::agents::parse_selected_agent`]) so the fallback stays inside
+/// `agents_dir`.
+pub fn resolve_kiro_agent_file(agents_dir: &Path, name: &str) -> PathBuf {
+    if let Some(path) = find_kiro_agent_file_by_name(agents_dir, name) {
+        return path;
+    }
+    agents_dir.join(format!("{name}.json"))
+}
+
+/// First `<agents_dir>/*.json` whose top-level `name` equals `name`, or `None`.
+/// Sorted so a duplicate-name tie resolves deterministically; unreadable or
+/// non-object files are skipped rather than failing the scan. Two files
+/// declaring the same `name` is a user misconfiguration (Kiro warns about it
+/// too): we pick the lexicographically-first and `warn!` so the divergence is
+/// debuggable, since installing into the wrong one silently breaks detection.
+fn find_kiro_agent_file_by_name(agents_dir: &Path, name: &str) -> Option<PathBuf> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(agents_dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "json"))
+        .collect();
+    entries.sort();
+    let mut matches = entries.into_iter().filter(|path| {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|content| serde_json::from_str::<Value>(&content).ok())
+            .and_then(|v| v.get("name").and_then(|n| n.as_str()).map(|n| n == name))
+            .unwrap_or(false)
+    });
+    let first = matches.next()?;
+    if let Some(second) = matches.next() {
+        tracing::warn!(target: "hooks.install",
+            "multiple Kiro agent files in {} declare name '{}' (e.g. {} and {}); \
+             installing hooks into the first. Remove the duplicate to avoid ambiguity.",
+            agents_dir.display(), name, first.display(), second.display());
+    }
+    Some(first)
 }
 
 /// Make `aoe-hooks` the active default Kiro agent if the user is still on
@@ -2073,6 +1817,7 @@ pub fn uninstall_all_hooks() {
 
 #[cfg(test)]
 mod tests {
+    use super::targets::collect_env_lists_from_session;
     use super::*;
     use tempfile::TempDir;
 
@@ -3019,11 +2764,40 @@ command = "echo user-hook"
     fn test_notification_hook_has_matcher() {
         let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
         let notification = hooks["Notification"].as_array().unwrap();
-        assert_eq!(notification.len(), 1);
-        let matcher = notification[0]["matcher"].as_str().unwrap();
-        assert!(matcher.contains("permission_prompt"));
-        assert!(matcher.contains("elicitation_dialog"));
-        assert!(!matcher.contains("idle_prompt"));
+        // Two matcher groups: permission/elicitation → waiting, idle_prompt → idle.
+        assert_eq!(notification.len(), 2);
+
+        let waiting = notification
+            .iter()
+            .find(|g| {
+                g["matcher"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("permission_prompt"))
+            })
+            .expect("waiting matcher group present");
+        let waiting_matcher = waiting["matcher"].as_str().unwrap();
+        assert!(waiting_matcher.contains("permission_prompt"));
+        assert!(waiting_matcher.contains("elicitation_dialog"));
+        assert!(!waiting_matcher.contains("idle_prompt"));
+        assert!(
+            waiting["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("printf waiting"),
+            "permission/elicitation notification should write waiting"
+        );
+
+        let idle = notification
+            .iter()
+            .find(|g| g["matcher"].as_str() == Some("idle_prompt"))
+            .expect("idle_prompt matcher group present");
+        assert!(
+            idle["hooks"][0]["command"]
+                .as_str()
+                .unwrap()
+                .contains("printf idle"),
+            "idle_prompt notification should write idle"
+        );
     }
 
     #[test]
@@ -3034,6 +2808,21 @@ command = "echo user-hook"
         assert!(
             cmd.contains("printf idle"),
             "Stop hook should write idle status: {}",
+            cmd
+        );
+    }
+
+    #[test]
+    fn test_stop_failure_hook_writes_idle() {
+        // A turn killed by an API error fires StopFailure, not Stop, so this is
+        // the only thing that clears the trailing `running` write in that path.
+        let hooks = build_aoe_hooks(claude_events(), HookInstallTarget::Sandbox);
+        let stop_failure = hooks["StopFailure"].as_array().unwrap();
+        assert_eq!(stop_failure.len(), 1);
+        let cmd = stop_failure[0]["hooks"][0]["command"].as_str().unwrap();
+        assert!(
+            cmd.contains("printf idle"),
+            "StopFailure hook should write idle status: {}",
             cmd
         );
     }
@@ -3658,6 +3447,160 @@ hooks_auto_accept: false
         let config_path = tmp.path().join("nonexistent.json");
         let modified = uninstall_kiro_hooks(&config_path).unwrap();
         assert!(!modified);
+    }
+
+    #[test]
+    fn test_resolve_kiro_agent_file_falls_back_to_name_json_when_dir_absent() {
+        // Brand-new agent, nothing on disk yet: resolve to `<dir>/<name>.json`,
+        // the path Kiro will read the name from once the file is written.
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("agents");
+        assert_eq!(
+            resolve_kiro_agent_file(&missing, "custom-agent"),
+            missing.join("custom-agent.json")
+        );
+    }
+
+    #[test]
+    fn test_resolve_kiro_agent_file_falls_back_when_no_name_matches() {
+        // The directory exists and has files, but none declares the selected
+        // name. Fall back to the create-path so a new agent can be added.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("something-else.json"),
+            r#"{"name":"something-else"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_kiro_agent_file(dir.path(), "custom-agent"),
+            dir.path().join("custom-agent.json")
+        );
+    }
+
+    #[test]
+    fn test_resolve_kiro_agent_file_matches_name_field_not_filename() {
+        // Regression: a generator renders the `custom-agent` agent under a
+        // prefixed filename, so the file Kiro loads for `--agent custom-agent`
+        // is name-matched, not stem-matched. The resolver must return it and
+        // ignore a decoy whose stem matches but whose `name` does not.
+        let dir = TempDir::new().unwrap();
+        let managed_file = dir.path().join("TeamAgents-custom-agent.json");
+        std::fs::write(
+            &managed_file,
+            r#"{"name":"custom-agent","hooks":{"agentSpawn":[{"command":"team-tool emit"}]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("custom-agent.json"),
+            r#"{"name":"aoe-hooks"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_kiro_agent_file(dir.path(), "custom-agent"),
+            managed_file,
+            "must resolve by the JSON name field, not the filename stem"
+        );
+    }
+
+    #[test]
+    fn test_resolve_kiro_agent_file_ignores_non_json_and_invalid_files() {
+        // Unreadable-as-JSON and non-.json files in the dir must not break the
+        // scan or produce a false match.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "name: custom-agent").unwrap();
+        std::fs::write(dir.path().join("broken.json"), "{ not json").unwrap();
+        let good = dir.path().join("AcmePkg-custom-agent.json");
+        std::fs::write(&good, r#"{"name":"custom-agent"}"#).unwrap();
+        assert_eq!(resolve_kiro_agent_file(dir.path(), "custom-agent"), good);
+    }
+
+    #[test]
+    fn test_resolve_kiro_agent_file_duplicate_names_pick_lexicographic_first() {
+        // Two files declaring the same name is a misconfiguration; resolution
+        // must be deterministic (lexicographically-first filename) so the
+        // install target does not flip between launches.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("ZZZ-custom.json"),
+            r#"{"name":"custom-agent"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("AAA-custom.json"),
+            r#"{"name":"custom-agent"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_kiro_agent_file(dir.path(), "custom-agent"),
+            dir.path().join("AAA-custom.json"),
+        );
+    }
+
+    #[test]
+    fn test_install_into_selected_kiro_agent_creates_file() {
+        // No pre-existing agent file: installing into the selected agent's path
+        // creates it with AoE hooks, just like the dedicated aoe-hooks agent.
+        // Mirrors how `install_sidecar_host_hooks` resolves the path then calls
+        // the sidecar installer.
+        let agents_dir = TempDir::new().unwrap();
+        let path = resolve_kiro_agent_file(agents_dir.path(), "custom-agent");
+        install_kiro_hooks(&path, HookInstallTarget::Host).unwrap();
+
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // The created file's name must match the selected agent, not the
+        // standalone "aoe-hooks" default, so Kiro loads it for --agent custom-agent.
+        assert_eq!(config["name"].as_str(), Some("custom-agent"));
+        for (event, _) in KIRO_HOOKS {
+            let entries = config["hooks"][event].as_array().unwrap();
+            assert_eq!(
+                entries.len(),
+                1,
+                "event {} should have one AoE entry",
+                event
+            );
+            assert!(is_aoe_hook_command(entries[0]["command"].as_str().unwrap()));
+        }
+    }
+
+    #[test]
+    fn test_install_into_selected_kiro_agent_preserves_user_config() {
+        // A real user agent has its own name/prompt/tools/hooks. Installing must
+        // keep all of that and only add AoE hook entries. The file uses the
+        // `<prefix>-<name>.json` generator convention to prove the resolver
+        // targets it by `name` rather than the filename stem.
+        let agents_dir = TempDir::new().unwrap();
+        std::fs::write(
+            agents_dir.path().join("CustomPkg-custom-agent.json"),
+            r#"{"name":"custom-agent","prompt":"custom helper","tools":["read","shell"],"hooks":{"preToolUse":[{"command":"echo mine"}]}}"#,
+        )
+        .unwrap();
+        let path = resolve_kiro_agent_file(agents_dir.path(), "custom-agent");
+        assert_eq!(
+            path,
+            agents_dir.path().join("CustomPkg-custom-agent.json"),
+            "resolver must target the name-matched file, not custom-agent.json"
+        );
+
+        install_kiro_hooks(&path, HookInstallTarget::Host).unwrap();
+
+        let config: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // User fields untouched.
+        assert_eq!(config["name"].as_str().unwrap(), "custom-agent");
+        assert_eq!(config["prompt"].as_str().unwrap(), "custom helper");
+        assert_eq!(config["tools"].as_array().unwrap().len(), 2);
+        // User's own preToolUse hook is preserved, AoE's appended after it.
+        let pre = config["hooks"]["preToolUse"].as_array().unwrap();
+        assert_eq!(pre[0]["command"].as_str().unwrap(), "echo mine");
+        assert!(pre
+            .iter()
+            .any(|h| is_aoe_hook_command(h["command"].as_str().unwrap())));
+        // And it's reversible without harming the user's hook.
+        assert!(uninstall_kiro_hooks(&path).unwrap());
+        let after: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let pre_after = after["hooks"]["preToolUse"].as_array().unwrap();
+        assert_eq!(pre_after.len(), 1);
+        assert_eq!(pre_after[0]["command"].as_str().unwrap(), "echo mine");
     }
 
     fn run_session_id_hook(payload: &str, instance_id: &str, base: &Path) -> std::process::Output {

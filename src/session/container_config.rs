@@ -1102,11 +1102,28 @@ fn agent_config_container_path(
 pub(crate) struct ContainerAgentSelection<'a> {
     tool: &'a str,
     detect_as: Option<&'a str>,
+    /// The agent name a user selected via the agent's selected-agent flag (e.g.
+    /// Kiro's `--agent NAME`), if any. When set, sidecar status hooks are
+    /// installed into that agent's sandbox config file rather than the
+    /// standalone hooks agent, mirroring the host path so a sandboxed session
+    /// running a user's own agent still reports status (Kiro has no global
+    /// hooks). `None` for the default / no selection.
+    selected_agent: Option<&'a str>,
 }
 
 impl<'a> ContainerAgentSelection<'a> {
     pub(crate) fn new(tool: &'a str, detect_as: Option<&'a str>) -> Self {
-        Self { tool, detect_as }
+        Self {
+            tool,
+            detect_as,
+            selected_agent: None,
+        }
+    }
+
+    /// Set the user-selected agent name (see [`Self::selected_agent`]).
+    pub(crate) fn with_selected_agent(mut self, selected_agent: Option<&'a str>) -> Self {
+        self.selected_agent = selected_agent;
+        self
     }
 }
 
@@ -1469,7 +1486,29 @@ pub(crate) fn build_container_config(
             }
 
             if let Some(sidecar) = &agent.sidecar_hooks {
-                let config_file = home.join(sidecar.sandbox_config_subpath);
+                // Default target: the standalone hooks agent's sandbox config.
+                // When the user selected their own agent via the sidecar's
+                // selected-agent flag (e.g. Kiro `--agent NAME`), the container
+                // loads THAT agent's config (these CLIs have no global hooks), so
+                // install into its staged file instead. The selected agent's dir
+                // is copied into the sandbox via AGENT_CONFIG_MOUNTS, so the
+                // staged path is the sandbox config dir plus the selected name's
+                // file (mirrors the host path in
+                // `Instance::install_sidecar_host_hooks`).
+                let config_file = sidecar
+                    .selected_agent_hooks
+                    .as_ref()
+                    .zip(agent_selection.selected_agent)
+                    .and_then(|(sel, name)| {
+                        // The selected agent's dir is staged into the sandbox
+                        // (parent of sandbox_config_subpath, e.g.
+                        // `.kiro/sandbox/agents`) before this install runs, so
+                        // the resolver can match by `name` there as on the host.
+                        let agents_dir =
+                            home.join(Path::new(sidecar.sandbox_config_subpath).parent()?);
+                        Some((sel.resolve_config_file)(&agents_dir, name))
+                    })
+                    .unwrap_or_else(|| home.join(sidecar.sandbox_config_subpath));
                 if let Err(e) =
                     (sidecar.install)(&config_file, crate::hooks::HookInstallTarget::Sandbox)
                 {
@@ -2921,6 +2960,7 @@ extra_volumes = ["/host/data:/container/data:ro"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let project_path_str = project_dir.path().to_str().unwrap();
@@ -3028,6 +3068,7 @@ volume_ignores = ["**/bin", "**/obj", "target"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let project_path_str = project_dir.path().to_str().unwrap();
@@ -3170,6 +3211,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let config = build_container_config(
@@ -3215,6 +3257,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "codex-sandbox-hooks-test";
         let config = build_container_config(
@@ -3307,6 +3350,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
                 extra_env: None,
                 custom_instruction: None,
                 before_start_env: Vec::new(),
+                container_workdir: None,
             };
             let instance_id = format!("{}-sidecar-sandbox-test", agent.name);
             let config = build_container_config(
@@ -3348,6 +3392,143 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
         }
     }
 
+    // #2381 (sandbox side): a sandboxed Kiro session launched with `--agent
+    // NAME` loads NAME's config inside the container, which has no AoE hooks, so
+    // status detection goes dark. When a selected agent is threaded in, the
+    // sandbox install must target NAME's staged config file, not the standalone
+    // aoe-hooks agent.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_installs_hooks_into_selected_kiro_agent() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let kiro = crate::agents::get_agent("kiro").unwrap();
+        let sidecar = kiro.sidecar_hooks.as_ref().unwrap();
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let instance_id = "kiro-selected-agent-sandbox-test";
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        // Hooks land in the selected agent's staged sandbox config...
+        let selected_config = temp_home
+            .path()
+            .join(".kiro/sandbox/agents/custom-agent.json");
+        assert!(
+            selected_config.exists(),
+            "selected-agent sandbox hook config should be installed at {}",
+            selected_config.display()
+        );
+        assert!(fs::read_to_string(&selected_config)
+            .unwrap()
+            .contains("aoe-hooks"));
+
+        // ...NOT the standalone aoe-hooks sandbox agent.
+        let standalone = temp_home.path().join(sidecar.sandbox_config_subpath);
+        assert!(
+            !standalone.exists(),
+            "standalone aoe-hooks sandbox config must not be written when an agent is selected"
+        );
+
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_resolves_selected_kiro_agent_by_name_in_sandbox() {
+        // The host `.kiro/agents` dir is staged into `.kiro/sandbox/agents`
+        // before hook install, so a prefixed agent file (filename != name) must
+        // be resolved by its `name` field there, mirroring the host path.
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let host_agents = temp_home.path().join(".kiro/agents");
+        std::fs::create_dir_all(&host_agents).unwrap();
+        std::fs::write(
+            host_agents.join("TeamAgents-custom-agent.json"),
+            r#"{"name":"custom-agent","hooks":{"agentSpawn":[{"command":"team-tool emit"}]}}"#,
+        )
+        .unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let instance_id = "kiro-managed-agent-sandbox-test";
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &super::super::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            },
+            ContainerAgentSelection::new("kiro", None).with_selected_agent(Some("custom-agent")),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let matched = temp_home
+            .path()
+            .join(".kiro/sandbox/agents/TeamAgents-custom-agent.json");
+        assert!(
+            matched.exists(),
+            "hooks should install into the name-matched staged file at {}",
+            matched.display()
+        );
+        let body = fs::read_to_string(&matched).unwrap();
+        assert!(
+            body.contains("aoe-hooks"),
+            "AoE hook command must be present"
+        );
+        assert!(
+            body.contains("agentSpawn"),
+            "the agent's own hook must be preserved"
+        );
+
+        let stem_clone = temp_home
+            .path()
+            .join(".kiro/sandbox/agents/custom-agent.json");
+        assert!(
+            !stem_clone.exists(),
+            "must not create a filename-stem clone the CLI never loads"
+        );
+
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_refuses_unsafe_instance_id() {
@@ -3367,6 +3548,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let result = build_container_config(
@@ -3416,6 +3598,7 @@ extra_volumes = ["/host/screenshots:/root/screenshots"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "codex-sandbox-hooks-disabled-test";
         let config = build_container_config(
@@ -3478,6 +3661,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "wrapped-codex-sandbox-hooks-test";
         let config = build_container_config(
@@ -3537,6 +3721,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "codex-sandbox-refresh-hooks-test";
         build_container_config(
@@ -3605,6 +3790,7 @@ trusted_hash = "keep"
             extra_env: Some(vec!["CODEX_HOME=/root/custom-codex".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "codex-sandbox-extra-env-hooks-test";
         let config = build_container_config(
@@ -3660,6 +3846,7 @@ environment = ["CODEX_HOME=/root/profile-codex"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let instance_id = "codex-sandbox-config-env-hooks-test";
         let config = build_container_config(
@@ -3749,6 +3936,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let has_volume = |config: &crate::containers::container_interface::ContainerConfig,
@@ -3900,6 +4088,7 @@ volume_ignores = ["target", "node_modules"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let project_path_str = worktree_path.to_str().unwrap();
@@ -3994,6 +4183,7 @@ volume_ignores = ["target"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
 
         let project_path_str = worktree_path.to_str().unwrap();
@@ -4149,6 +4339,7 @@ volume_ignores = ["target"]
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         }
     }
 

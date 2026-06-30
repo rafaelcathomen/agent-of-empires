@@ -407,6 +407,7 @@ impl HomeView {
                 // and the row stays stuck resuming its dead conversation).
                 let skip = matches!(inst.status, Status::Creating | Status::Deleting)
                     || inst.is_archived()
+                    || inst.is_trashed()
                     || (snoozed && in_attention)
                     || (inst.pane_dead_observed && !fresh_start);
                 let wake_snooze = snoozed && !in_attention;
@@ -777,24 +778,10 @@ impl HomeView {
 
             for session_id in &sessions_to_delete {
                 if let Some(inst) = self.get_instance(session_id) {
-                    let delete_worktree = options.delete_worktrees
-                        && (inst
-                            .worktree_info
-                            .as_ref()
-                            .is_some_and(|wt| wt.managed_by_aoe)
-                            || inst
-                                .workspace_info
-                                .as_ref()
-                                .is_some_and(|ws| ws.cleanup_on_delete));
-                    let delete_branch = options.delete_branches
-                        && (inst
-                            .worktree_info
-                            .as_ref()
-                            .is_some_and(|wt| wt.managed_by_aoe)
-                            || inst
-                                .workspace_info
-                                .as_ref()
-                                .is_some_and(|ws| ws.cleanup_on_delete));
+                    let delete_worktree =
+                        options.delete_worktrees && inst.has_managed_worktree_or_workspace();
+                    let delete_branch =
+                        options.delete_branches && inst.has_managed_worktree_or_workspace();
                     let delete_sandbox = options.delete_containers
                         && inst.sandbox_info.as_ref().is_some_and(|s| s.enabled);
                     let request = DeletionRequest {
@@ -866,10 +853,7 @@ impl HomeView {
         self.instances().iter().any(|i| {
             (i.group_path == group_path || i.group_path.starts_with(prefix))
                 && owning_profile.is_none_or(|p| i.source_profile == p)
-                && (i.worktree_info.as_ref().is_some_and(|wt| wt.managed_by_aoe)
-                    || i.workspace_info
-                        .as_ref()
-                        .is_some_and(|ws| ws.cleanup_on_delete))
+                && i.has_managed_worktree_or_workspace()
         })
     }
 
@@ -1035,10 +1019,15 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
-        let snapshot = self
-            .get_instance(&id)
-            .map(|i| (i.worktree_info.clone(), i.status, i.project_path.clone()));
-        let Some((worktree_info, status, project_path)) = snapshot else {
+        let snapshot = self.get_instance(&id).map(|i| {
+            (
+                i.worktree_info.clone(),
+                i.status,
+                i.project_path.clone(),
+                i.is_sandboxed(),
+            )
+        });
+        let Some((worktree_info, status, project_path, is_sandboxed)) = snapshot else {
             anyhow::bail!("Session not found");
         };
         let Some(worktree_info) = worktree_info else {
@@ -1046,6 +1035,19 @@ impl HomeView {
         };
         if status.blocks_worktree_edit() {
             anyhow::bail!("Stop the session before editing its workdir name");
+        }
+        // A sandbox session keeps its container alive (running `sleep infinity`)
+        // even while Idle, and that container bind-mounts the worktree dir, so
+        // the `git worktree move` below would hit EBUSY, and a reused container
+        // would keep mounting (and `cd`-ing into) the old path. Refuse until the
+        // session is stopped, mirroring the tied-rename path. `status` alone is
+        // insufficient: `blocks_worktree_edit` is false for an Idle session
+        // whose container is still up. See #2117, #2414.
+        if crate::session::worktree_edit::sandbox_container_holds_worktree(&id, is_sandboxed) {
+            anyhow::bail!(
+                "Stop the session before editing its workdir name: its sandbox container is \
+                 mounting the worktree directory"
+            );
         }
 
         let outcome = crate::session::worktree_edit::edit_worktree_workdir(
@@ -1058,6 +1060,17 @@ impl HomeView {
         )?;
         let new_path = outcome.new_path.to_string_lossy().to_string();
         let new_branch = outcome.new_branch.clone();
+
+        // A container created against the old path is now stale: its mounts and
+        // working dir are baked in at create time and do NOT follow a host-side
+        // `git worktree move`, so a reused container would `docker exec -w` into
+        // a path that no longer exists. Drop it to force a fresh create on next
+        // start. Only when the dir actually moved; a branch-only rename leaves
+        // the path valid. Mirrors `rename_selected` (#2117).
+        let dir_moved = outcome.new_path != std::path::Path::new(&project_path);
+        if dir_moved {
+            crate::session::worktree_edit::discard_sandbox_container_after_move(&id, is_sandboxed);
+        }
 
         self.apply_user_action(&id, |inst| {
             inst.project_path = new_path.clone();
@@ -1440,7 +1453,7 @@ impl HomeView {
                 return None;
             }
             let inst = self.instances.iter().find(|i| &i.id == id)?;
-            (!inst.is_archived()).then(|| id.clone())
+            (!inst.is_archived() && !inst.is_trashed()).then(|| id.clone())
         };
         for item in self.flat_items.iter().skip(self.cursor + 1) {
             if let Some(id) = candidate(item) {
@@ -1494,6 +1507,13 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
+        // The shelve/unshelve key doubles as restore for the Trash section: a
+        // trashed row can't be meaningfully archived, so `z` on it pulls the
+        // session back out of the trash instead. See #2489.
+        if matches!(self.instances.iter().find(|i| i.id == id), Some(i) if i.is_trashed()) {
+            self.restore_selected_from_trash();
+            return Ok(());
+        }
         let is_archived = match self.instances.iter().find(|i| i.id == id) {
             Some(i) => i.is_archived(),
             None => return Ok(()),
@@ -1568,6 +1588,80 @@ impl HomeView {
         Ok(())
     }
 
+    /// Move a session to the trash: stop its tmux sessions (a structured-view
+    /// worker is reaped by the daemon reconciler once the row reads trashed)
+    /// and set `trashed_at`. Durable artifacts are kept so it can be
+    /// restored. The Trash section is revealed so the user sees where the row
+    /// went. See #2489.
+    pub(super) fn trash_session_by_id(&mut self, id: &str) {
+        if let Err(e) = self.apply_user_action(id, |inst| inst.trash()) {
+            tracing::warn!(target: "tui.session", session = %id, "trash failed: {e}");
+            return;
+        }
+        if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
+            inst.kill_all_tmux_sessions();
+        }
+        // The session is durably trashed and its agent stopped; relocate its
+        // worktree out of the active dir. The move + repointed project_path
+        // persist through the same diff path. Best-effort: a failure leaves the
+        // worktree in place and a later reconcile pass can move it.
+        let mut relocate_warning: Option<String> = None;
+        let _ = self.apply_user_action(id, |inst| {
+            if let crate::session::trash::RelocateOutcome::Failed { reason } =
+                crate::session::trash::relocate_worktree_to_trash(inst)
+            {
+                relocate_warning = Some(reason);
+            }
+        });
+        if let Some(reason) = relocate_warning {
+            tracing::warn!(target: "tui.session", session = %id, "trash worktree relocation skipped: {reason}");
+        }
+        self.reveal_trashed_section();
+        self.flat_items = self.build_flat_items();
+        self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+        self.update_selected();
+    }
+
+    /// Restore the selected trashed session, clearing `trashed_at` so it
+    /// returns to its prior bucket. No-op when the selection is not trashed.
+    /// The session stays stopped (trash killed its panes); the user restarts
+    /// it with `e` like any stopped session. See #2489.
+    pub(super) fn restore_selected_from_trash(&mut self) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        let is_trashed = matches!(
+            self.instances.iter().find(|i| i.id == id),
+            Some(i) if i.is_trashed()
+        );
+        if !is_trashed {
+            return;
+        }
+        // Move the worktree back to its pre-trash location before clearing the
+        // marker. Strict: if the original path is occupied, keep the session
+        // trashed and tell the user, rather than restoring it to the holding
+        // path.
+        let mut restore_error: Option<String> = None;
+        let _ = self.apply_user_action(&id, |inst| {
+            if let crate::session::trash::RestoreOutcome::Failed { reason } =
+                crate::session::trash::restore_worktree_location(inst)
+            {
+                restore_error = Some(reason);
+            } else {
+                inst.untrash();
+            }
+        });
+        if let Some(reason) = restore_error {
+            self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                "Restore Failed",
+                &format!("Could not restore the worktree: {reason}"),
+            ));
+            return;
+        }
+        self.flat_items = self.build_flat_items();
+        self.select_session_by_id(&id);
+    }
+
     /// Collect the active (non-archived) session ids under the currently
     /// selected group header, honoring the active group-by mode. Archived
     /// sessions are excluded: they already live under the synthetic Archived
@@ -1584,7 +1678,7 @@ impl HomeView {
             crate::session::config::GroupByMode::Project => self
                 .instances
                 .iter()
-                .filter(|i| !i.is_archived())
+                .filter(|i| !i.is_archived() && !i.is_trashed())
                 .filter(|i| {
                     self.active_profile
                         .as_ref()
@@ -1600,7 +1694,7 @@ impl HomeView {
                 let prefix = format!("{}/", group_path);
                 self.instances
                     .iter()
-                    .filter(|i| !i.is_archived())
+                    .filter(|i| !i.is_archived() && !i.is_trashed())
                     .filter(|i| i.group_path == group_path || i.group_path.starts_with(&prefix))
                     .filter(|i| {
                         self.selected_group_profile

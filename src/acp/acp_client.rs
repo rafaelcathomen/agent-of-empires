@@ -11,10 +11,11 @@
 //! initialize once, create one ACP session, then pump commands from an
 //! mpsc channel into ACP requests until shutdown.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use agent_client_protocol::schema::ErrorCode;
 use agent_client_protocol::schema::{
@@ -492,6 +493,111 @@ const BETWEEN_PROMPT_IDLE_GRACE: std::time::Duration = std::time::Duration::from
 /// between prompts, so the extra wakeups are cheap. See #2325.
 const BETWEEN_PROMPT_IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+fn opencode_data_dir() -> Option<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return Some(PathBuf::from(xdg).join("opencode"));
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    Some(
+        PathBuf::from(home)
+            .join(".local")
+            .join("share")
+            .join("opencode"),
+    )
+}
+
+fn opencode_db_path() -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("OPENCODE_DB") {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == ":memory:" {
+            return None;
+        }
+        let path = PathBuf::from(trimmed);
+        if path.is_absolute() {
+            return Some(path);
+        }
+        return opencode_data_dir().map(|dir| dir.join(path));
+    }
+
+    let data_dir = opencode_data_dir()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    let entries = std::fs::read_dir(&data_dir).ok()?;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let is_candidate =
+            name == "opencode.db" || (name.starts_with("opencode-") && name.ends_with(".db"));
+        if !is_candidate {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if best
+            .as_ref()
+            .map(|(best_mtime, _)| modified > *best_mtime)
+            .unwrap_or(true)
+        {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, path)| path)
+        .or_else(|| Some(data_dir.join("opencode.db")))
+}
+
+fn recover_opencode_prompt_error_from_sqlite_at(
+    db_path: &Path,
+    acp_session_id: &str,
+    prompt_started_at_ms: i64,
+) -> Option<String> {
+    use rusqlite::{Connection, OpenFlags};
+
+    if !db_path.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let _ = conn.busy_timeout(Duration::from_millis(100));
+    let mut stmt = conn
+        .prepare(
+            "SELECT json_extract(data, '$.error.data.message')
+             FROM message
+             WHERE session_id = ?1
+               AND json_extract(data, '$.role') = 'assistant'
+               AND CAST(json_extract(data, '$.time.created') AS INTEGER) >= ?2
+               AND json_extract(data, '$.error.data.message') IS NOT NULL
+             ORDER BY CAST(json_extract(data, '$.time.created') AS INTEGER) DESC
+             LIMIT 1",
+        )
+        .ok()?;
+    let message: String = stmt
+        .query_row(
+            rusqlite::params![acp_session_id, prompt_started_at_ms],
+            |row| row.get(0),
+        )
+        .ok()?;
+    let trimmed = message.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn recover_opencode_prompt_error(
+    acp_session_id: &str,
+    prompt_started_at_ms: i64,
+) -> Option<String> {
+    let db_path = opencode_db_path()?;
+    recover_opencode_prompt_error_from_sqlite_at(&db_path, acp_session_id, prompt_started_at_ms)
+}
+
 /// Classification of an inbound ACP `SessionUpdate` for the silent-
 /// orphan watchdog state machine. Sent from the notification handler
 /// to the prompt loop via a dedicated mpsc; the prompt loop owns the
@@ -879,6 +985,10 @@ impl SilentOrphanWatchdog {
     fn cost_seen(&self) -> bool {
         self.cost_seen
     }
+
+    fn saw_progress(&self) -> bool {
+        self.saw_first_progress
+    }
 }
 
 /// Resolve the terminal `Stopped` reason for a prompt turn from the
@@ -890,7 +1000,12 @@ impl SilentOrphanWatchdog {
 /// recovery (#2237) deliberately sets NONE of these flags and breaks the
 /// loop, so it falls through to `prompt_complete`: the turn finished, the
 /// adapter just never sent the PromptResponse, so it must NOT collapse
-/// into `prompt_orphaned` (which would trigger a worker restart).
+/// into `prompt_orphaned` (which would trigger a worker restart). Its
+/// post-cancel sibling `finished_after_orphan_cancel` (#2370) covers the
+/// case where the cost marker arrives only AFTER the grace already expired
+/// and the orphan cancel fired: the cancel was premature, so the turn is
+/// demoted back to `prompt_complete` unless the adapter is still wedged on
+/// the RPC (`agent_unresponsive` / `shutdown`), which keeps the restart.
 fn terminal_stop_reason(
     rate_limited: bool,
     force_stopped: bool,
@@ -898,11 +1013,24 @@ fn terminal_stop_reason(
     agent_unresponsive: bool,
     shutdown: bool,
     prompt_cancelled: bool,
+    finished_after_orphan_cancel: bool,
 ) -> &'static str {
     if rate_limited {
         "rate_limited"
     } else if force_stopped {
         "user_forced"
+    } else if finished_after_orphan_cancel && !agent_unresponsive && !shutdown {
+        // A cost-populated UsageUpdate that lands after a timer-driven orphan
+        // cancel proves the turn actually finished; the cancel was premature.
+        // End cleanly as prompt_complete (no worker restart, no "didn't notify
+        // the daemon" banner), the post-cancel sibling of the pre-grace #2237
+        // recovery. The cancel makes the adapter resolve as
+        // StopReason::Cancelled, so this must outrank both prompt_orphaned and
+        // prompt_cancelled. A genuinely RPC-wedged adapter (cancel-escalation
+        // grace fired, so agent_unresponsive / shutdown) is excluded here and
+        // still restarts the worker, since the connection may be unusable for
+        // the next prompt. See #2370.
+        "prompt_complete"
     } else if prompt_orphaned {
         "prompt_orphaned"
     } else if agent_unresponsive {
@@ -930,8 +1058,9 @@ fn terminal_stop_reason(
 /// grace policy: the cost-bearing `UsageUpdate` is claude-agent-acp's
 /// end-of-turn marker, so once it has arrived the fast grace applies;
 /// otherwise the vendor-agnostic off-protocol floor governs. A pending
-/// scheduled wake (`wake_until` in the future) suppresses firing so a
-/// legitimately-sleeping monitor is never killed early.
+/// scheduled wake (`wake_at` in the future) suppresses firing so a
+/// legitimately-sleeping monitor is never killed early; once `wake_at` is
+/// in the past the turn is treated as finished and self-heals fast (#2371).
 /// State update the between-prompt watchdog should apply for one inbound
 /// notification's classified signals. `None` when neither a lifecycle nor a
 /// wakeup signal is present (ambient updates do not touch the watchdog).
@@ -946,57 +1075,86 @@ fn terminal_stop_reason(
 struct BetweenPromptUpdate {
     cost_seen: bool,
     last_lifecycle_at: i64,
-    wake_until: i64,
+    /// Absolute wake timestamp (ms) of the most recent pending scheduled
+    /// wake, `0` when none. The watchdog suppresses while `now < wake_at`
+    /// (a future wake the agent is legitimately sleeping toward) and, once
+    /// the wake `at` has passed with no agent resume, treats the turn as
+    /// finished and fires on the fast grace instead of the 30-minute floor.
+    /// Stored as the wake `at` directly (not `at + floor`) so an expired
+    /// wake self-heals promptly. See #2371.
+    wake_at: i64,
 }
 
 fn between_prompt_signal_update(
     lifecycle: Option<&LifecycleSignal>,
     wakeup: Option<&LifecycleSignal>,
     now_ms: i64,
-    prev_wake_until: i64,
+    prev_wake_at: i64,
 ) -> Option<BetweenPromptUpdate> {
     let mut update = match lifecycle {
         Some(LifecycleSignal::TerminalUsage) => Some(BetweenPromptUpdate {
             cost_seen: true,
             last_lifecycle_at: now_ms,
-            wake_until: prev_wake_until,
+            wake_at: prev_wake_at,
         }),
         Some(_) => Some(BetweenPromptUpdate {
             cost_seen: false,
             last_lifecycle_at: now_ms,
-            wake_until: prev_wake_until,
+            wake_at: prev_wake_at,
         }),
         None => None,
     };
-    // A scheduled wake (a re-armed monitor) suppresses firing until its
-    // deadline. Multiple wakes extend, never shorten, suppression.
+    // A scheduled wake (a re-armed monitor or /loop fallback) suppresses
+    // firing until its `at`. Multiple wakes extend, never shorten,
+    // suppression, so keep the latest deadline.
     if let Some(LifecycleSignal::WakeupPending { at }) = wakeup {
-        let deadline = at.timestamp_millis() + OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
         update = Some(BetweenPromptUpdate {
             cost_seen: false,
             last_lifecycle_at: now_ms,
-            wake_until: deadline.max(prev_wake_until),
+            wake_at: at.timestamp_millis().max(prev_wake_at),
         });
     }
     update
 }
 
+#[allow(clippy::too_many_arguments)]
 fn between_prompt_should_fire(
     active: bool,
     now_ms: i64,
     last_lifecycle_ms: i64,
-    wake_until_ms: i64,
+    wake_at_ms: Option<i64>,
     cost_seen: bool,
+    tools_in_flight: bool,
+    off_protocol_work_seen: bool,
     fast_grace: std::time::Duration,
     floor: std::time::Duration,
 ) -> bool {
     if !active {
         return false;
     }
-    if now_ms < wake_until_ms {
+    // An in-flight tool (npm install, Playwright, a Task subagent) means the
+    // turn is legitimately busy; never fire while one is open. See #1401.
+    if tools_in_flight {
         return false;
     }
-    let grace = if cost_seen { fast_grace } else { floor };
+    // A future wake is the agent legitimately sleeping toward `at`; suppress
+    // until it passes so a parked /loop or monitor is not killed early.
+    if wake_at_ms.is_some_and(|at| now_ms < at) {
+        return false;
+    }
+    let expired_wake = wake_at_ms.is_some_and(|at| now_ms >= at);
+    // Off-protocol work (backgrounded Bash, async sub-agent) completes on the
+    // protocol while the real work keeps running, so hold the conservative
+    // floor even though no tool is "in flight". See #1401, #1858. Otherwise a
+    // cost-resolved end-of-turn marker OR an expired wake (the agent should
+    // have resumed and did not) means the turn is done: self-heal fast.
+    let grace = if off_protocol_work_seen {
+        floor
+    } else if cost_seen || expired_wake {
+        fast_grace
+    } else {
+        floor
+    };
     now_ms - last_lifecycle_ms >= grace.as_millis() as i64
 }
 
@@ -1320,6 +1478,142 @@ struct ElicitationResolutionMessage {
 
 type PendingResponders = Arc<Mutex<HashMap<Nonce, PendingResponder>>>;
 
+type ToolContextCache = Arc<std::sync::Mutex<ToolCallContextCache>>;
+
+const TOOL_CONTEXT_CACHE_LIMIT: usize = 256;
+
+#[derive(Debug, Default)]
+struct ToolCallContextCache {
+    raw_inputs: HashMap<String, serde_json::Value>,
+    insertion_order: VecDeque<String>,
+}
+
+impl ToolCallContextCache {
+    fn record(&mut self, tool_call_id: String, raw_input: serde_json::Value) {
+        if raw_input_has_no_user_context(&raw_input) {
+            return;
+        }
+        if !self.raw_inputs.contains_key(&tool_call_id) {
+            self.insertion_order.push_back(tool_call_id.clone());
+        }
+        self.raw_inputs.insert(tool_call_id, raw_input);
+        self.enforce_limit();
+    }
+
+    fn get(&self, tool_call_id: &str) -> Option<serde_json::Value> {
+        self.raw_inputs.get(tool_call_id).cloned()
+    }
+
+    fn remove(&mut self, tool_call_id: &str) {
+        self.raw_inputs.remove(tool_call_id);
+        self.insertion_order.retain(|id| id != tool_call_id);
+    }
+
+    fn enforce_limit(&mut self) {
+        while self.raw_inputs.len() > TOOL_CONTEXT_CACHE_LIMIT {
+            let Some(oldest) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.raw_inputs.remove(&oldest);
+        }
+    }
+}
+
+fn permission_raw_input_with_context(
+    permission_raw: Option<&serde_json::Value>,
+    cached_raw: Option<&serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let cached_raw =
+        cached_raw.and_then(|cached| (!raw_input_has_no_user_context(cached)).then_some(cached));
+    match (permission_raw, cached_raw) {
+        (Some(permission), Some(cached)) => Some(merge_permission_raw_input(permission, cached)),
+        (Some(permission), None) if permission.is_null() => None,
+        (Some(permission), None) => Some(permission.clone()),
+        (None, Some(cached)) => Some(cached.clone()),
+        (None, None) => None,
+    }
+}
+
+fn merge_permission_raw_input(
+    permission_raw: &serde_json::Value,
+    cached_raw: &serde_json::Value,
+) -> serde_json::Value {
+    if let (serde_json::Value::Object(permission), serde_json::Value::Object(cached)) =
+        (permission_raw, cached_raw)
+    {
+        let mut merged = cached.clone();
+        for (key, value) in permission {
+            merged.insert(key.clone(), value.clone());
+        }
+        return serde_json::Value::Object(merged);
+    }
+
+    if raw_input_has_no_user_context(permission_raw) {
+        cached_raw.clone()
+    } else {
+        permission_raw.clone()
+    }
+}
+
+fn raw_input_has_no_user_context(raw_input: &serde_json::Value) -> bool {
+    match raw_input {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(map) => map.keys().all(|key| key.starts_with("_aoe_")),
+        _ => false,
+    }
+}
+
+fn update_tool_context_cache(
+    cache: &ToolContextCache,
+    event: &Event,
+    source_update: &SessionUpdate,
+) {
+    match event {
+        Event::ToolCallStarted { tool_call } => {
+            if let Some(raw_input) = raw_input_for_tool_event(source_update, &tool_call.id) {
+                cache
+                    .lock()
+                    .expect("tool context cache mutex poisoned")
+                    .record(tool_call.id.clone(), raw_input);
+            }
+        }
+        Event::ToolCallUpdated { tool_call_id, .. } => {
+            if let Some(raw_input) = raw_input_for_tool_event(source_update, tool_call_id) {
+                cache
+                    .lock()
+                    .expect("tool context cache mutex poisoned")
+                    .record(tool_call_id.clone(), raw_input);
+            }
+        }
+        Event::ToolCallCompleted { tool_call_id, .. } => {
+            cache
+                .lock()
+                .expect("tool context cache mutex poisoned")
+                .remove(tool_call_id);
+        }
+        _ => {}
+    }
+}
+
+fn raw_input_for_tool_event(
+    source_update: &SessionUpdate,
+    tool_call_id: &str,
+) -> Option<serde_json::Value> {
+    match source_update {
+        SessionUpdate::ToolCall(tool_call)
+            if tool_call.tool_call_id.0.to_string() == tool_call_id =>
+        {
+            tool_call.raw_input.clone()
+        }
+        SessionUpdate::ToolCallUpdate(update)
+            if update.tool_call_id.0.to_string() == tool_call_id =>
+        {
+            update.fields.raw_input.clone()
+        }
+        _ => None,
+    }
+}
+
 /// Top-level ACP client. Owns the subprocess lifetime and pumps events
 /// from the connection task.
 pub struct AcpClient {
@@ -1366,9 +1660,27 @@ impl SessionSandbox {
         source_profile: Option<String>,
     ) -> Result<(Self, SandboxPathMap), AcpError> {
         let project_path_str = project_path.to_string_lossy().to_string();
-        let (volumes, workdir) =
+        let (volumes, computed_workdir) =
             crate::session::container_config::compute_volume_paths(project_path, &project_path_str)
                 .map_err(|e| AcpError::Spawn(format!("compute container workdir: {e}")))?;
+        // The workdir must be what the container was actually created with, not
+        // a live recompute. `compute_volume_paths` resolves the worktree's git
+        // linkage and silently collapses to `/workspace/<basename>` once that
+        // linkage breaks on the host (and it ignores multi-repo `workspace_info`),
+        // which would `docker exec -w` into a path the container never mounted
+        // (#2414). Prefer the create-time-pinned value, then the live container's
+        // own `WorkingDir`, and only fall back to the recompute when neither is
+        // available (no container created yet). The mount map stays the computed
+        // project volumes; making it workspace-complete needs `workspace_info`,
+        // which the reattach path does not carry (tracked separately).
+        let workdir = sandbox
+            .container_workdir
+            .clone()
+            .or_else(|| {
+                crate::containers::get_container_runtime()
+                    .container_working_dir(&sandbox.container_name)
+            })
+            .unwrap_or(computed_workdir);
         let mounts: Vec<(PathBuf, PathBuf)> = volumes
             .into_iter()
             .map(|v| (PathBuf::from(v.container_path), PathBuf::from(v.host_path)))
@@ -1510,11 +1822,19 @@ impl AcpClient {
             seed_history_replay: config.seed_history_replay,
         };
         let sandbox_pair = if let Some(info) = &config.sandbox_info {
-            Some(SessionSandbox::from_info(
-                info,
-                config.cwd.as_path(),
-                config.source_profile.clone(),
-            )?)
+            // `from_info` resolves the container workdir, which touches git2 and
+            // (for a legacy session with no pinned workdir) shells out to
+            // `docker inspect`. Run it off the async executor.
+            let info = info.clone();
+            let cwd = config.cwd.clone();
+            let profile = config.source_profile.clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    SessionSandbox::from_info(&info, cwd.as_path(), profile)
+                })
+                .await
+                .map_err(|e| AcpError::Spawn(format!("sandbox resolve task panicked: {e}")))??,
+            )
         } else {
             None
         };
@@ -2894,6 +3214,11 @@ fn is_transcript_event(event: &Event) -> bool {
             | Event::ApprovalRequested { .. }
             | Event::ApprovalResolved { .. }
             | Event::RawAgentUpdate { .. }
+            // A replayed launch must be dropped too: the tailer spawn is
+            // skipped during suppression, so letting it through would
+            // create a running record with nothing to ever complete it.
+            | Event::BackgroundAgentLaunched { .. }
+            | Event::PromptRuntimeError { .. }
     )
 }
 
@@ -2917,6 +3242,7 @@ fn transcript_event_kind(event: &Event) -> &'static str {
         Event::ApprovalRequested { .. } => "approval_requested",
         Event::ApprovalResolved { .. } => "approval_resolved",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
+        Event::PromptRuntimeError { .. } => "prompt_runtime_error",
         _ => "other",
     }
 }
@@ -3456,12 +3782,25 @@ fn map_update_to_events(
                 });
             }
             if completed {
+                // An async sub-agent launch (Claude `Task` with isAsync)
+                // completes immediately with the `Async agent launched
+                // successfully` marker while the real work runs
+                // off-protocol. Flag it so renderers draw a neutral
+                // background-sub-agent card and drop the marker body
+                // (which leaks an internal agent id). Same detector the
+                // silent-orphan watchdog uses; this just forwards it to
+                // the UI event stream.
+                let async_subagent = matches!(
+                    detect_off_protocol_work_completed(&update.fields.content),
+                    Some(OffProtocolWorkKind::AsyncAgent)
+                );
                 events.push(Event::ToolCallCompleted {
                     tool_call_id: id,
                     is_error,
                     content: content_text,
                     output: output_blocks,
                     completed_at: chrono::Utc::now(),
+                    async_subagent,
                 });
             } else if !content_text.is_empty() {
                 events.push(Event::ToolCallContent {
@@ -3469,7 +3808,18 @@ fn map_update_to_events(
                     content: content_text,
                 });
             } else if events.is_empty() {
-                events.push(raw_event(&update));
+                // The async sub-agent launch rides a metadata-only
+                // ToolCallUpdate (`_meta.claudeCode.toolName == "Agent"`,
+                // status "async_launched", no status/content/title), so it
+                // lands here rather than the unknown-variant catch-all
+                // below. Promote it to a typed BackgroundAgentLaunched so
+                // the daemon tails the agent's transcript; otherwise pass
+                // the raw payload through unchanged.
+                let payload = serde_json::to_value(&update).unwrap_or(serde_json::Value::Null);
+                match background_agent_launched_from_value(&payload) {
+                    Some(event) => events.push(event),
+                    None => events.push(Event::RawAgentUpdate { payload }),
+                }
             }
             // claude-agent-acp emits the initial `tool_call` frame for
             // ScheduleWakeup with empty `raw_input`; the actual
@@ -3578,6 +3928,7 @@ fn map_update_to_events(
                     content: String::new(),
                     output: Vec::new(),
                     completed_at: now,
+                    async_subagent: false,
                 },
             ]
         }
@@ -3650,11 +4001,53 @@ fn map_update_to_events(
             );
             vec![Event::ConfigOptionsUpdated { options }]
         }
+        // Ignore agent-pushed session titles. AoE owns automatic renaming via
+        // `session::smart_rename`; forwarding Claude ACP title suggestions here
+        // gives the session two competing auto-title writers.
+        SessionUpdate::SessionInfoUpdate(_) => Vec::new(),
         // Variants we don't have a typed mapping for yet pass through as
         // RawAgentUpdate so the UI can render best-effort and we can
         // narrow these as we go.
         other => vec![raw_event(&other)],
     }
+}
+
+/// Detect a Claude async sub-agent launch in an otherwise-unmapped ACP
+/// update and build a typed `BackgroundAgentLaunched`. The launch arrives
+/// as `{ _meta: { claudeCode: { toolName: "Agent", toolResponse: {
+/// agentId, description, prompt, resolvedModel, outputFile, status:
+/// "async_launched" } } }, toolCallId }`. Returns `None` for anything
+/// else (the caller falls back to `RawAgentUpdate`). Field extraction is
+/// fully defensive: a missing `agentId` is the only hard requirement.
+fn background_agent_launched_from_value(v: &serde_json::Value) -> Option<Event> {
+    let cc = v.get("_meta")?.get("claudeCode")?;
+    if cc.get("toolName").and_then(|t| t.as_str()) != Some("Agent") {
+        return None;
+    }
+    let tr = cc.get("toolResponse")?;
+    if tr.get("status").and_then(|s| s.as_str()) != Some("async_launched") {
+        return None;
+    }
+    let agent_id = tr.get("agentId").and_then(|s| s.as_str())?.to_string();
+    let str_field = |key: &str| {
+        tr.get(key)
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    Some(Event::BackgroundAgentLaunched {
+        agent_id,
+        tool_call_id: v
+            .get("toolCallId")
+            .and_then(|s| s.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        description: str_field("description"),
+        prompt: str_field("prompt"),
+        model: str_field("resolvedModel"),
+        output_file: str_field("outputFile"),
+        started_at: chrono::Utc::now(),
+    })
 }
 
 /// Build a `ConfigOptionsUpdated` event from a session response's
@@ -3911,6 +4304,7 @@ async fn emit_permission_denied(event_tx: &mpsc::Sender<Event>, tool_call_id: &s
             content: content.to_string(),
             output: Vec::new(),
             completed_at: chrono::Utc::now(),
+            async_subagent: false,
         })
         .await;
 }
@@ -4263,6 +4657,10 @@ async fn run_connection_task<W, R>(
     let event_tx_for_block = event_tx.clone();
     let pending_for_perm = pending_responders.clone();
     let pending_for_elicit = pending_responders.clone();
+    let tool_context_cache: ToolContextCache =
+        Arc::new(std::sync::Mutex::new(ToolCallContextCache::default()));
+    let tool_context_cache_for_notif = tool_context_cache.clone();
+    let tool_context_cache_for_perm = tool_context_cache.clone();
     let mut cmd_rx = cmd_rx;
     let session_label_for_log = session_label.clone();
 
@@ -4341,14 +4739,30 @@ async fn run_connection_task<W, R>(
     let last_lifecycle_at = Arc::new(AtomicI64::new(now_ms));
     let between_prompt_active = Arc::new(AtomicBool::new(false));
     let between_prompt_cost_seen = Arc::new(AtomicBool::new(false));
-    let between_prompt_wake_until = Arc::new(AtomicI64::new(0));
+    // Wake `at` (ms) of the latest pending scheduled wake, 0 when none.
+    let between_prompt_wake_at = Arc::new(AtomicI64::new(0));
+    // In-flight tool calls for the between-prompt (agent-initiated) path,
+    // keyed by tool_call_id -> the `run_in_background` flag observed at
+    // ToolStarted. Mirrors the per-prompt SilentOrphanWatchdog's
+    // `tool_calls_in_flight` map (by id, not a count, so duplicate or
+    // unmatched completions cannot drift the state). See #2371.
+    let between_prompt_tools = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        bool,
+    >::new()));
+    // Latched true when a successful tool completion carried an off-protocol
+    // marker OR its launch set `run_in_background`: the work keeps running
+    // after the ToolCall completes, so the watchdog holds the floor.
+    let between_prompt_off_protocol = Arc::new(AtomicBool::new(false));
     let prompt_in_flight = Arc::new(AtomicBool::new(false));
     let last_event_at_for_notif = last_event_at.clone();
     let first_event_after_attach_for_notif = first_event_after_attach.clone();
     let last_lifecycle_at_for_notif = last_lifecycle_at.clone();
     let between_prompt_active_for_notif = between_prompt_active.clone();
     let between_prompt_cost_seen_for_notif = between_prompt_cost_seen.clone();
-    let between_prompt_wake_until_for_notif = between_prompt_wake_until.clone();
+    let between_prompt_wake_at_for_notif = between_prompt_wake_at.clone();
+    let between_prompt_tools_for_notif = between_prompt_tools.clone();
+    let between_prompt_off_protocol_for_notif = between_prompt_off_protocol.clone();
     let prompt_in_flight_for_notif = prompt_in_flight.clone();
 
     // Per-session tracker that drops claude-agent-acp's leaked consolidated
@@ -4382,9 +4796,13 @@ async fn run_connection_task<W, R>(
                 let between_prompt_active = between_prompt_active_for_notif.clone();
                 let between_prompt_cost_seen =
                     between_prompt_cost_seen_for_notif.clone();
-                let between_prompt_wake_until =
-                    between_prompt_wake_until_for_notif.clone();
+                let between_prompt_wake_at =
+                    between_prompt_wake_at_for_notif.clone();
+                let between_prompt_tools = between_prompt_tools_for_notif.clone();
+                let between_prompt_off_protocol =
+                    between_prompt_off_protocol_for_notif.clone();
                 let prompt_in_flight = prompt_in_flight_for_notif.clone();
+                let tool_context_cache = tool_context_cache_for_notif.clone();
                 async move {
                     last_event_at
                         .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
@@ -4450,7 +4868,7 @@ async fn run_connection_task<W, R>(
                             lifecycle_signal.as_ref(),
                             wakeup_signal.as_ref(),
                             now,
-                            between_prompt_wake_until.load(Ordering::Relaxed),
+                            between_prompt_wake_at.load(Ordering::Relaxed),
                         ) {
                             between_prompt_active.store(true, Ordering::Relaxed);
                             between_prompt_cost_seen.store(u.cost_seen, Ordering::Relaxed);
@@ -4460,11 +4878,49 @@ async fn run_connection_task<W, R>(
                             // than from a possibly-stale earlier progress
                             // event. See #2325 review.
                             last_lifecycle_at.store(u.last_lifecycle_at, Ordering::Relaxed);
-                            between_prompt_wake_until.store(u.wake_until, Ordering::Relaxed);
+                            between_prompt_wake_at.store(u.wake_at, Ordering::Relaxed);
+                        }
+                        // Track in-flight tool calls and off-protocol work for
+                        // the between-prompt path so the idle watchdog never
+                        // fires while a tool is open or backgrounded work is
+                        // still running. Mirrors the per-prompt watchdog's
+                        // `tool_calls_in_flight` + `off_protocol_work_seen`.
+                        // See #2371, #1401.
+                        match lifecycle_signal.as_ref() {
+                            Some(LifecycleSignal::ToolStarted {
+                                id,
+                                is_background_task,
+                            }) => {
+                                let mut tools = between_prompt_tools
+                                    .lock()
+                                    .expect("between-prompt tools mutex poisoned");
+                                let entry = tools.entry(id.clone()).or_insert(false);
+                                *entry = *entry || *is_background_task;
+                            }
+                            Some(LifecycleSignal::ToolCompleted {
+                                id,
+                                succeeded,
+                                off_protocol_work,
+                            }) => {
+                                let was_background = between_prompt_tools
+                                    .lock()
+                                    .expect("between-prompt tools mutex poisoned")
+                                    .remove(id)
+                                    .unwrap_or(false);
+                                // A failed launch keeps no background work
+                                // running, so it must not pin the floor.
+                                if *succeeded
+                                    && (off_protocol_work.is_some() || was_background)
+                                {
+                                    between_prompt_off_protocol
+                                        .store(true, Ordering::Relaxed);
+                                }
+                            }
+                            _ => {}
                         }
                     }
-                    let mapped_events =
-                        map_update_to_events(notification.update, profile);
+                    let update_for_tool_context = notification.update.clone();
+                    let mapped_events = map_update_to_events(notification.update, profile);
                     // Deliver lifecycle signals BEFORE publishing the
                     // user-visible event vector. The watchdog uses
                     // ToolStarted / ToolCompleted / WakeupPending /
@@ -4500,6 +4956,28 @@ async fn run_connection_task<W, R>(
                         .await;
                     }
                     for event in mapped_events {
+                        // An async sub-agent launch: spawn a tailer that
+                        // follows the agent's on-disk transcript and emits
+                        // BackgroundAgent{Progress,Completed}. The tailer
+                        // owns its own lifecycle (self-terminates on
+                        // completion, hard-idle, or when event_tx closes),
+                        // so it can never outlive the session. Skipped on
+                        // replay (the agent already finished). See
+                        // src/acp/background_agent.rs.
+                        if let Event::BackgroundAgentLaunched {
+                            agent_id,
+                            output_file,
+                            ..
+                        } = &event
+                        {
+                            if !suppressing && !output_file.is_empty() {
+                                crate::acp::background_agent::spawn_tailer(
+                                    agent_id.clone(),
+                                    output_file.clone(),
+                                    event_tx.clone(),
+                                );
+                            }
+                        }
                         // During the post-load replay window, drop only
                         // events that would reproduce the prior turns'
                         // visible transcript (assistant chunks, tool
@@ -4517,6 +4995,11 @@ async fn run_connection_task<W, R>(
                             );
                             continue;
                         }
+                        update_tool_context_cache(
+                            &tool_context_cache,
+                            &event,
+                            &update_for_tool_context,
+                        );
                         if event_tx.send(event).await.is_err() {
                             break;
                         }
@@ -4532,9 +5015,17 @@ async fn run_connection_task<W, R>(
                   _conn| {
                 let event_tx = event_tx_for_perm.clone();
                 let pending = pending_for_perm.clone();
+                let tool_context_cache = tool_context_cache_for_perm.clone();
                 async move {
-                    handle_permission_request(request, responder, event_tx, pending, profile)
-                        .await
+                    handle_permission_request(
+                        request,
+                        responder,
+                        event_tx,
+                        pending,
+                        profile,
+                        tool_context_cache,
+                    )
+                    .await
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -5138,16 +5629,36 @@ async fn run_connection_task<W, R>(
                     cmd = cmd_rx.recv() => cmd,
                     _ = between_prompt_idle_tick.tick() => {
                         let now = chrono::Utc::now().timestamp_millis();
+                        let wake_at = match between_prompt_wake_at.load(Ordering::Relaxed) {
+                            0 => None,
+                            at => Some(at),
+                        };
+                        let tools_in_flight = !between_prompt_tools
+                            .lock()
+                            .expect("between-prompt tools mutex poisoned")
+                            .is_empty();
                         if between_prompt_should_fire(
                             between_prompt_active.load(Ordering::Relaxed),
                             now,
                             last_lifecycle_at.load(Ordering::Relaxed),
-                            between_prompt_wake_until.load(Ordering::Relaxed),
+                            wake_at,
                             between_prompt_cost_seen.load(Ordering::Relaxed),
+                            tools_in_flight,
+                            between_prompt_off_protocol.load(Ordering::Relaxed),
                             BETWEEN_PROMPT_IDLE_GRACE,
                             OFF_PROTOCOL_WORK_GRACE_FLOOR,
                         ) {
+                            // Clear all between-prompt state so a stale expired
+                            // wake can't accelerate (or an off-protocol latch
+                            // can't pin) the next agent-initiated turn. See #2371.
                             between_prompt_active.store(false, Ordering::Relaxed);
+                            between_prompt_cost_seen.store(false, Ordering::Relaxed);
+                            between_prompt_wake_at.store(0, Ordering::Relaxed);
+                            between_prompt_off_protocol.store(false, Ordering::Relaxed);
+                            between_prompt_tools
+                                .lock()
+                                .expect("between-prompt tools mutex poisoned")
+                                .clear();
                             info!(
                                 target: "acp.protocol",
                                 session = %session_label,
@@ -5194,6 +5705,17 @@ async fn run_connection_task<W, R>(
                         // Stopped emit below clears `prompt_in_flight`. See #2325.
                         prompt_in_flight.store(true, Ordering::Relaxed);
                         between_prompt_active.store(false, Ordering::Relaxed);
+                        // A real prompt supersedes any agent-initiated turn the
+                        // between-prompt watchdog was tracking; reset its state
+                        // so a leftover wake / off-protocol latch / open tool
+                        // from the prior turn can't skew this prompt. See #2371.
+                        between_prompt_cost_seen.store(false, Ordering::Relaxed);
+                        between_prompt_wake_at.store(0, Ordering::Relaxed);
+                        between_prompt_off_protocol.store(false, Ordering::Relaxed);
+                        between_prompt_tools
+                            .lock()
+                            .expect("between-prompt tools mutex poisoned")
+                            .clear();
                         info!(target: "acp.protocol", "sending prompt ({} content blocks)", blocks.len());
                         // Drive the prompt request concurrently with the
                         // command channel so out-of-band notifications
@@ -5253,6 +5775,7 @@ async fn run_connection_task<W, R>(
                             tokio::time::sleep(silent_orphan_check_period);
                         tokio::pin!(silent_orphan_check);
 
+                        let prompt_started_at_ms = chrono::Utc::now().timestamp_millis();
                         let prompt_fut = connection
                             .send_request(PromptRequest::new(acp_session_id.clone(), blocks))
                             .block_task();
@@ -5749,6 +6272,44 @@ async fn run_connection_task<W, R>(
                         //   - the finished-but-unacked recovery breaks with
                         //     no flag set, falling through to prompt_complete
                         //     so the turn does NOT restart the worker (#2237).
+                        // Apply any lifecycle signal still queued when the loop
+                        // broke. A cost-populated UsageUpdate can land in the
+                        // same tick prompt_fut resolves, so without this drain
+                        // the watchdog state read below could miss it and
+                        // misclassify a finished turn. Mirrors the
+                        // start-of-prompt drain. See #2370.
+                        while let Ok(env) = lifecycle_signal_rx.try_recv() {
+                            if env.epoch == this_prompt_epoch {
+                                watchdog.apply_signal(
+                                    env.signal,
+                                    tokio::time::Instant::now(),
+                                    chrono::Utc::now(),
+                                    watchdog_cfg,
+                                );
+                            }
+                        }
+                        // A cost-populated UsageUpdate after a timer-driven
+                        // orphan cancel proves the turn finished; the cancel was
+                        // premature. terminal_stop_reason demotes it to
+                        // prompt_complete unless the adapter is still RPC-wedged.
+                        // See #2370.
+                        let finished_after_orphan_cancel = orphan_cancel_sent
+                            && watchdog.cost_seen()
+                            && watchdog.off_protocol_work_seen().is_none();
+                        if profile.key == "opencode"
+                            && watchdog.cost_seen()
+                            && !watchdog.saw_progress()
+                            && watchdog.off_protocol_work_seen().is_none()
+                        {
+                            if let Some(message) = recover_opencode_prompt_error(
+                                &acp_session_id.0,
+                                prompt_started_at_ms,
+                            ) {
+                                let _ = event_tx_for_block
+                                    .send(Event::PromptRuntimeError { message })
+                                    .await;
+                            }
+                        }
                         let reason = terminal_stop_reason(
                             rate_limited,
                             force_stopped,
@@ -5756,6 +6317,7 @@ async fn run_connection_task<W, R>(
                             agent_unresponsive,
                             shutdown,
                             prompt_cancelled,
+                            finished_after_orphan_cancel,
                         );
                         let _ = event_tx_for_block
                             .send(Event::Stopped {
@@ -6364,6 +6926,7 @@ async fn handle_permission_request(
     event_tx: mpsc::Sender<Event>,
     pending: PendingResponders,
     profile: &'static agent_profiles::AgentProfile,
+    tool_context_cache: ToolContextCache,
 ) -> agent_client_protocol::Result<()> {
     let enter_ns = enter_timestamp_ns();
     let tool_call_id = request.tool_call.tool_call_id.0.to_string();
@@ -6381,10 +6944,20 @@ async fn handle_permission_request(
         .title
         .clone()
         .unwrap_or_else(|| "tool call".into());
-    // Empty (not the literal "null") when the permission request ships no
-    // raw_input, which Gemini's confirm-required tools routinely do. The
-    // approval card then renders a clean empty-state. See #1713.
-    let args_preview = preview_optional_args(request.tool_call.fields.raw_input.as_ref());
+    let cached_raw_input = tool_context_cache
+        .lock()
+        .expect("tool context cache mutex poisoned")
+        .get(&tool_call_id);
+    // Empty (not the literal "null") when neither the permission request nor a
+    // previously forwarded tool update has raw_input. Gemini's confirm-required
+    // tools routinely do this. See #1713. opencode sometimes sends an
+    // external_directory permission reusing a tool_call_id whose earlier tool
+    // update had the command, so merge that context before emitting events.
+    let enriched_raw_input = permission_raw_input_with_context(
+        request.tool_call.fields.raw_input.as_ref(),
+        cached_raw_input.as_ref(),
+    );
+    let args_preview = preview_optional_args(enriched_raw_input.as_ref());
     let tool_call = ToolCall {
         id: request.tool_call.tool_call_id.0.to_string(),
         name: title,
@@ -6608,6 +7181,7 @@ async fn handle_elicitation_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     #[tokio::test]
     async fn fake_client_round_trips_events() {
@@ -6641,6 +7215,74 @@ mod tests {
         // ellipsis. "ééé" is 6 bytes total, so we expect "éé...".
         let out = truncate_for_log("ééé", 5);
         assert_eq!(out, "éé...");
+    }
+
+    fn create_opencode_error_test_db(rows: &[(&str, i64, Option<&str>)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        for (idx, (session_id, created, error_message)) in rows.iter().enumerate() {
+            let data = if let Some(message) = error_message {
+                serde_json::json!({
+                    "role": "assistant",
+                    "time": { "created": created },
+                    "error": { "data": { "message": message } },
+                })
+            } else {
+                serde_json::json!({
+                    "role": "assistant",
+                    "time": { "created": created },
+                })
+            };
+            conn.execute(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    format!("msg-{idx}"),
+                    session_id,
+                    created,
+                    created,
+                    data.to_string()
+                ],
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn recover_opencode_prompt_error_from_sqlite_returns_latest_matching_error() {
+        let dir = create_opencode_error_test_db(&[
+            ("ses-1", 99, Some("old error")),
+            ("ses-1", 100, None),
+            ("ses-1", 110, Some("new error")),
+            ("ses-2", 120, Some("wrong session")),
+        ]);
+        let db_path = dir.path().join("opencode.db");
+        let result = recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100);
+        assert_eq!(result.as_deref(), Some("new error"));
+    }
+
+    #[test]
+    fn recover_opencode_prompt_error_from_sqlite_returns_none_without_match() {
+        let dir = create_opencode_error_test_db(&[
+            ("ses-1", 90, Some("too early")),
+            ("ses-1", 100, None),
+            ("ses-2", 110, Some("wrong session")),
+        ]);
+        let db_path = dir.path().join("opencode.db");
+        let result = recover_opencode_prompt_error_from_sqlite_at(&db_path, "ses-1", 100);
+        assert_eq!(result, None);
     }
 
     // -------------------------------------------------------------------
@@ -6754,7 +7396,7 @@ mod tests {
     #[test]
     fn terminal_stop_reason_all_false_is_prompt_complete() {
         assert_eq!(
-            terminal_stop_reason(false, false, false, false, false, false),
+            terminal_stop_reason(false, false, false, false, false, false, false),
             "prompt_complete"
         );
     }
@@ -6763,22 +7405,55 @@ mod tests {
     fn terminal_stop_reason_precedence_is_preserved() {
         // rate_limited wins over everything.
         assert_eq!(
-            terminal_stop_reason(true, true, true, true, true, true),
+            terminal_stop_reason(true, true, true, true, true, true, true),
             "rate_limited"
         );
         // force_stopped beats a prompt_orphaned flag set earlier.
         assert_eq!(
-            terminal_stop_reason(false, true, true, false, false, false),
+            terminal_stop_reason(false, true, true, false, false, false, false),
             "user_forced"
         );
         // prompt_orphaned (genuine wedge) wins over a later shutdown/cancel.
         assert_eq!(
-            terminal_stop_reason(false, false, true, false, true, false),
+            terminal_stop_reason(false, false, true, false, true, false, false),
             "prompt_orphaned"
         );
         assert_eq!(
-            terminal_stop_reason(false, false, false, false, false, true),
+            terminal_stop_reason(false, false, false, false, false, true, false),
             "cancelled"
+        );
+    }
+
+    #[test]
+    fn terminal_stop_reason_late_cost_demotes_orphan_and_cancelled() {
+        // #2370: the orphan cancel fired on the timer, the adapter then
+        // resolved the prompt as Cancelled (because we cancelled), but a
+        // cost-populated UsageUpdate proved the turn finished. The demotion
+        // must outrank BOTH prompt_orphaned and prompt_cancelled.
+        assert_eq!(
+            terminal_stop_reason(false, false, true, false, false, true, true),
+            "prompt_complete"
+        );
+    }
+
+    #[test]
+    fn terminal_stop_reason_late_cost_does_not_mask_rpc_wedge_or_user_intent() {
+        // #2370: a cost frame proves the model work finished, but if the
+        // adapter is still wedged on the RPC (cancel-escalation grace fired)
+        // the worker connection may be unusable for the next prompt, so the
+        // genuine-wedge restart must survive.
+        assert_eq!(
+            terminal_stop_reason(false, false, true, true, true, true, true),
+            "prompt_orphaned"
+        );
+        // rate_limited and user force_stopped still win over the demotion.
+        assert_eq!(
+            terminal_stop_reason(true, false, true, false, false, true, true),
+            "rate_limited"
+        );
+        assert_eq!(
+            terminal_stop_reason(false, true, true, false, false, true, true),
+            "user_forced"
         );
     }
 
@@ -6791,7 +7466,7 @@ mod tests {
     fn between_prompt_inactive_never_fires() {
         // No agent-initiated turn tracked, even long past any grace.
         assert!(!between_prompt_should_fire(
-            false, 10_000_000, 0, 0, true, FAST, FLOOR
+            false, 10_000_000, 0, None, true, false, false, FAST, FLOOR
         ));
     }
 
@@ -6804,8 +7479,10 @@ mod tests {
             true,
             last + grace_ms - 500,
             last,
-            0,
+            None,
             true,
+            false,
+            false,
             FAST,
             FLOOR
         ));
@@ -6814,8 +7491,10 @@ mod tests {
             true,
             last + grace_ms + 500,
             last,
-            0,
+            None,
             true,
+            false,
+            false,
             FAST,
             FLOOR
         ));
@@ -6824,12 +7503,15 @@ mod tests {
     #[test]
     fn between_prompt_uses_floor_without_cost() {
         let last = 1_000_000;
-        // 21s idle but no cost marker: the generous floor governs, no fire.
+        // 21s idle but no cost marker and no expired wake: the generous floor
+        // governs (a turn doing silent background work, #1858), no fire.
         assert!(!between_prompt_should_fire(
             true,
             last + 21_000,
             last,
-            0,
+            None,
+            false,
+            false,
             false,
             FAST,
             FLOOR
@@ -6839,7 +7521,9 @@ mod tests {
             true,
             last + 30 * 60 * 1000 + 1,
             last,
-            0,
+            None,
+            false,
+            false,
             false,
             FAST,
             FLOOR
@@ -6847,20 +7531,105 @@ mod tests {
     }
 
     #[test]
-    fn between_prompt_suppressed_while_wake_pending() {
+    fn between_prompt_suppressed_while_future_wake_pending() {
+        // A future wake (#1401): the agent is deliberately asleep toward `at`.
+        // Suppressed even long past the floor.
         let last = 1_000_000;
-        let now = last + 60_000; // idle well past fast grace
-        let wake_until = now + 5_000; // a re-armed monitor still sleeping
-                                      // Suppressed: the agent is deliberately asleep on a scheduled wake.
+        let now = last + 60_000;
+        let wake_at = now + 5_000; // still in the future relative to `now`
         assert!(!between_prompt_should_fire(
-            true, now, last, wake_until, true, FAST, FLOOR
+            true,
+            now,
+            last,
+            Some(wake_at),
+            false,
+            false,
+            false,
+            FAST,
+            FLOOR
         ));
-        // Once the wake deadline passes, the idle grace governs again.
+    }
+
+    #[test]
+    fn between_prompt_expired_wake_fires_on_fast_grace() {
+        // The #2371 bug: the agent scheduled a wake for `wake_at`, kept working
+        // past it, then went quiet without resuming. Once the wake `at` is in
+        // the past and no tool / off-protocol work protects the turn, it must
+        // self-heal on the fast grace, NOT the 30-minute floor.
+        let last = 1_000_000;
+        let wake_at = last - 10_000; // already expired when the turn went quiet
+                                     // Just under the fast grace: still waiting.
+        assert!(!between_prompt_should_fire(
+            true,
+            last + FAST.as_millis() as i64 - 500,
+            last,
+            Some(wake_at),
+            false,
+            false,
+            false,
+            FAST,
+            FLOOR
+        ));
+        // Past the fast grace: fire, instead of holding the floor for 30 min.
         assert!(between_prompt_should_fire(
             true,
-            wake_until + 21_000,
+            last + FAST.as_millis() as i64 + 500,
             last,
-            wake_until,
+            Some(wake_at),
+            false,
+            false,
+            false,
+            FAST,
+            FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_expired_wake_suppressed_while_tool_in_flight() {
+        // Wake expired AND a tool is still open (a fired wake that resumed and
+        // launched a long tool): never fire while a tool runs. Preserves #1401.
+        let last = 1_000_000;
+        let wake_at = last - 10_000;
+        assert!(!between_prompt_should_fire(
+            true,
+            last + 60_000,
+            last,
+            Some(wake_at),
+            false,
+            true, // tool in flight
+            false,
+            FAST,
+            FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_expired_wake_with_off_protocol_holds_floor() {
+        // Wake expired and no tool open, but a backgrounded Bash / async agent
+        // is still running off-protocol: hold the floor, do not fast-fire and
+        // kill the background work. Preserves #1401 / #1858.
+        let last = 1_000_000;
+        let wake_at = last - 10_000;
+        // 21s in: fast grace would have fired, but off-protocol holds the floor.
+        assert!(!between_prompt_should_fire(
+            true,
+            last + 21_000,
+            last,
+            Some(wake_at),
+            false,
+            false,
+            true, // off-protocol work latched
+            FAST,
+            FLOOR
+        ));
+        // Past the floor it still fires (the floor, not a permanent pin).
+        assert!(between_prompt_should_fire(
+            true,
+            last + 30 * 60 * 1000 + 1,
+            last,
+            Some(wake_at),
+            false,
+            false,
             true,
             FAST,
             FLOOR
@@ -6880,7 +7649,7 @@ mod tests {
             BetweenPromptUpdate {
                 cost_seen: true,
                 last_lifecycle_at: 500_000,
-                wake_until: 0,
+                wake_at: 0,
             }
         );
     }
@@ -6894,7 +7663,7 @@ mod tests {
             BetweenPromptUpdate {
                 cost_seen: false,
                 last_lifecycle_at: 500_000,
-                wake_until: 0,
+                wake_at: 0,
             }
         );
     }
@@ -6906,10 +7675,10 @@ mod tests {
     }
 
     #[test]
-    fn between_prompt_signal_update_wakeup_extends_suppression() {
+    fn between_prompt_signal_update_wakeup_stores_at_and_never_shortens() {
         let at = chrono::DateTime::from_timestamp_millis(600_000).unwrap();
-        let expected_deadline = 600_000 + OFF_PROTOCOL_WORK_GRACE_FLOOR.as_millis() as i64;
-        // A later wake deadline wins; an earlier prev does not shorten it.
+        // The wake `at` is stored directly (not `at + floor`), so an expired
+        // wake can self-heal on the fast grace. See #2371.
         let u = between_prompt_signal_update(
             None,
             Some(&LifecycleSignal::WakeupPending { at }),
@@ -6922,18 +7691,18 @@ mod tests {
             BetweenPromptUpdate {
                 cost_seen: false,
                 last_lifecycle_at: 500_000,
-                wake_until: expected_deadline,
+                wake_at: 600_000,
             }
         );
-        // A larger prev_wake_until is preserved (suppression only extends).
+        // A later pending wake does not shorten suppression: keep the max.
         let u2 = between_prompt_signal_update(
             None,
             Some(&LifecycleSignal::WakeupPending { at }),
             500_000,
-            expected_deadline + 10_000,
+            900_000,
         )
         .unwrap();
-        assert_eq!(u2.wake_until, expected_deadline + 10_000);
+        assert_eq!(u2.wake_at, 900_000);
     }
 
     #[test]
@@ -6955,8 +7724,10 @@ mod tests {
             true,
             cost_now + 2_000,
             u.last_lifecycle_at,
-            u.wake_until,
+            None,
             u.cost_seen,
+            false,
+            false,
             FAST,
             FLOOR,
         ));
@@ -6965,8 +7736,10 @@ mod tests {
             true,
             cost_now + FAST.as_millis() as i64 + 1,
             u.last_lifecycle_at,
-            u.wake_until,
+            None,
             u.cost_seen,
+            false,
+            false,
             FAST,
             FLOOR,
         ));
@@ -6999,6 +7772,39 @@ mod tests {
         assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60), cfg));
         // And must eventually fire after the full base grace.
         assert!(w.should_fire(t0 + std::time::Duration::from_secs(125), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_cost_seen_clears_when_progress_resumes() {
+        // #2370: finished_after_orphan_cancel reads cost_seen() directly to
+        // demote a premature orphan cancel. If a cost marker arrives but the
+        // turn then resumes real work, cost_seen() must flip back to false so a
+        // turn that did NOT finish is never demoted to prompt_complete.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        assert!(
+            w.cost_seen(),
+            "cost marker must be observable after TerminalUsage"
+        );
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert!(
+            !w.cost_seen(),
+            "progress after the cost marker means the turn resumed; must not demote"
+        );
     }
 
     #[tokio::test]
@@ -7430,6 +8236,51 @@ mod tests {
         assert!(classify_rate_limit_from_message("connection refused").is_none());
     }
 
+    /// Regression for issue #2414 on the structured-view path: `from_info`
+    /// must use the create-time-pinned `SandboxInfo::container_workdir`, not a
+    /// live recompute. With the worktree's git linkage broken,
+    /// `compute_volume_paths` collapses to `/workspace/<basename>` (a path the
+    /// container never mounted), so the pin has to win.
+    #[test]
+    fn from_info_prefers_pinned_workdir_over_live_recompute() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Orphaned worktree: a `.git` file whose gitdir points nowhere.
+        let worktree = tmp.path().join("repo-worktrees").join("feature");
+        std::fs::create_dir_all(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../does-not-exist/.git/worktrees/feature\n",
+        )
+        .unwrap();
+
+        let sandbox = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-pinned1".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: Some("/workspace/repo-worktrees/feature".into()),
+        };
+
+        // Pin present, so no live inspect is attempted; the pinned value is used.
+        let (resources, _map) = SessionSandbox::from_info(&sandbox, &worktree, None).unwrap();
+        assert_eq!(
+            resources.container_workdir,
+            PathBuf::from("/workspace/repo-worktrees/feature"),
+        );
+
+        // The pin is load-bearing: the live recompute on this orphaned worktree
+        // collapses to the basename, which is the path that never got mounted.
+        let (_volumes, computed) = crate::session::container_config::compute_volume_paths(
+            &worktree,
+            &worktree.to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(computed, "/workspace/feature");
+    }
+
     /// Sandboxed structured view spawn must wrap the agent command in
     /// `docker exec` argv with `-i`, the container workdir, an `-e`
     /// flag per env entry, then the container name, then the agent
@@ -7448,6 +8299,7 @@ mod tests {
             extra_env: Some(vec!["MY_LITERAL=hello".into()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
@@ -7516,6 +8368,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
@@ -7588,6 +8441,7 @@ mod tests {
             extra_env: None,
             custom_instruction: None,
             before_start_env: Vec::new(),
+            container_workdir: None,
         };
         let config = SpawnConfig {
             agent_key: "claude".into(),
@@ -7734,7 +8588,9 @@ mod tests {
             AcpError::Spawn(msg) => {
                 assert!(msg.contains("codex-acp"), "should echo the binary: {msg}");
                 assert!(
-                    msg.contains("Install with: npm install -g @zed-industries/codex-acp"),
+                    msg.contains(
+                        "Install with: npm install -g @agentclientprotocol/codex-acp@latest"
+                    ),
                     "should append the exact install command: {msg}"
                 );
             }
@@ -8082,6 +8938,92 @@ mod tests {
         assert_eq!(preview_optional_args(Some(&serde_json::Value::Null)), "");
         let obj = serde_json::json!({ "command": "ls" });
         assert_eq!(preview_optional_args(Some(&obj)), r#"{"command":"ls"}"#);
+    }
+
+    #[test]
+    fn permission_raw_input_uses_cached_context_when_request_is_empty() {
+        let cached = serde_json::json!({ "command": "mkdir -p /tmp/opencode", "workdir": "/tmp" });
+        let enriched = permission_raw_input_with_context(None, Some(&cached))
+            .expect("cached context should be used");
+
+        assert_eq!(enriched.get("command"), cached.get("command"));
+        assert_eq!(enriched.get("workdir"), cached.get("workdir"));
+    }
+
+    #[test]
+    fn permission_raw_input_merges_cached_context_without_overwriting_request() {
+        let permission =
+            serde_json::json!({ "filepath": "/tmp/opencode", "command": "permission command" });
+        let cached = serde_json::json!({ "command": "mkdir -p /tmp/opencode", "workdir": "/tmp" });
+        let enriched = permission_raw_input_with_context(Some(&permission), Some(&cached))
+            .expect("non-empty permission args should remain present");
+
+        assert_eq!(enriched.get("command"), permission.get("command"));
+        assert_eq!(enriched.get("filepath"), permission.get("filepath"));
+        assert_eq!(enriched.get("workdir"), cached.get("workdir"));
+    }
+
+    #[test]
+    fn permission_raw_input_preserves_aoe_metadata_when_falling_back() {
+        let permission = serde_json::json!({ "_aoe_title": "external_directory" });
+        let cached = serde_json::json!({ "command": "mkdir -p /tmp/opencode" });
+        let enriched = permission_raw_input_with_context(Some(&permission), Some(&cached))
+            .expect("cached context should enrich bookkeeping-only requests");
+
+        assert_eq!(enriched.get("_aoe_title"), permission.get("_aoe_title"));
+        assert_eq!(enriched.get("command"), cached.get("command"));
+    }
+
+    #[test]
+    fn permission_raw_input_keeps_non_empty_non_object_request() {
+        let permission = serde_json::json!(["already", "specific"]);
+        let cached = serde_json::json!({ "command": "mkdir -p /tmp/opencode" });
+        let enriched = permission_raw_input_with_context(Some(&permission), Some(&cached))
+            .expect("non-empty permission args should remain present");
+
+        assert_eq!(enriched, permission);
+    }
+
+    #[test]
+    fn permission_raw_input_ignores_empty_cached_context() {
+        let cached = serde_json::json!({});
+        let enriched = permission_raw_input_with_context(None, Some(&cached));
+
+        assert!(enriched.is_none());
+    }
+
+    #[test]
+    fn tool_context_cache_ignores_empty_context_entries() {
+        let mut cache = ToolCallContextCache::default();
+        cache.record("tc-1".to_string(), serde_json::json!({}));
+
+        assert!(cache.get("tc-1").is_none());
+    }
+
+    #[test]
+    fn tool_context_cache_removes_completed_entries() {
+        let mut cache = ToolCallContextCache::default();
+        cache.record("tc-1".to_string(), serde_json::json!({ "command": "ls" }));
+        assert!(cache.get("tc-1").is_some());
+
+        cache.remove("tc-1");
+
+        assert!(cache.get("tc-1").is_none());
+        assert!(!cache.insertion_order.iter().any(|id| id == "tc-1"));
+    }
+
+    #[test]
+    fn tool_context_cache_enforces_bounded_size() {
+        let mut cache = ToolCallContextCache::default();
+        for idx in 0..=TOOL_CONTEXT_CACHE_LIMIT {
+            cache.record(format!("tc-{idx}"), serde_json::json!({ "idx": idx }));
+        }
+
+        assert_eq!(cache.raw_inputs.len(), TOOL_CONTEXT_CACHE_LIMIT);
+        assert!(cache.get("tc-0").is_none());
+        assert!(cache
+            .get(&format!("tc-{TOOL_CONTEXT_CACHE_LIMIT}"))
+            .is_some());
     }
 
     #[test]
@@ -8543,6 +9485,112 @@ mod tests {
     }
 
     #[test]
+    fn background_agent_launched_parsed_from_agent_meta() {
+        let payload = serde_json::json!({
+            "_meta": { "claudeCode": {
+                "toolName": "Agent",
+                "toolResponse": {
+                    "agentId": "a3d5ae46a7a0414b1",
+                    "description": "grep tmux mentions repo-wide",
+                    "prompt": "Grep the repo for tmux.",
+                    "resolvedModel": "claude-opus-4-8[1m]",
+                    "outputFile": "/tmp/x/tasks/a3d5ae46a7a0414b1.output",
+                    "status": "async_launched"
+                }
+            }},
+            "toolCallId": "toolu_012yUZykQT2vqFXZTvqWev5e"
+        });
+        match background_agent_launched_from_value(&payload) {
+            Some(Event::BackgroundAgentLaunched {
+                agent_id,
+                tool_call_id,
+                description,
+                model,
+                output_file,
+                ..
+            }) => {
+                assert_eq!(agent_id, "a3d5ae46a7a0414b1");
+                assert_eq!(tool_call_id, "toolu_012yUZykQT2vqFXZTvqWev5e");
+                assert_eq!(description, "grep tmux mentions repo-wide");
+                assert_eq!(model, "claude-opus-4-8[1m]");
+                assert!(output_file.ends_with(".output"));
+            }
+            other => panic!("expected BackgroundAgentLaunched, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tool_call_update_meta_emits_background_agent_launched() {
+        // The real path: the async launch arrives as a metadata-only
+        // ToolCallUpdate (no status/content/title), carrying the Agent
+        // payload under `_meta.claudeCode`. It must map to a typed
+        // BackgroundAgentLaunched, not a raw passthrough. This is the
+        // path the unit test on the helper alone did not cover.
+        use agent_client_protocol::schema::{SessionUpdate, ToolCallUpdate, ToolCallUpdateFields};
+        let mut meta = serde_json::Map::new();
+        meta.insert(
+            "claudeCode".to_string(),
+            serde_json::json!({
+                "toolName": "Agent",
+                "toolResponse": {
+                    "agentId": "a6654829ea0a19032",
+                    "description": "grep tmux mentions repo-wide",
+                    "prompt": "Grep the repo for tmux.",
+                    "resolvedModel": "claude-opus-4-8[1m]",
+                    "outputFile": "/tmp/x/tasks/a6654829ea0a19032.output",
+                    "status": "async_launched"
+                }
+            }),
+        );
+        let mut update = ToolCallUpdate::new("toolu_01HzYCZK", ToolCallUpdateFields::new());
+        update.meta = Some(meta);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        match events.iter().find_map(|e| match e {
+            Event::BackgroundAgentLaunched {
+                agent_id,
+                description,
+                output_file,
+                ..
+            } => Some((agent_id.clone(), description.clone(), output_file.clone())),
+            _ => None,
+        }) {
+            Some((id, desc, out)) => {
+                assert_eq!(id, "a6654829ea0a19032");
+                assert_eq!(desc, "grep tmux mentions repo-wide");
+                assert!(out.ends_with(".output"));
+            }
+            None => panic!("expected BackgroundAgentLaunched, got {events:?}"),
+        }
+        // It must NOT also leak a RawAgentUpdate for the same payload.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::RawAgentUpdate { .. })),
+            "async launch should not also pass through as RawAgentUpdate"
+        );
+    }
+
+    #[test]
+    fn background_agent_launched_ignores_non_agent_meta() {
+        // A normal tool-response RawAgentUpdate must not be promoted.
+        let bash = serde_json::json!({
+            "_meta": { "claudeCode": { "toolName": "Bash", "toolResponse": {} } }
+        });
+        assert!(background_agent_launched_from_value(&bash).is_none());
+        // An Agent update that is not an async launch (no status) stays raw.
+        let sync = serde_json::json!({
+            "_meta": { "claudeCode": { "toolName": "Agent", "toolResponse": {
+                "agentId": "x"
+            }}}
+        });
+        assert!(background_agent_launched_from_value(&sync).is_none());
+        assert!(background_agent_launched_from_value(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
     fn classify_lifecycle_signal_tool_call_defaults_run_in_background_false() {
         use agent_client_protocol::schema::ToolCall;
         let mut tc = ToolCall::new("tc-fg-1", "Bash");
@@ -8584,6 +9632,56 @@ mod tests {
                 assert_eq!(content, "abc1234 first commit");
             }
             other => panic!("expected ToolCallCompleted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tool_call_update_flags_async_subagent_launch() {
+        // Claude's async `Task` tool completes immediately with the SDK
+        // marker while the sub-agent runs off-protocol. The completion
+        // event must carry async_subagent so renderers draw a background
+        // card and drop the marker body (it leaks an internal agent id).
+        use agent_client_protocol::schema::{
+            Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Content(Content::new(
+                "Async agent launched successfully\nagentId: ae6f0567246843e25 (internal ID)",
+            ))]);
+        let update = ToolCallUpdate::new("tc-async", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        match events.iter().find_map(|e| match e {
+            Event::ToolCallCompleted { async_subagent, .. } => Some(*async_subagent),
+            _ => None,
+        }) {
+            Some(flag) => assert!(flag, "async sub-agent launch must set async_subagent"),
+            None => panic!("expected a ToolCallCompleted event, got {events:?}"),
+        }
+    }
+
+    #[test]
+    fn map_tool_call_update_normal_completion_is_not_async_subagent() {
+        use agent_client_protocol::schema::{
+            Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
+        let fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(vec![ToolCallContent::Content(Content::new("done"))]);
+        let update = ToolCallUpdate::new("tc-normal", fields);
+        let events = map_update_to_events(
+            SessionUpdate::ToolCallUpdate(update),
+            &agent_profiles::CLAUDE,
+        );
+        match events.iter().find_map(|e| match e {
+            Event::ToolCallCompleted { async_subagent, .. } => Some(*async_subagent),
+            _ => None,
+        }) {
+            Some(flag) => assert!(!flag, "normal completion must not set async_subagent"),
+            None => panic!("expected a ToolCallCompleted event, got {events:?}"),
         }
     }
 
@@ -8689,8 +9787,9 @@ mod tests {
         // The supervisor's post-spawn `set_mode(profile.yolo_mode_id)` is
         // gated by this same `is_mode_advertised` guard. Pin each adapter's
         // YOLO id against the modes that adapter actually advertises, so a
-        // mismatch (the #1142 codex bug: `bypassPermissions` vs `full-access`)
-        // can't silently get dropped again.
+        // mismatch (the #1142 codex bug, or the
+        // @agentclientprotocol/codex-acp `agent-full-access` rename) can't
+        // silently get dropped again.
         let claude_modes = Some(vec![
             "auto".to_string(),
             "default".to_string(),
@@ -8700,8 +9799,8 @@ mod tests {
         ]);
         let codex_modes = Some(vec![
             "read-only".to_string(),
-            "auto".to_string(),
-            "full-access".to_string(),
+            "agent".to_string(),
+            "agent-full-access".to_string(),
         ]);
 
         let claude_yolo = agent_profiles::resolve("claude").yolo_mode_id.unwrap();
@@ -8715,6 +9814,8 @@ mod tests {
             &codex_modes,
             false
         ));
+        // The old Zed adapter id is stale for @agentclientprotocol/codex-acp.
+        assert!(!is_mode_advertised("full-access", &codex_modes, false));
     }
 
     #[test]
@@ -9159,6 +10260,29 @@ mod tests {
                 .any(|e| matches!(e, Event::MonitorArmed { .. })),
             "no MonitorArmed should fire without command or description",
         );
+    }
+
+    #[test]
+    fn map_session_info_update_ignores_pushed_title() {
+        use agent_client_protocol::schema::SessionInfoUpdate;
+        let info = SessionInfoUpdate::new().title("Fix the flaky test".to_string());
+        let events = map_update_to_events(
+            SessionUpdate::SessionInfoUpdate(info),
+            &agent_profiles::CLAUDE,
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn map_session_info_update_without_title_emits_nothing() {
+        use agent_client_protocol::schema::SessionInfoUpdate;
+        // Null/undefined title (e.g. a timestamp-only update) yields no event.
+        let info = SessionInfoUpdate::new().updated_at("2026-06-25T00:00:00Z".to_string());
+        let events = map_update_to_events(
+            SessionUpdate::SessionInfoUpdate(info),
+            &agent_profiles::CLAUDE,
+        );
+        assert!(events.is_empty());
     }
 
     #[test]

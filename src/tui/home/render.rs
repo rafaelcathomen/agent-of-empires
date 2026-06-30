@@ -219,7 +219,7 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
         Status::Deleting => ICON_DELETING,
         Status::Creating => spinner_starting(&inst.created_at),
     };
-    if inst.is_archived() || inst.is_snoozed() {
+    if inst.is_archived() || inst.is_snoozed() || inst.is_trashed() {
         ICON_STOPPED
     } else {
         icon
@@ -1092,6 +1092,7 @@ impl HomeView {
                 // keyed by the header label.
                 let pinned = self.group_by == GroupByMode::Project
                     && !crate::session::is_within_archived_section(path)
+                    && !crate::session::is_within_trash_section(path)
                     && self.is_project_label_pinned(name);
                 let text = if pinned {
                     Cow::Owned(format!("{} ({}) {}", name, session_count, ICON_PINNED))
@@ -1106,7 +1107,9 @@ impl HomeView {
                 if color.is_some() {
                     style = style.fg(folder_color_fg(*color, theme)).bold();
                 }
-                if crate::session::is_within_archived_section(path) {
+                if crate::session::is_within_archived_section(path)
+                    || crate::session::is_within_trash_section(path)
+                {
                     // Synthetic Archived section header (and any
                     // project sub-folder rendered under it in Project
                     // mode): muted + italic + dim so it reads as a
@@ -1207,9 +1210,9 @@ impl HomeView {
                                 icon = ICON_UNREAD;
                                 style = style.add_modifier(ratatui::style::Modifier::BOLD);
                             }
-                            if inst.is_archived() {
-                                // Archived rows render with one uniform
-                                // muted glyph regardless of underlying
+                            if inst.is_archived() || inst.is_trashed() {
+                                // Archived and trashed rows render with one
+                                // uniform muted glyph regardless of underlying
                                 // status. The pane is dead, so painting
                                 // the persisted Running/Waiting status
                                 // would be misleading. The Archived
@@ -1252,7 +1255,7 @@ impl HomeView {
                             // prefixes are Attention-mode-only so users
                             // in Newest / AZ / etc. don't see decoration
                             // for state they didn't opt into managing.
-                            let title_text = if inst.is_archived() {
+                            let title_text = if inst.is_archived() || inst.is_trashed() {
                                 Cow::Owned(inst.title.clone())
                             } else if in_attention && inst.is_snoozed() {
                                 Cow::Owned(format!("z {}", inst.title))
@@ -1305,8 +1308,8 @@ impl HomeView {
                             if unread_overlay && !terminal_running {
                                 style = style.add_modifier(ratatui::style::Modifier::BOLD);
                             }
-                            if inst.is_archived() {
-                                // Archive lifecycle override mirrors the
+                            if inst.is_archived() || inst.is_trashed() {
+                                // Archive/trash lifecycle override mirrors the
                                 // Agent-view path: dim color, stopped
                                 // icon, no italic/dim modifier; the
                                 // Archived section header is the cue.
@@ -1328,7 +1331,7 @@ impl HomeView {
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::UNDERLINED);
                             }
-                            let title_text = if inst.is_archived() {
+                            let title_text = if inst.is_archived() || inst.is_trashed() {
                                 Cow::Owned(inst.title.clone())
                             } else if in_attention && inst.is_snoozed() {
                                 Cow::Owned(format!("z {}", inst.title))
@@ -2207,7 +2210,16 @@ impl HomeView {
         // Tool / Terminal views show a different, independently-live pane (a tool
         // session can be running while the agent has exited), so the placeholder
         // must not hide that pane's output there.
+        // A trashed session's pane was also killed (on trash). Same calm
+        // placeholder treatment as archived, with a restore hint.
+        let selected_trashed = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| inst.is_trashed());
+
         let selected_stopped = !selected_archived
+            && !selected_trashed
             && matches!(self.view_mode, ViewMode::Structured)
             && self
                 .selected_session
@@ -2222,7 +2234,7 @@ impl HomeView {
         // refresh reads from it. Done once here, not per-branch, so the
         // creating / no-selection / archived / stopped paths also retarget or
         // tear it down (no live pane feeds `None` so the worker stops capturing).
-        let desired = if selected_archived || selected_stopped {
+        let desired = if selected_archived || selected_trashed || selected_stopped {
             None
         } else {
             self.displayed_pane_tmux_name()
@@ -2231,6 +2243,12 @@ impl HomeView {
 
         if selected_archived {
             self.render_archived_preview(frame, inner, theme);
+            self.paint_preview_selection(frame, theme);
+            return;
+        }
+
+        if selected_trashed {
+            self.render_trashed_preview(frame, inner, theme);
             self.paint_preview_selection(frame, theme);
             return;
         }
@@ -2519,14 +2537,20 @@ impl HomeView {
     ///
     /// Only fires while live-send is active and the preview is at the live
     /// tail (`preview_scroll_offset == 0`): over scrolled-back history the
-    /// live cursor would land on the wrong row. The capture worker only
-    /// publishes a cursor when the displayed pane IS the live-send target, so
-    /// a `Some` here already means "this pane is the one being driven."
+    /// live cursor would land on the wrong row. The capture worker now
+    /// publishes a cursor for every previewed pane (the wheel forward reads its
+    /// mode flags), so this gates on `live_send` to keep painting confined to
+    /// the driven pane, and on `position_reliable` (false while the pane
+    /// scrolled mid-capture) to avoid painting on a row the cursor no longer
+    /// indexes.
     fn live_preview_cursor_pos(&self) -> Option<Position> {
         if self.live_send.is_none() || self.preview_scroll_offset != 0 {
             return None;
         }
         let cursor = self.preview_capture_worker.as_ref()?.current_cursor()?;
+        if !cursor.position_reliable {
+            return None;
+        }
         map_live_preview_cursor(self.preview_pane_area, self.preview_visible_rows, cursor)
     }
 
@@ -2732,6 +2756,61 @@ impl HomeView {
                 Span::styled(key, Style::default().fg(theme.hint).bold()),
                 Span::styled(" to unarchive it.", Style::default().fg(theme.dimmed)),
             ]),
+        ];
+        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        frame.render_widget(para, area);
+    }
+
+    /// Calm placeholder shown when the selected session is in the trash. Its
+    /// agent was stopped on trash but its transcript and workspace are kept;
+    /// it can be restored or permanently purged from here.
+    fn render_trashed_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let title = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .map(|inst| inst.title.clone())
+            .unwrap_or_default();
+        let body = if title.is_empty() {
+            "This session is in the trash. Its agent was stopped; its transcript and workspace are kept.".to_string()
+        } else {
+            format!(
+                "\"{}\" is in the trash. Its agent was stopped; its transcript and workspace are kept.",
+                title
+            )
+        };
+        let restore_key = if self.strict_hotkeys { "Z" } else { "z" };
+        // The permanent-delete keybind is blocked in Terminal view (it routes
+        // to a "Cannot delete terminal" dialog), so only advertise it in
+        // Structured view. Restore works in either. See #2489.
+        let hint = if self.view_mode == ViewMode::Terminal {
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled(restore_key, Style::default().fg(theme.hint).bold()),
+                Span::styled(" to restore.", Style::default().fg(theme.dimmed)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled(restore_key, Style::default().fg(theme.hint).bold()),
+                Span::styled(" to restore, or ", Style::default().fg(theme.dimmed)),
+                Span::styled(
+                    if self.strict_hotkeys { "D" } else { "d" },
+                    Style::default().fg(theme.hint).bold(),
+                ),
+                Span::styled(" to delete permanently.", Style::default().fg(theme.dimmed)),
+            ])
+        };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Trash",
+                Style::default().fg(theme.text).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(body, Style::default().fg(theme.dimmed))),
+            Line::from(""),
+            hint,
         ];
         let para = Paragraph::new(lines).alignment(Alignment::Center);
         frame.render_widget(para, area);
@@ -3236,8 +3315,11 @@ impl HomeView {
         let text = if let Some(s) = status {
             format!(" {s}  [Ctrl+x] dismiss")
         } else if let Some(info) = info {
+            // Reassure users (issue #2220) that updating is safe: it never
+            // tears down or interrupts running sessions. Kept after the keys so
+            // the action hints stay visible first on narrow terminals.
             format!(
-                " update available {} → {}  [{update_key}] update  [Ctrl+x] dismiss",
+                " update available {} → {}  [{update_key}] update  [Ctrl+x] dismiss  ·  running sessions stay safe",
                 info.current_version, info.latest_version
             )
         } else if image_update.is_some() {
@@ -3273,6 +3355,7 @@ mod tests {
             alternate_on: false,
             mouse_tracking: false,
             mouse_sgr: false,
+            position_reliable: true,
         }
     }
 

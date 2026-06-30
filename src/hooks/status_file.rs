@@ -72,7 +72,7 @@ fn parse_status(bytes: &[u8]) -> Option<Status> {
 /// Read a Claude session UUID from the hook-written `session_id` sidecar.
 ///
 /// Returns `None` when the file is absent, malformed (non-UUID), or older
-/// than [`SESSION_ID_SIDECAR_MAX_AGE`].
+/// than `SESSION_ID_SIDECAR_MAX_AGE`.
 pub fn read_hook_session_id(instance_id: &str) -> Option<String> {
     let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
     let meta = dir_guard::metadata_at(dir.as_fd(), "session_id").ok()??;

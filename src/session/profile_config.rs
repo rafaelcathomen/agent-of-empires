@@ -43,7 +43,7 @@ impl ProfileConfig {
 /// Load profile-specific config. Returns empty config if file doesn't exist.
 ///
 /// Pure read: never creates the profile directory. Goes through the
-/// non-creating path resolver so a GET /api/settings?profile=<unknown>
+/// non-creating path resolver so a GET `/api/settings?profile=<unknown>`
 /// (which the dashboard fires on mount before profiles resolve) does
 /// not pollute `profiles/` with a stub directory.
 pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
@@ -134,14 +134,14 @@ pub fn merge_configs(global: Config, profile: &ProfileConfig) -> Config {
 /// This works for every section without per-field arms, so adding a config
 /// field never touches a merge function. The deserialize is infallible in
 /// practice because every override-writing path (file load, server PATCH, TUI)
-/// type-checks against the schema first; see [`validate_overrides_typecheck`].
+/// type-checks against the schema first; see `validate_overrides_typecheck`.
 pub fn merge_configs_generic(global: &Config, overrides: &serde_json::Value) -> Config {
     let mut base = serde_json::to_value(global).expect("Config serializes to JSON");
     crate::session::settings_schema::merge_json(&mut base, overrides);
     serde_json::from_value(base).expect("merged config deserializes")
 }
 
-/// Validate Docker volume format (host:container[:options])
+/// Validate Docker volume format (`host:container[:options]`)
 pub fn validate_volume_format(volume: &str) -> Result<(), String> {
     if volume.is_empty() {
         return Err("Volume cannot be empty".to_string());

@@ -70,6 +70,16 @@ pub enum SessionCommands {
 
     /// Unarchive a session (restores it to its tier in the Attention sort)
     Unarchive(SessionIdArgs),
+
+    /// Restore a trashed session, returning it to its prior bucket with its
+    /// transcript and metadata intact. See #2489.
+    Restore(SessionIdArgs),
+
+    /// List the sessions currently in the trash.
+    ListTrash,
+
+    /// Permanently purge every trashed session in the profile (irreversible).
+    EmptyTrash,
 }
 
 #[derive(Args)]
@@ -259,6 +269,9 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Unfavorite(args) => unfavorite_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => unarchive_session(profile, args).await,
+        SessionCommands::Restore(args) => restore_session(profile, args).await,
+        SessionCommands::ListTrash => list_trash(profile).await,
+        SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
 }
 
@@ -339,6 +352,176 @@ async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         Ok(inst.title.clone())
     })?;
     println!("Unarchived: {}", title);
+    Ok(())
+}
+
+async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
+    let storage = Storage::new_unwatched(profile)?;
+
+    // Resolve within the trashed subset only. The CLI advertises the argument
+    // as an id OR title, and a live or archived session can share a title/path
+    // with a trashed one; resolving against the full list would let that row
+    // win and make `untrash()` a silent no-op on an already-live session.
+    // See #2489.
+    let (instances, _groups) = storage.load_with_groups()?;
+    let trashed: Vec<_> = instances
+        .iter()
+        .filter(|i| i.is_trashed())
+        .cloned()
+        .collect();
+    let mut inst = super::resolve_session(&args.identifier, &trashed)
+        .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?
+        .clone();
+    let restore_id = inst.id.clone();
+
+    // Move the worktree back to its pre-trash location before flipping the
+    // marker. Strict: if the original path is occupied or git refuses, leave
+    // the session trashed and surface the error rather than restoring it to
+    // the holding-area path.
+    if let crate::session::trash::RestoreOutcome::Failed { reason } =
+        crate::session::trash::restore_worktree_location(&mut inst)
+    {
+        anyhow::bail!("Cannot restore worktree: {reason}");
+    }
+    let restored_path = inst.project_path.clone();
+    let restored_pre = inst.pre_trash_project_path.clone();
+
+    let title = storage.update(|instances, _groups| {
+        let stored = instances
+            .iter_mut()
+            .find(|i| i.id == restore_id)
+            .ok_or_else(|| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?;
+        stored.project_path = restored_path.clone();
+        stored.pre_trash_project_path = restored_pre.clone();
+        stored.untrash();
+        Ok(stored.title.clone())
+    })?;
+    println!("Restored: {}", title);
+    Ok(())
+}
+
+async fn list_trash(profile: &str) -> Result<()> {
+    let storage = Storage::new_unwatched(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
+    let trashed: Vec<_> = instances.iter().filter(|i| i.is_trashed()).collect();
+    if trashed.is_empty() {
+        println!("Trash is empty.");
+        return Ok(());
+    }
+    println!("Trashed sessions in profile '{}':", storage.profile());
+    for inst in trashed {
+        let when = inst
+            .trashed_at
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "?".to_string());
+        println!("  {}  {}  (trashed {})", inst.id, inst.title, when);
+    }
+    Ok(())
+}
+
+async fn empty_trash(profile: &str) -> Result<()> {
+    let storage = Storage::new_unwatched(profile)?;
+
+    // Phase 1 (unlocked): snapshot the trashed sessions and run the slow
+    // teardown for each. Purge is permanent; force removal so a dirty
+    // worktree cannot keep an emptied session pinned in the trash.
+    let (instances, _groups) = storage.load_with_groups()?;
+    let trashed: Vec<_> = instances
+        .iter()
+        .filter(|i| i.is_trashed())
+        .cloned()
+        .collect();
+    if trashed.is_empty() {
+        println!("Trash is empty.");
+        return Ok(());
+    }
+
+    let mut purged_ids = Vec::new();
+    for inst in &trashed {
+        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+            profile,
+            std::path::Path::new(&inst.project_path),
+        );
+        let delete_worktree =
+            config.worktree.auto_cleanup && inst.has_managed_worktree_or_workspace();
+        // Tie branch deletion to worktree deletion + config so it also fires
+        // for multi-repo workspace sessions (which have no `worktree_info`);
+        // `perform_deletion` keys the workspace-repo branch cleanup off this
+        // same flag. See #2489.
+        let delete_branch = delete_worktree && config.worktree.delete_branch_on_cleanup;
+        let delete_sandbox =
+            inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) && config.sandbox.auto_cleanup;
+
+        let result = crate::session::deletion::perform_deletion(
+            &crate::session::deletion::DeletionRequest {
+                session_id: inst.id.clone(),
+                instance: inst.clone(),
+                delete_worktree,
+                delete_branch,
+                delete_sandbox,
+                force_delete: true,
+                detach_hooks: false,
+                keep_scratch: false,
+            },
+        );
+        for err in &result.errors {
+            eprintln!("Warning ({}): {}", inst.title, err);
+        }
+        // Only after teardown succeeded: purge the durable structured-view
+        // transcript (the daemon does this via the supervisor; the CLI opens
+        // the event store directly since it has no live worker) and drop the
+        // session row. Doing the irreversible transcript delete last keeps a
+        // failed purge fully restorable, and keeping the row on failure (here
+        // or in perform_deletion) lets the orphaned worktree/container/
+        // transcript be retried instead of abandoned. See #2489.
+        if result.success {
+            match super::purge_acp_transcript(inst) {
+                Ok(()) => purged_ids.push(inst.id.clone()),
+                Err(e) => eprintln!(
+                    "Warning ({}): transcript not purged, keeping session in trash: {}",
+                    inst.title, e
+                ),
+            }
+        }
+    }
+
+    // Phase 2 (locked): drop every successfully-purged id from the latest disk
+    // state. #2534: revalidate under the lock; a candidate restored mid-purge
+    // (no longer trashed) must survive even though its teardown already ran on
+    // the snapshot. #2527: report the count actually removed, not the candidate
+    // count, plus how many were kept (teardown/transcript failed, or restored).
+    let purged_set: HashSet<String> = purged_ids.into_iter().collect();
+    let candidate_ids: HashSet<String> = trashed.iter().map(|i| i.id.clone()).collect();
+    // Compute `kept` from candidate rows that are STILL present after the purge,
+    // not `candidates - removed`: a candidate a peer already removed before this
+    // lock is neither removed by us nor still around, so subtracting would
+    // wrongly report it as kept for retry.
+    let (removed, restored, kept) = storage.update(|all_instances, _groups| {
+        let (removed, restored) = super::apply_empty_trash_purge(all_instances, &purged_set);
+        let kept = all_instances
+            .iter()
+            .filter(|i| candidate_ids.contains(&i.id))
+            .count();
+        Ok((removed, restored, kept))
+    })?;
+    if restored > 0 {
+        eprintln!(
+            "Warning: {restored} session(s) were restored while the trash was being \
+             emptied; kept the restored records, but their worktree, branch, container, \
+             or transcript may already have been removed. Inspect and repair them."
+        );
+    }
+    if kept > 0 {
+        println!(
+            "Emptied trash: purged {removed} session(s), kept {kept} for retry, from profile '{}'.",
+            storage.profile()
+        );
+    } else {
+        println!(
+            "Emptied trash: purged {removed} session(s) from profile '{}'.",
+            storage.profile()
+        );
+    }
     Ok(())
 }
 

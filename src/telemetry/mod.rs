@@ -6,9 +6,9 @@
 //! - **`DO_NOT_TRACK` is absolute.** When set (`1` / `true` / `yes`), it
 //!   suppresses both sending and install-id generation regardless of config.
 //! - **Endpoint.** Opted-in sends go to the collection gateway at
-//!   [`DEFAULT_ENDPOINT`] (which validates and re-sanitizes as a backstop);
+//!   `DEFAULT_ENDPOINT` (which validates and re-sanitizes as a backstop);
 //!   `AOE_TELEMETRY_ENDPOINT` overrides it, e.g. to point at a local sink. A
-//!   compiled-in [`TELEMETRY_KEY`] is sent as `X-Telemetry-Key` so the gateway
+//!   compiled-in `TELEMETRY_KEY` is sent as `X-Telemetry-Key` so the gateway
 //!   can shed drive-by noise (it is visible in source, so not real auth).
 //! - **Fire-and-forget.** Sends run detached with a hard timeout (plus a short
 //!   connect timeout so a down endpoint fails fast) and swallow every error
@@ -22,6 +22,7 @@ pub mod aggregate;
 pub mod events;
 pub mod features;
 pub mod form_factor;
+pub mod plugins;
 pub mod sanitize;
 mod state;
 pub mod usage_signals;
@@ -115,7 +116,7 @@ pub fn do_not_track() -> bool {
 }
 
 /// The send endpoint. `AOE_TELEMETRY_ENDPOINT` overrides when set to a
-/// non-empty value; otherwise the compiled-in [`DEFAULT_ENDPOINT`] is used.
+/// non-empty value; otherwise the compiled-in `DEFAULT_ENDPOINT` is used.
 /// Always returns a target, so the opt-in gate (not a missing endpoint) is
 /// what decides whether anything is sent.
 pub fn endpoint() -> String {
@@ -415,6 +416,12 @@ pub fn build_usage_snapshot(
     snapshot.data_schema_version = crate::migrations::current_schema_version();
     snapshot.update_status = update_status;
     snapshot.update_releases_behind = update_releases_behind;
+    // Plugin census reads the loaded registry (disk-backed), so it is layered
+    // here rather than in the disk-free assembler, like the version-health
+    // fields above. Both the TUI and serve surfaces route through here.
+    let (plugins_by_source, plugins_active) = plugins::census(crate::plugin::registry().all());
+    snapshot.plugins_by_source = plugins_by_source;
+    snapshot.plugins_active = plugins_active;
     Some(snapshot)
 }
 
@@ -488,6 +495,10 @@ fn assemble_usage_snapshot(
         agent_switches: acp_counts.agent_switches,
         plan_mode_seen: acp_counts.plan_mode_seen,
         prompts_queued: acp_counts.prompts_queued,
+        // Plugin census reads the disk-backed registry; the disk-free assembler
+        // leaves these empty and `build_usage_snapshot` fills them.
+        plugins_by_source: BTreeMap::new(),
+        plugins_active: BTreeMap::new(),
     }
 }
 
@@ -581,12 +592,12 @@ pub fn build_cli_usage() -> Option<CliUsage> {
 /// Record one CLI subcommand invocation and flush the accumulated `cli_usage`
 /// event if a send is due. Called once per `aoe <subcommand>` run.
 ///
-/// Side-effect-free unless the install is opted in: the [`app_dir_exists`] gate
+/// Side-effect-free unless the install is opted in: the [`crate::session::app_dir_exists`] gate
 /// is a non-creating check, so app-data-free commands (`aoe completion`,
 /// `aoe init`, ...) on a not-opted-in install never materialize the app dir and
 /// keep working in read-only / sandboxed environments. The daily slot is claimed
 /// only after a *confirmed* send, so a failed send leaves the counts and the slot
-/// intact for the next invocation to retry (bounded by [`CLI_USAGE_RETRY_GAP`]).
+/// intact for the next invocation to retry (bounded by `CLI_USAGE_RETRY_GAP`).
 /// Awaited with a hard timeout so a dead endpoint can never hang the CLI's exit.
 pub async fn track_cli_command(name: &str) {
     // Cheap non-creating gate first: opt-in creates the app dir, so its absence
@@ -792,6 +803,8 @@ mod tests {
             agent_switches: 0,
             plan_mode_seen: false,
             prompts_queued: 0,
+            plugins_by_source: BTreeMap::new(),
+            plugins_active: BTreeMap::new(),
         }
     }
 

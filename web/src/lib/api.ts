@@ -1309,6 +1309,30 @@ export async function switchAcpAgent(
   });
 }
 
+export interface ViewSwitchResponse {
+  session_id: string;
+  view: "structured" | "terminal";
+}
+
+export type ViewSwitchResult = { ok: true; response: ViewSwitchResponse } | { ok: false; message: string };
+
+async function switchSessionView(sessionId: string, target: "enable" | "disable"): Promise<ViewSwitchResult> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/${target}`, {
+      method: "POST",
+    });
+    if (!res.ok) {
+      return { ok: false, message: (await res.text()) || `Server error (${res.status})` };
+    }
+    return { ok: true, response: (await res.json()) as ViewSwitchResponse };
+  } catch {
+    return { ok: false, message: "Could not change this session view. Please try again." };
+  }
+}
+
+export const enableStructuredView = (sessionId: string) => switchSessionView(sessionId, "enable");
+export const disableStructuredView = (sessionId: string) => switchSessionView(sessionId, "disable");
+
 // --- Acp install agent (Tier 2 of #2109) ---
 
 export interface InstallAgentResponse {

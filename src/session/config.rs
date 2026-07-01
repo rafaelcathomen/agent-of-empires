@@ -1189,6 +1189,16 @@ pub struct SessionConfig {
     #[setting(label = "Restart Wake Message", widget = "text")]
     pub restart_wake_message: String,
 
+    /// When enabled, the daemon relaunches any session whose tmux pane has
+    /// died but still has a resumable agent on daemon startup (e.g. after a
+    /// reboot or after the tmux server was killed). Disable to leave
+    /// dead-pane sessions alone until you reopen them by hand; a session you
+    /// Ctrl+C then stays down instead of being auto-restarted with the wake
+    /// message on the next daemon start.
+    #[serde(default = "default_true")]
+    #[setting(label = "Auto-recover sessions on startup", widget = "toggle")]
+    pub auto_recover_sessions: bool,
+
     /// What to show next to each session title: Auto (profile in all-profiles
     /// view), None, Profile (always), Sandbox (sb on sandboxed rows), or
     /// Branch.
@@ -1463,6 +1473,7 @@ impl Default for SessionConfig {
             trash_retention_days: default_trash_retention_days(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             restart_wake_message: default_restart_wake_message(),
+            auto_recover_sessions: true,
             row_tag: RowTagMode::default(),
             session_id_poller_max_threads: default_session_id_poller_max_threads(),
             live_send_exit_chord: default_live_send_exit_chord(),

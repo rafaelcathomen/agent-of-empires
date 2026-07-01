@@ -3440,6 +3440,17 @@ async fn daemon_startup_recovery_mark(
     crate::session::recovery::RecoveryLock,
     Vec<crate::session::Instance>,
 )> {
+    if !crate::session::Config::load_or_warn()
+        .session
+        .auto_recover_sessions
+    {
+        tracing::info!(
+            target: "session.startup_recovery",
+            "auto_recover_sessions is disabled; skipping daemon startup recovery",
+        );
+        return None;
+    }
+
     let lock = match crate::session::recovery::try_acquire_recovery_lock() {
         Ok(Some(l)) => l,
         Ok(None) => {

@@ -1105,8 +1105,18 @@
       "id": "session.lifecycle",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/session-rename.spec.ts", "tests/live/session-delete.spec.ts"],
-      "components": ["web/src/components/DeleteSessionDialog.tsx", "web/src/components/WorkspaceSidebar.tsx"]
+      "specs": [
+        "tests/live/session-rename.spec.ts",
+        "tests/live/session-delete.spec.ts",
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/__tests__/SessionViewConversionDialog.test.tsx",
+        "src/lib/api.acp.test.ts"
+      ],
+      "components": [
+        "web/src/components/DeleteSessionDialog.tsx",
+        "web/src/components/SessionViewConversionDialog.tsx",
+        "web/src/components/WorkspaceSidebar.tsx"
+      ]
     },
     {
       "id": "session.trash",

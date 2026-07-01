@@ -354,6 +354,17 @@ describe("SessionRow context menu", () => {
     expect(screen.queryByTestId("sidebar-context-menu-disable-structured")).toBeNull();
   });
 
+  it("shows structured conversion when an ACP-capable terminal session omits its view", () => {
+    const ws = workspace("w-implicit-terminal", [session({ acp_capable: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).not.toBeNull();
+  });
+
   it("hides structured conversion for a terminal session without ACP support", () => {
     const ws = workspace("w-terminal", [session({ view: "terminal", acp_capable: false })]);
     render(

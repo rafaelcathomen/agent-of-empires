@@ -257,10 +257,15 @@ fn trim_trailing_blank_rows(raw: &[u8]) -> &[u8] {
     &raw[..end]
 }
 
-/// `pipe-pane -I` (input injection) landed in tmux 2.8, and a dead-pane write
-/// crash was fixed in 3.4, so we require >= 3.4 before arming a channel. Older
-/// tmux (or a `tmux -V` we can't parse) falls back to the capture path. Cached:
-/// the server version doesn't change under a running aoe.
+/// `pipe-pane -I` (input injection) landed in tmux 2.8. A dead-pane write
+/// crash was reportedly fixed in 3.4, but tmux 3.4 (Ubuntu 3.4-1ubuntu0.1 with
+/// libevent 2.1.12) still segfaults the whole server when input reaches a pane
+/// whose process just exited; a double Ctrl+C that kills the agent followed by
+/// a second byte racing the pane teardown reproduces it (kernel log shows a
+/// repeatable segfault in libevent_core). We therefore require >= 3.5 before
+/// arming a channel. Older tmux (or a `tmux -V` we cannot parse) falls back to
+/// the safe capture path. Cached: the server version does not change under a
+/// running aoe.
 fn tmux_supports_pipe_pane_io() -> bool {
     static SUPPORTED: LazyLock<bool> = LazyLock::new(|| {
         let Ok(out) = Command::new("tmux").arg("-V").output() else {
@@ -277,7 +282,7 @@ fn tmux_supports_pipe_pane_io() -> bool {
         let mut parts = digits.split('.');
         let major: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         let minor: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-        (major, minor) >= (3, 4)
+        (major, minor) >= (3, 5)
     });
     *SUPPORTED
 }

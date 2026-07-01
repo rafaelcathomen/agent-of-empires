@@ -732,6 +732,9 @@ export interface AcpState {
    *  transient "Restarting…" banner appears without a reconnect button;
    *  cleared on AcpSessionAssigned or UserPromptSent. */
   workerRestarting: boolean;
+  /** True while a prompt deferred during history import is waiting for the
+   *  successful session assignment that closes the replay. */
+  importWaiting: boolean;
   /** Set true when the daemon publishes `Stopped { reason: "idle_auto_stop" }`,
    *  meaning the reconciler reaped the worker for inactivity
    *  (`acp.auto_stop_idle_secs`) and marked the session dormant. Unlike
@@ -940,6 +943,10 @@ export interface ActivityRow {
     | "session_cleared"
     | "compacted";
   text: string;
+  /** True while a locally rendered user prompt is waiting for its
+   *  authoritative UserPromptSent echo. Replay completion must leave these
+   *  rows active because their live turn begins after imported history. */
+  optimistic?: boolean;
   toolCallId?: string;
   /** Full ToolCall payload, present on tool_start rows so the UI can
    *  pick a per-kind renderer without needing to look the call up by
@@ -1026,6 +1033,7 @@ export function emptyAcpState(): AcpState {
     turnHasOutput: false,
     workerStopped: false,
     workerRestarting: false,
+    importWaiting: false,
     workerIdleStopped: false,
     queuedPrompts: [],
     nextWakeupAt: null,
@@ -1519,6 +1527,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("Stopped" in event) {
+    const historyReplayComplete = event.Stopped.reason === "history_replay_complete";
     // Final marker; nothing to mutate, but reset the inflight tool just
     // in case the agent forgot to emit a completion.
     //
@@ -1541,7 +1550,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // clear the "Stopping..." state regardless of reason. See #1727.
     next.cancelling = false;
     next.cancelEscalatesAt = null;
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
+    if (historyReplayComplete) {
+      const pendingOptimisticPrompts = next.activity.filter(
+        (row) => row.kind === "user_prompt" && row.optimistic === true,
+      ).length;
+      next.lastStoppedSeq = Math.max(next.lastStoppedSeq, next.pendingUserPromptSeq - pendingOptimisticPrompts);
+    } else {
+      next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
+    }
     next.turnActive = isTurnActive(next);
     // Clear the "monitoring" badge once the monitor has fired and that turn
     // ends. The monitor firing makes the agent act (a tool call after the
@@ -1640,7 +1656,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // retiring. In the race case, `turnHasOutput` still reflects the
     // turn being retired because UserPromptSent (which resets it) for
     // the follow-up hasn't been applied yet.
-    if (state.turnActive && !state.turnHasOutput) {
+    if (!historyReplayComplete && state.turnActive && !state.turnHasOutput) {
       next.activity = pushActivity(next.activity, {
         id: `empty-${frame.seq}`,
         kind: "empty_output",
@@ -1718,7 +1734,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // first server echo must promote the first optimistic row, not
     // the second, so the seq order matches the submission order.
     const matchIdx = next.activity.findIndex(
-      (r) => r.kind === "user_prompt" && r.text === text && !r.id.startsWith("user-seq-"),
+      (r) => r.kind === "user_prompt" && r.text === text && !r.id.startsWith("user-seq-") && r.optimistic !== false,
     );
     if (matchIdx >= 0) {
       // Optimistic-match path: promote the placeholder's id. The
@@ -1736,6 +1752,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
         updated[matchIdx] = {
           ...match,
           id: `user-seq-${frame.seq}`,
+          optimistic: undefined,
           attachments:
             match.attachments && match.attachments.length > 0
               ? match.attachments
@@ -1811,6 +1828,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // is online; clear both transient worker banners.
     next.workerStopped = false;
     next.workerRestarting = false;
+    next.importWaiting = false;
     // The respawn may have been triggered by waking an idle-dormant
     // worker; the fresh handshake means it is no longer dormant.
     next.workerIdleStopped = false;

@@ -27,6 +27,7 @@ use serde::Serialize;
 use crate::acp::claude_import::{
     cwd_is_aoe_scratch, cwd_under_worktree, normalize_cwd, worktree_dir_markers,
 };
+use crate::session::capture::parse_codex_rollout_metadata;
 
 /// Cap how many lines we read per rollout when extracting metadata. The `cwd`
 /// (session_meta, first record) and the first real user message live at the
@@ -48,6 +49,8 @@ pub struct CodexSessionSummary {
     pub last_modified_ms: u64,
     /// Whether `cwd` still exists.
     pub cwd_exists: bool,
+    #[serde(skip)]
+    is_child: bool,
 }
 
 /// Base directory Codex stores sessions under: `$CODEX_HOME/sessions` when
@@ -90,7 +93,7 @@ fn find_rollout_for_cwd_in(root: &Path, cwd: &str) -> Option<CodexSessionSummary
     let target = normalize_cwd(cwd);
     collect_summaries_in(root)
         .into_iter()
-        .find(|s| normalize_cwd(&s.cwd) == target)
+        .find(|s| !s.is_child && normalize_cwd(&s.cwd) == target)
 }
 
 /// Testable core of [`scan_sessions`]: all rollouts under `root`, with
@@ -99,7 +102,9 @@ fn scan_sessions_in(root: &Path) -> Vec<CodexSessionSummary> {
     let markers = worktree_dir_markers();
     collect_summaries_in(root)
         .into_iter()
-        .filter(|s| !cwd_is_aoe_scratch(&s.cwd) && !cwd_under_worktree(&s.cwd, &markers))
+        .filter(|s| {
+            !s.is_child && !cwd_is_aoe_scratch(&s.cwd) && !cwd_under_worktree(&s.cwd, &markers)
+        })
         .collect()
 }
 
@@ -158,6 +163,7 @@ fn summarize_rollout(path: &Path) -> Option<CodexSessionSummary> {
 
     let mut cwd: Option<String> = None;
     let mut title: Option<String> = None;
+    let mut is_child = false;
 
     for line in reader.lines().take(MAX_SCAN_LINES).map_while(Result::ok) {
         let line = line.trim();
@@ -167,18 +173,9 @@ fn summarize_rollout(path: &Path) -> Option<CodexSessionSummary> {
         let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
-        // `cwd` lives in the payload (session_meta / turn_context records).
-        if cwd.is_none() {
-            if let Some(c) = record
-                .get("payload")
-                .and_then(|p| p.get("cwd"))
-                .or_else(|| record.get("cwd"))
-                .and_then(|v| v.as_str())
-            {
-                if !c.is_empty() {
-                    cwd = Some(c.to_string());
-                }
-            }
+        if let Some(metadata) = parse_codex_rollout_metadata(line) {
+            cwd.get_or_insert(metadata.cwd);
+            is_child |= metadata.is_child;
         }
         if title.is_none() {
             title = extract_user_title(&record);
@@ -196,6 +193,7 @@ fn summarize_rollout(path: &Path) -> Option<CodexSessionSummary> {
         title,
         last_modified_ms,
         cwd_exists,
+        is_child,
     })
 }
 
@@ -295,6 +293,12 @@ mod tests {
         format!(r#"{{"timestamp":"t","type":"session_meta","payload":{{"cwd":"{cwd}"}}}}"#)
     }
 
+    fn subagent_meta(cwd: &str) -> String {
+        format!(
+            r#"{{"timestamp":"t","type":"session_meta","payload":{{"cwd":"{cwd}","thread_source":"subagent","source":{{"subagent":{{"thread_spawn":{{}}}}}},"parent_thread_id":"aaaaaaaa-1111-2222-3333-444444444444"}}}}"#
+        )
+    }
+
     fn user_msg(text: &str) -> String {
         let esc = text.replace('\\', "\\\\").replace('"', "\\\"");
         format!(
@@ -379,6 +383,33 @@ mod tests {
         assert_eq!(got.session_id, "bbbbbbbb-1111-2222-3333-444444444444");
         // Unknown cwd → None.
         assert!(find_rollout_for_cwd_in(tmp.path(), "/nope").is_none());
+    }
+
+    #[test]
+    fn find_rollout_for_cwd_skips_newer_subagent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("proj");
+        fs::create_dir(&work).unwrap();
+        let cwd = work.to_str().unwrap().to_string();
+
+        let top_level = write_rollout(
+            tmp.path(),
+            "aaaaaaaa-1111-2222-3333-444444444444",
+            "2026-06-28T09-00-00",
+            &[meta(&cwd), user_msg("terminal conversation")],
+        );
+        let child = write_rollout(
+            tmp.path(),
+            "bbbbbbbb-1111-2222-3333-444444444444",
+            "2026-06-28T11-00-00",
+            &[subagent_meta(&cwd), user_msg("child conversation")],
+        );
+        let now = std::time::SystemTime::now();
+        filetime_set(&top_level, now - std::time::Duration::from_secs(600));
+        filetime_set(&child, now);
+
+        let got = find_rollout_for_cwd_in(tmp.path(), &cwd).unwrap();
+        assert_eq!(got.session_id, "aaaaaaaa-1111-2222-3333-444444444444");
     }
 
     #[test]

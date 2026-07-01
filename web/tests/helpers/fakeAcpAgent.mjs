@@ -532,37 +532,41 @@ async function handleRequest(msg) {
       const result = { sessionId };
       const configOptions = buildSessionConfigOptions(sessionId);
       if (configOptions) result.configOptions = configOptions;
-      sendResult(id, result);
+      const scriptedLoadUpdates =
+        method === "session/load" && script.loadUpdatesBySession ? script.loadUpdatesBySession[sessionId] : null;
+      if (Array.isArray(scriptedLoadUpdates)) {
+        await emitSessionUpdates(sessionId, scriptedLoadUpdates);
+      }
       // Test hook for the import flow (#2276): on session/load, replay a
       // deterministic transcript chunk the way claude-agent-acp re-emits
       // prior history during a load. Lets the import spec assert the
       // imported transcript renders (seed-not-suppressed), while a normal
-      // reattach would drop it. Only on load, deferred after the response.
+      // reattach would drop it. The adapter awaits these notifications before
+      // returning session/load, so the response is the ordered replay fence.
       const loadReplay = process.env.FAKE_ACP_LOAD_REPLAY;
       if (method === "session/load" && loadReplay) {
-        setImmediate(() => {
-          // Replay a prior USER turn first (claude-agent-acp emits
-          // user_message_chunk for historical user messages), then the
-          // assistant reply, so the import spec can assert both render.
-          const userReplay = process.env.FAKE_ACP_LOAD_REPLAY_USER;
-          if (userReplay) {
-            sendNotification("session/update", {
-              sessionId,
-              update: {
-                sessionUpdate: "user_message_chunk",
-                content: { type: "text", text: userReplay },
-              },
-            });
-          }
+        // Replay a prior USER turn first (claude-agent-acp emits
+        // user_message_chunk for historical user messages), then the
+        // assistant reply, so the import spec can assert both render.
+        const userReplay = process.env.FAKE_ACP_LOAD_REPLAY_USER;
+        if (userReplay) {
           sendNotification("session/update", {
             sessionId,
             update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: loadReplay },
+              sessionUpdate: "user_message_chunk",
+              content: { type: "text", text: userReplay },
             },
           });
+        }
+        sendNotification("session/update", {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: loadReplay },
+          },
         });
       }
+      sendResult(id, result);
       return;
     }
 

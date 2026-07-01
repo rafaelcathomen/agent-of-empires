@@ -703,6 +703,22 @@ fn classify_lifecycle_signal(
         | SessionUpdate::AgentThoughtChunk(_)
         | SessionUpdate::Plan(_) => Some(LifecycleSignal::Progress),
         SessionUpdate::ToolCall(tc) => {
+            let id = tc.tool_call_id.0.to_string();
+            if matches!(tc.status, ToolCallStatus::Completed) {
+                let content = Some(tc.content.clone());
+                return Some(LifecycleSignal::ToolCompleted {
+                    id,
+                    succeeded: true,
+                    off_protocol_work: detect_off_protocol_work_completed(&content),
+                });
+            }
+            if matches!(tc.status, ToolCallStatus::Failed) {
+                return Some(LifecycleSignal::ToolCompleted {
+                    id,
+                    succeeded: false,
+                    off_protocol_work: None,
+                });
+            }
             let is_background_task = tc
                 .raw_input
                 .as_ref()
@@ -711,7 +727,7 @@ fn classify_lifecycle_signal(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             Some(LifecycleSignal::ToolStarted {
-                id: tc.tool_call_id.0.to_string(),
+                id,
                 is_background_task,
             })
         }
@@ -3722,6 +3738,24 @@ fn map_update_to_events(
         },
         SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
         SessionUpdate::ToolCall(tc) => {
+            let terminal_status = match tc.status {
+                agent_client_protocol::schema::ToolCallStatus::Completed => Some(false),
+                agent_client_protocol::schema::ToolCallStatus::Failed => Some(true),
+                _ => None,
+            };
+            let completion_content = terminal_status
+                .is_some()
+                .then(|| extract_tool_content_text(&tc.content));
+            let completion_output = terminal_status
+                .is_some()
+                .then(|| extract_tool_output_blocks(&tc.content));
+            let async_subagent = terminal_status.is_some_and(|is_error| {
+                !is_error
+                    && matches!(
+                        detect_off_protocol_work_completed(&Some(tc.content.clone())),
+                        Some(OffProtocolWorkKind::AsyncAgent)
+                    )
+            });
             let raw_args = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
             // Empty (not the literal "null") when the agent ships no
             // raw_input, so argless tool cards render a clean empty-state.
@@ -3790,6 +3824,16 @@ fn map_update_to_events(
                 if let Some(event) = wakeup_event_from_raw(&raw_args) {
                     events.push(event);
                 }
+            }
+            if let Some(is_error) = terminal_status {
+                events.push(Event::ToolCallCompleted {
+                    tool_call_id: tc.tool_call_id.0.to_string(),
+                    is_error,
+                    content: completion_content.unwrap_or_default(),
+                    output: completion_output.unwrap_or_default(),
+                    completed_at: chrono::Utc::now(),
+                    async_subagent,
+                });
             }
             events
         }
@@ -4831,6 +4875,13 @@ async fn run_connection_task<W, R>(
     let suppress_history_replay = Arc::new(AtomicBool::new(false));
     let suppress_for_notif = suppress_history_replay.clone();
     let suppress_for_block = suppress_history_replay.clone();
+    // Every session/load replays historical notifications. Ordinary reattach
+    // drops their visible transcript via `suppress_history_replay`; import seed
+    // keeps it, but still must prevent history from arming live watchdogs,
+    // poisoning message dedup, or spawning background tailers.
+    let replaying_history = Arc::new(AtomicBool::new(false));
+    let replaying_for_notif = replaying_history.clone();
+    let replaying_for_block = replaying_history.clone();
     let session_label_for_notif = session_label.clone();
 
     // Watchdog inputs (only consulted when `mode` is `Resume { in_flight_turn: true }`):
@@ -4918,6 +4969,7 @@ async fn run_connection_task<W, R>(
             move |notification: SessionNotification, _cx| {
                 let event_tx = event_tx_for_notif.clone();
                 let suppress = suppress_for_notif.clone();
+                let replaying_history = replaying_for_notif.clone();
                 let session_label = session_label_for_notif.clone();
                 let last_event_at = last_event_at_for_notif.clone();
                 let first_event_after_attach =
@@ -4942,6 +4994,7 @@ async fn run_connection_task<W, R>(
                     last_event_at
                         .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
                     let suppressing = suppress.load(Ordering::Relaxed);
+                    let replaying = replaying_history.load(Ordering::Acquire);
                     // Drop claude-agent-acp's leaked consolidated
                     // agent_message_chunk restatement before it reaches the
                     // watchdog, the event store, or any client (#2281). During
@@ -4951,7 +5004,7 @@ async fn run_connection_task<W, R>(
                         let mut dedup = agent_msg_dedup
                             .lock()
                             .expect("agent message dedup mutex poisoned");
-                        if suppressing {
+                        if suppressing || replaying {
                             dedup.reset();
                         } else if dedup.observe(&notification.update) {
                             debug!(
@@ -4981,7 +5034,7 @@ async fn run_connection_task<W, R>(
                         classify_watchdog_notification_signals(
                             &notification.update,
                             profile,
-                            suppressing,
+                            suppressing || replaying,
                         );
                     // Disarm resume-idle only on lifecycle-bearing
                     // notifications (progress/tool/terminal/wakeup). Pure
@@ -5117,7 +5170,7 @@ async fn run_connection_task<W, R>(
                             ..
                         } = &event
                         {
-                            if !suppressing && !output_file.is_empty() {
+                            if !suppressing && !replaying && !output_file.is_empty() {
                                 crate::acp::background_agent::spawn_tailer(
                                     agent_id.clone(),
                                     output_file.clone(),
@@ -5593,15 +5646,23 @@ async fn run_connection_task<W, R>(
                             if !seed_history_replay {
                                 suppress_for_block.store(true, Ordering::Relaxed);
                             }
+                            replaying_for_block.store(true, Ordering::Release);
                             let req = LoadSessionRequest::new(stored.clone(), cwd.clone())
                                 .mcp_servers(mcp_servers.clone());
                             match connection.send_request(req).block_task().await {
                                 Ok(resp) => {
+                                    // Supported adapters await every history
+                                    // notification before returning session/load.
+                                    // The ordered response is therefore the replay
+                                    // fence; notification callbacks also finish in
+                                    // the protocol dispatch loop before this future
+                                    // resolves.
+                                    replaying_for_block.store(false, Ordering::Release);
                                     info!(
                                         target: "acp.protocol",
                                         session = %session_label,
                                         stored_id = %stored,
-                                        "session/load succeeded; suppressing post-load history replay"
+                                        "session/load succeeded; replay response fence reached"
                                     );
                                     // Capture available mode info from the
                                     // load response before consuming resp.
@@ -5629,6 +5690,18 @@ async fn run_connection_task<W, R>(
                                     {
                                         has_config_option_mode = true;
                                     }
+                                    // Imported history contains multiple historical
+                                    // user prompts but no prompt-response boundary.
+                                    // Close the complete replay before advertising the
+                                    // session as promptable so reducers settle to Idle
+                                    // without retiring a raced live prompt.
+                                    if seed_history_replay {
+                                        let _ = event_tx_for_block
+                                            .send(Event::Stopped {
+                                                reason: "history_replay_complete".into(),
+                                            })
+                                            .await;
+                                    }
                                     // Emit AcpSessionAssigned even on resume so the
                                     // frontend reducer can clear any sticky
                                     // `startupError` / `lastError` from a prior crash
@@ -5654,6 +5727,7 @@ async fn run_connection_task<W, R>(
                                     acp_session_id = Some(SessionId::from(stored));
                                 }
                                 Err(e) if seed_history_replay => {
+                                    replaying_for_block.store(false, Ordering::Relaxed);
                                     // Import seed (#2276): the replay may have
                                     // partially populated the (otherwise empty)
                                     // event store before load failed. Falling
@@ -5680,6 +5754,7 @@ async fn run_connection_task<W, R>(
                                         "session/load failed, falling back to session/new: {e}"
                                     );
                                     suppress_for_block.store(false, Ordering::Relaxed);
+                                    replaying_for_block.store(false, Ordering::Relaxed);
                                     let _ = event_tx_for_block
                                         .send(Event::SessionContextReset {
                                             reason: format!("session/load failed: {e}"),
@@ -10181,6 +10256,64 @@ mod tests {
                 is_background_task, ..
             }) => assert!(!is_background_task),
             other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_lifecycle_signal_terminal_initial_tool_call_is_completed() {
+        use agent_client_protocol::schema::{SessionUpdate, ToolCall, ToolCallStatus};
+
+        for (status, succeeded) in [
+            (ToolCallStatus::Completed, true),
+            (ToolCallStatus::Failed, false),
+        ] {
+            let tc = ToolCall::new("tc-history", "Read").status(status);
+            match classify_lifecycle_signal(&SessionUpdate::ToolCall(tc)) {
+                Some(LifecycleSignal::ToolCompleted {
+                    id,
+                    succeeded: actual,
+                    off_protocol_work,
+                }) => {
+                    assert_eq!(id, "tc-history");
+                    assert_eq!(actual, succeeded);
+                    assert!(off_protocol_work.is_none());
+                }
+                other => panic!("expected terminal ToolCompleted, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn map_terminal_initial_tool_call_emits_start_and_completion() {
+        use agent_client_protocol::schema::{
+            Content, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
+        };
+
+        for (status, is_error) in [
+            (ToolCallStatus::Completed, false),
+            (ToolCallStatus::Failed, true),
+        ] {
+            let tc = ToolCall::new("tc-history", "Read")
+                .status(status)
+                .content(vec![ToolCallContent::Content(Content::new(
+                    "history output",
+                ))]);
+            let events = map_update_to_events(SessionUpdate::ToolCall(tc), &agent_profiles::CODEX);
+            assert!(matches!(
+                events.first(),
+                Some(Event::ToolCallStarted { .. })
+            ));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                Event::ToolCallCompleted {
+                    tool_call_id,
+                    is_error: actual_error,
+                    content,
+                    ..
+                } if tool_call_id == "tc-history"
+                    && *actual_error == is_error
+                    && content == "history output"
+            )));
         }
     }
 

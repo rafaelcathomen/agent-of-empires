@@ -75,6 +75,8 @@ import { useUnreadIndicatorEnabled } from "../lib/unreadIndicator";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import {
   createSession,
+  disableStructuredView,
+  enableStructuredView,
   renameSession,
   setSessionNotifications,
   setWorktreeName,
@@ -114,6 +116,7 @@ export { makeOptimisticSnoozedUntil } from "../lib/sidebarOptimistic";
 import { StatusGlyph } from "./StatusGlyph";
 import { OwnerAvatar } from "./OwnerAvatar";
 import { SessionGroupModal } from "./SessionGroupModal";
+import { SessionViewConversionDialog } from "./SessionViewConversionDialog";
 import { SidebarSortPicker } from "./SidebarSortPicker";
 import { Tooltip } from "./Tooltip";
 import { PluginRowLine } from "./plugin/PluginSlots";
@@ -1032,6 +1035,7 @@ export const SessionRow = memo(function SessionRow({
   // independent of the context menu's lifecycle so the parent-menu
   // dismissal listener cannot close the picker out from under us.
   const [snoozeModalOpen, setSnoozeModalOpen] = useState(false);
+  const [terminalConversion, setTerminalConversion] = useState<{ id: string; title: string } | null>(null);
   // Edit-workdir-name picker, also in its own portal-rendered modal so the
   // context-menu dismissal listener does not close it. See #1723.
   const [workdirModalOpen, setWorkdirModalOpen] = useState(false);
@@ -1101,6 +1105,30 @@ export const SessionRow = memo(function SessionRow({
     } else {
       reportError(result.error ?? "Could not fork this session. Please try again.");
     }
+  };
+
+  const handleEnableStructured = async () => {
+    setContextMenu(null);
+    if (!sessionId) return;
+    const result = await enableStructuredView(sessionId);
+    if (!result.ok) reportError(result.message);
+  };
+
+  const openDisableStructured = () => {
+    setContextMenu(null);
+    if (!sessionId) return;
+    setTerminalConversion({ id: sessionId, title: label });
+  };
+
+  const confirmDisableStructured = async (): Promise<boolean> => {
+    if (!terminalConversion) return false;
+    const result = await disableStructuredView(terminalConversion.id);
+    if (!result.ok) {
+      reportError(result.message);
+      return false;
+    }
+    setTerminalConversion(null);
+    return true;
   };
 
   // Re-run smart rename ("Auto-name now") for a structured session whose
@@ -1555,6 +1583,24 @@ export const SessionRow = memo(function SessionRow({
                     Edit group
                   </button>
                 )}
+                {!readOnly && firstSession?.view === "terminal" && firstSession.acp_capable && (
+                  <button
+                    onClick={() => void handleEnableStructured()}
+                    data-testid="sidebar-context-menu-enable-structured"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+                  >
+                    Convert to structured view
+                  </button>
+                )}
+                {!readOnly && firstSession?.view === "structured" && (
+                  <button
+                    onClick={openDisableStructured}
+                    data-testid="sidebar-context-menu-disable-structured"
+                    className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+                  >
+                    Convert to terminal
+                  </button>
+                )}
                 {!readOnly && acpSession && (
                   <button
                     onClick={handleSwitchAgent}
@@ -1747,6 +1793,15 @@ export const SessionRow = memo(function SessionRow({
             title={label}
             onCancel={() => setSnoozeModalOpen(false)}
             onPick={(minutes) => void applySnooze(minutes)}
+          />,
+          document.body,
+        )}
+      {terminalConversion &&
+        createPortal(
+          <SessionViewConversionDialog
+            sessionTitle={terminalConversion.title}
+            onConfirm={confirmDisableStructured}
+            onCancel={() => setTerminalConversion(null)}
           />,
           document.body,
         )}

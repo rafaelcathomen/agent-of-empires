@@ -383,6 +383,42 @@ describe("SessionRow context menu", () => {
     expect(screen.queryByTestId("sidebar-context-menu-switch-agent")).toBeNull();
   });
 
+  it("shows structured conversion only for ACP-capable terminal sessions", () => {
+    const ws = workspace("w-acp-terminal", [session({ view: "terminal", acp_capable: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).not.toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-disable-structured")).toBeNull();
+  });
+
+  it("hides structured conversion for a terminal session without ACP support", () => {
+    const ws = workspace("w-terminal", [session({ view: "terminal", acp_capable: false })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).toBeNull();
+  });
+
+  it("opens confirmation before converting structured view to terminal", () => {
+    const ws = workspace("w-structured", [session({ view: "structured" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-disable-structured"));
+    expect(screen.queryByTestId("session-view-conversion-dialog")).not.toBeNull();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("hides the triage section in read-only mode", () => {
     // structured_view is set so the Switch agent gate is also exercised:
     // it must stay hidden in read-only even on a structured view row.
@@ -399,6 +435,20 @@ describe("SessionRow context menu", () => {
     expect(menu.textContent).not.toContain("Snooze");
     expect(menu.textContent).not.toContain("Delete");
     expect(screen.queryByTestId("sidebar-context-menu-switch-agent")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-disable-structured")).toBeNull();
+  });
+
+  it("hides structured enable conversion in read-only mode", () => {
+    const ws = workspace("w-read-only-terminal", [session({ view: "terminal", acp_capable: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} readOnly />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-disable-structured")).toBeNull();
   });
 });
 
@@ -575,6 +625,37 @@ describe("SessionRow triage actions", () => {
       window.removeEventListener(OPEN_SESSION_EVENT, onOpen);
       window.removeEventListener(OPEN_SWITCH_AGENT_EVENT, onSwitch);
     }
+  });
+
+  it("Enable structured click POSTs the view conversion request", async () => {
+    const ws = workspace("w-enable", [session({ id: "sess-enable", view: "terminal", acp_capable: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-enable-structured"));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-enable/acp/enable");
+    expect(init?.method).toBe("POST");
+  });
+
+  it("confirmed structured disable POSTs the view conversion request", async () => {
+    const ws = workspace("w-disable", [session({ id: "sess-disable", view: "structured" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-disable-structured"));
+    fireEvent.click(screen.getByRole("button", { name: "Convert to terminal" }));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-disable/acp/disable");
+    expect(init?.method).toBe("POST");
   });
 
   it("New Session click calls onCreateSession with the row's repo path", () => {

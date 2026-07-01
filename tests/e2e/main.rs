@@ -27,6 +27,7 @@ mod automation_cli_e2e;
 mod automation_fires_e2e;
 mod automation_view_e2e;
 mod cli;
+mod codex_conversion_e2e;
 mod command_palette;
 mod errors;
 mod filewatch_config_malformed;

@@ -1605,6 +1605,13 @@
       "components": ["web/src/components/acp/ContextPrimerBanner.tsx"]
     },
     {
+      "id": "acp.codex-conversion-history",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/acpTypes.reducer.test.ts", "src/hooks/useAcpSession.queue.test.ts"],
+      "components": ["web/src/lib/acpTypes.ts", "web/src/hooks/useAcpSession.ts"]
+    },
+    {
       "id": "acp.completion",
       "kind": "live-playwright",
       "risk": "high",

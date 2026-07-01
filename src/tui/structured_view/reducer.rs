@@ -468,6 +468,23 @@ impl AcpTranscript {
             }
             Event::Stopped { reason } => {
                 self.flush_pending_chunk();
+                for row in &mut self.rows {
+                    if let ActivityRow::ToolCall(tool) = row {
+                        if tool.completed.is_none() {
+                            tool.completed = Some(ToolCompletion {
+                                ok: false,
+                                content: "stopped".to_string(),
+                            });
+                        }
+                    }
+                }
+                if reason == "history_replay_complete" {
+                    if self.status_text.as_deref() == Some("thinking…") {
+                        self.status_text = None;
+                    }
+                    self.turn_active = false;
+                    return;
+                }
                 self.status_text = Some(format!("stopped: {reason}"));
                 self.rows.push(ActivityRow::Note {
                     kind: NoteKind::Info,
@@ -1080,6 +1097,56 @@ mod tests {
             },
         ));
         assert!(!t.turn_active, "Stopped closes the turn");
+    }
+
+    #[test]
+    fn history_replay_completion_is_a_silent_idle_boundary() {
+        let mut t = AcpTranscript::new("s-1");
+        t.apply(&frame(
+            1,
+            Event::UserPromptSent {
+                text: "first imported turn".into(),
+                attachments: vec![],
+            },
+        ));
+        t.apply(&frame(2, Event::ThinkingStarted));
+        let row_count = t.rows.len();
+
+        t.apply(&frame(
+            3,
+            Event::Stopped {
+                reason: "history_replay_complete".into(),
+            },
+        ));
+
+        assert!(!t.turn_active);
+        assert_eq!(t.status_text, None);
+        assert_eq!(t.rows.len(), row_count, "replay boundary must stay hidden");
+    }
+
+    #[test]
+    fn history_replay_completion_terminalizes_open_tools() {
+        let mut t = AcpTranscript::new("s-1");
+        t.apply(&frame(
+            1,
+            Event::ToolCallStarted {
+                tool_call: tool("t-1", "Bash"),
+            },
+        ));
+        t.apply(&frame(
+            2,
+            Event::Stopped {
+                reason: "history_replay_complete".into(),
+            },
+        ));
+
+        match &t.rows[0] {
+            ActivityRow::ToolCall(row) => {
+                let completion = row.completed.as_ref().expect("tool must be terminal");
+                assert!(!completion.ok);
+            }
+            _ => panic!("expected ToolCall"),
+        }
     }
 
     #[test]

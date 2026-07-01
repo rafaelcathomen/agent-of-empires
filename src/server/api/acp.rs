@@ -1011,6 +1011,46 @@ async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
     woke_idle_dormant
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportPromptWait {
+    Ready,
+    NotFound,
+    Failed,
+    TimedOut,
+}
+
+const IMPORT_PROMPT_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn wait_for_import_completion(
+    instances: &tokio::sync::RwLock<Vec<crate::session::Instance>>,
+    session_id: &str,
+    timeout: std::time::Duration,
+) -> ImportPromptWait {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let (pending, failed) = {
+            let instances = instances.read().await;
+            let Some(instance) = instances.iter().find(|instance| instance.id == session_id) else {
+                return ImportPromptWait::NotFound;
+            };
+            (
+                instance.import_pending == Some(true),
+                instance.status == crate::session::Status::Error,
+            )
+        };
+        if !pending {
+            return ImportPromptWait::Ready;
+        }
+        if failed {
+            return ImportPromptWait::Failed;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return ImportPromptWait::TimedOut;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
 pub async fn acp_prompt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1023,13 +1063,27 @@ pub async fn acp_prompt(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
-    {
-        let instances = state.instances.read().await;
-        if !instances.iter().any(|i| i.id == id) {
+    match wait_for_import_completion(&state.instances, &id, IMPORT_PROMPT_WAIT_TIMEOUT).await {
+        ImportPromptWait::Ready => {}
+        ImportPromptWait::NotFound => {
             return (StatusCode::NOT_FOUND, "session not found").into_response();
         }
+        ImportPromptWait::Failed => {
+            return (
+                StatusCode::CONFLICT,
+                "history import failed; retry the structured view conversion",
+            )
+                .into_response();
+        }
+        ImportPromptWait::TimedOut => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "worker_not_ready: history import in progress",
+            )
+                .into_response();
+        }
     }
+    let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
     // Decode + validate + capability-gate attachments BEFORE publishing
     // so a rejected prompt never leaves a half-rendered attachment in
     // the transcript (the publish path is otherwise authoritative). See
@@ -1148,13 +1202,27 @@ pub async fn acp_prompt_diff_comments(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
-    {
-        let instances = state.instances.read().await;
-        if !instances.iter().any(|i| i.id == id) {
+    match wait_for_import_completion(&state.instances, &id, IMPORT_PROMPT_WAIT_TIMEOUT).await {
+        ImportPromptWait::Ready => {}
+        ImportPromptWait::NotFound => {
             return (StatusCode::NOT_FOUND, "session not found").into_response();
         }
+        ImportPromptWait::Failed => {
+            return (
+                StatusCode::CONFLICT,
+                "history import failed; retry the structured view conversion",
+            )
+                .into_response();
+        }
+        ImportPromptWait::TimedOut => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "worker_not_ready: history import in progress",
+            )
+                .into_response();
+        }
     }
+    let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
     // Idle-dormant wake: respawn synchronously-reserved + detached so the
     // send_prompt below waits for the worker instead of 404ing. Mirrors
     // acp_prompt. See #1748.
@@ -1528,12 +1596,17 @@ pub struct ViewSwitchResponse {
     pub view: crate::session::View,
 }
 
+fn supports_terminal_history_import(tool: &str) -> bool {
+    matches!(tool, "codex" | "claude")
+}
+
 /// Switch a tmux-mode session to structured view. Idempotent: a session that
 /// is already structured view-mode returns 200 with no work done.
 ///
-/// History is destroyed in the swap: the tmux scrollback is dropped
-/// when the pane is killed; structured view starts with an empty conversation.
-/// The frontend warns the user before calling this endpoint.
+/// Codex and Claude conversions resume the captured terminal conversation and
+/// seed the structured transcript through `session/load`. Other tools convert
+/// to a fresh structured conversation. The tmux scrollback itself is dropped
+/// when the pane is killed.
 pub async fn acp_enable(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1595,6 +1668,22 @@ pub async fn acp_enable(
     // A real terminal -> acp transition is now committed (the idempotent
     // already-acp and unresolvable-agent cases returned above).
 
+    // Snapshot the terminal agent's exact session identity while its tmux
+    // session still exists. The poller writes this hidden value before the
+    // daemon necessarily persists agent_session_id, and sandboxed Codex
+    // rollouts are not visible to a later host filesystem scan.
+    let captured_resume_id = if instance.acp_session_id.is_none()
+        && supports_terminal_history_import(&instance.tool)
+    {
+        let inst_for_capture = instance.clone();
+        tokio::task::spawn_blocking(move || inst_for_capture.terminal_session_id_for_conversion())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
     // Tear down the tmux side. Best-effort: a stale tmux name should
     // not block the swap. Run on a blocking pool worker because each
     // kill shells out. Warn on agent kill failure to keep signal for
@@ -1614,25 +1703,33 @@ pub async fn acp_enable(
         tracing::error!(target: "acp.switch", session = %id_for_log, "tmux teardown task panicked: {join_err}");
     }
 
-    // A terminal session may have no captured agent session id (codex never
-    // captures one; claude's status hook usually does, but pre-hook sessions
-    // don't), so the structured spawn would start fresh and drop the
+    // A terminal session may have no captured agent session id (the poller or
+    // status hook may not have observed it yet), so the structured spawn would
+    // start fresh and drop the
     // conversation. Discover the on-disk session for this cwd and resume it via
     // `session/load` + history replay: codex scans its rollouts, claude scans
     // the `~/.claude` transcripts. Gated to a missing captured id; an
     // already-captured id is left untouched. No match -> fresh convert
     // (previous behavior), logged. Scans the filesystem, so off-thread.
     let resume_id: Option<String> = if instance.acp_session_id.is_none() {
-        let cwd = instance.project_path.clone();
-        let tool = instance.tool.clone();
-        let found = tokio::task::spawn_blocking(move || match tool.as_str() {
-            "codex" => crate::acp::codex_import::find_rollout_for_cwd(&cwd).map(|r| r.session_id),
-            "claude" => crate::acp::claude_import::find_session_for_cwd(&cwd).map(|s| s.session_id),
-            _ => None,
-        })
-        .await
-        .ok()
-        .flatten();
+        let found = if captured_resume_id.is_some() {
+            captured_resume_id
+        } else {
+            let cwd = instance.project_path.clone();
+            let tool = instance.tool.clone();
+            tokio::task::spawn_blocking(move || match tool.as_str() {
+                "codex" => {
+                    crate::acp::codex_import::find_rollout_for_cwd(&cwd).map(|r| r.session_id)
+                }
+                "claude" => {
+                    crate::acp::claude_import::find_session_for_cwd(&cwd).map(|s| s.session_id)
+                }
+                _ => None,
+            })
+            .await
+            .ok()
+            .flatten()
+        };
         match found {
             Some(sid) => {
                 tracing::info!(
@@ -2343,6 +2440,46 @@ mod tests {
         assert!(!is_plan_mode_value("yolo"));
         assert!(!is_plan_mode_value("Plan"));
         assert!(!is_plan_mode_value(""));
+    }
+
+    #[test]
+    fn terminal_history_import_is_limited_to_supported_adapters() {
+        assert!(supports_terminal_history_import("codex"));
+        assert!(supports_terminal_history_import("claude"));
+        for tool in ["opencode", "gemini", "vibe", "pi", "custom"] {
+            assert!(
+                !supports_terminal_history_import(tool),
+                "{tool} must convert fresh until its load contract is supported"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_wait_blocks_only_while_import_is_pending() {
+        let mut instance = crate::session::Instance::new("import", "/tmp");
+        instance.import_pending = Some(true);
+        let id = instance.id.clone();
+        let instances = tokio::sync::RwLock::new(vec![instance]);
+        assert_eq!(
+            wait_for_import_completion(&instances, &id, std::time::Duration::ZERO).await,
+            ImportPromptWait::TimedOut
+        );
+        instances.write().await[0].import_pending = None;
+        assert_eq!(
+            wait_for_import_completion(&instances, &id, std::time::Duration::ZERO).await,
+            ImportPromptWait::Ready
+        );
+        assert_eq!(
+            wait_for_import_completion(&instances, "missing", std::time::Duration::ZERO).await,
+            ImportPromptWait::NotFound
+        );
+
+        instances.write().await[0].import_pending = Some(true);
+        instances.write().await[0].status = crate::session::Status::Error;
+        assert_eq!(
+            wait_for_import_completion(&instances, &id, std::time::Duration::ZERO).await,
+            ImportPromptWait::Failed
+        );
     }
 
     #[test]

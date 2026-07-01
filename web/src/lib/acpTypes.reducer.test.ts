@@ -537,6 +537,34 @@ describe("sweepOpenToolCalls via Stopped", () => {
   });
 });
 
+describe("history replay completion", () => {
+  it("retires every imported turn without rendering an empty-output warning", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "first imported turn" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "second imported turn" } },
+    });
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { Stopped: { reason: "history_replay_complete" } },
+    });
+
+    expect(state.pendingUserPromptSeq).toBe(2);
+    expect(state.lastStoppedSeq).toBe(2);
+    expect(state.turnActive).toBe(false);
+    expect(state.activity.some((row) => row.kind === "empty_output")).toBe(false);
+    expect(state.workerStopped).toBe(false);
+    expect(state.workerRestarting).toBe(false);
+  });
+});
+
 describe("pushActivity respects the configured activity cap", () => {
   it("retains only the most recent N rows when a cap is set", () => {
     setActivityLimit(3);

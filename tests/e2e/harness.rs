@@ -318,11 +318,11 @@ last_seen_version = "{}"
         self.extra_env.push((key.to_string(), value.to_string()));
     }
 
-    /// Install the shared Node fake-ACP agent as the `claude`,
-    /// `claude-agent-acp`, and `aoe-agent` commands on PATH. The structured view
-    /// supervisor resolves the `claude` tool key to the `claude-agent-acp`
-    /// command via `AgentRegistry`, so all three names must point at the
-    /// fake. `FAKE_ACP_SCRIPT` / `FAKE_ACP_DEBUG_LOG` are baked into the
+    /// Install the shared Node fake-ACP agent under the built-in adapter
+    /// command names used by these tests. The structured view supervisor
+    /// resolves tool keys to these commands via `AgentRegistry`, so every
+    /// exercised adapter name must point at the fake. `FAKE_ACP_SCRIPT` /
+    /// `FAKE_ACP_DEBUG_LOG` are baked into the
     /// shim (the daemon -> runner -> node spawn chain does not reliably
     /// propagate process env). Also sets the runner-socket timeout high
     /// so a contended CI box doesn't trip the spawn deadline.
@@ -343,7 +343,7 @@ last_seen_version = "{}"
             debug_log.display(),
             fake_agent.display(),
         );
-        for name in ["claude", "claude-agent-acp", "aoe-agent"] {
+        for name in ["claude", "claude-agent-acp", "codex-acp", "aoe-agent"] {
             let path = bin.join(name);
             std::fs::write(&path, &script).expect("write acp shim");
             #[cfg(unix)]

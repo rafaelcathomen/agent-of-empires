@@ -1526,8 +1526,11 @@ pub(crate) fn capture_codex_session_id(
         let file = std::fs::File::open(path).ok()?;
         let reader = std::io::BufReader::new(file);
         let first_line = std::io::BufRead::lines(reader).next()?.ok()?;
-        let cwd = parse_codex_cwd_from_json(&first_line)?;
-        let cwd_matches = std::fs::canonicalize(&cwd)
+        let metadata = parse_codex_rollout_metadata(&first_line)?;
+        if metadata.is_child {
+            return None;
+        }
+        let cwd_matches = std::fs::canonicalize(&metadata.cwd)
             .map(|c| c == canonical_project)
             .unwrap_or(false);
         if cwd_matches {
@@ -1540,17 +1543,52 @@ pub(crate) fn capture_codex_session_id(
     chosen.ok_or_else(|| anyhow::anyhow!("No Codex session found matching project path"))
 }
 
-/// Parse the CWD from a Codex `.jsonl` first line (already in memory).
+/// Identity metadata from the first `session_meta` record in a Codex rollout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexRolloutMetadata {
+    pub(crate) cwd: String,
+    pub(crate) is_child: bool,
+}
+
+/// Parse the CWD and thread identity from a Codex rollout record.
 ///
-/// Shared by the host scanner and the container scanner. Extracts `payload.cwd`
-/// from the JSON object on the first line of a session file.
-fn parse_codex_cwd_from_json(line: &str) -> Option<String> {
+/// Recent Codex versions identify child rollouts in several overlapping ways.
+/// Older versions may omit all of them, so missing child metadata is treated as
+/// a top-level session for compatibility with existing terminal transcripts.
+pub(crate) fn parse_codex_rollout_metadata(line: &str) -> Option<CodexRolloutMetadata> {
     let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
-    parsed
-        .get("payload")
-        .and_then(|p| p.get("cwd"))
+    let payload = parsed.get("payload")?;
+    let cwd = payload
+        .get("cwd")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .filter(|cwd| !cwd.is_empty())?
+        .to_string();
+    let has_nonempty_string = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.is_empty())
+    };
+    let source_is_child = payload.get("source").is_some_and(|source| {
+        source.as_str() == Some("subagent")
+            || source
+                .as_object()
+                .is_some_and(|source| source.contains_key("subagent"))
+    });
+    let thread_source = payload
+        .get("thread_source")
+        .and_then(|value| value.as_str());
+    let source_is_explicit_top_level = payload
+        .get("source")
+        .and_then(|source| source.as_str())
+        .is_some_and(|source| !source.is_empty() && source != "subagent");
+    let explicit_top_level = thread_source == Some("user") || source_is_explicit_top_level;
+    let is_child = thread_source == Some("subagent")
+        || source_is_child
+        || has_nonempty_string("parent_thread_id")
+        || (has_nonempty_string("forked_from_id") && !explicit_top_level);
+
+    Some(CodexRolloutMetadata { cwd, is_child })
 }
 
 /// Extract UUID from a Codex rollout filename.
@@ -1651,11 +1689,12 @@ fn select_codex_session_in_container(
             Some((j, _)) => j,
             None => rest,
         };
-        let cwd = match parse_codex_cwd_from_json(json_part.trim()) {
-            Some(c) => c,
+        let metadata = match parse_codex_rollout_metadata(json_part.trim()) {
+            Some(metadata) if !metadata.is_child => metadata,
             None => continue,
+            Some(_) => continue,
         };
-        candidates.push((uuid, cwd, ts));
+        candidates.push((uuid, metadata.cwd, ts));
     }
 
     if candidates.is_empty() {
@@ -3306,23 +3345,56 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_codex_cwd_from_json() {
+    fn test_parse_codex_rollout_metadata() {
         let line = r#"{"type":"session_meta","payload":{"cwd":"/home/user/myproject"}}"#;
         assert_eq!(
-            parse_codex_cwd_from_json(line),
-            Some("/home/user/myproject".to_string())
+            parse_codex_rollout_metadata(line),
+            Some(CodexRolloutMetadata {
+                cwd: "/home/user/myproject".to_string(),
+                is_child: false,
+            })
         );
     }
 
     #[test]
-    fn test_parse_codex_cwd_from_json_missing_field() {
-        let line = r#"{"type":"session_meta","payload":{}}"#;
-        assert_eq!(parse_codex_cwd_from_json(line), None);
+    fn test_parse_codex_rollout_metadata_detects_child_markers() {
+        for payload in [
+            r#"{"cwd":"/repo","thread_source":"subagent"}"#,
+            r#"{"cwd":"/repo","source":{"subagent":{"thread_spawn":{}}}}"#,
+            r#"{"cwd":"/repo","parent_thread_id":"parent"}"#,
+            r#"{"cwd":"/repo","forked_from_id":"parent"}"#,
+        ] {
+            let line = format!(r#"{{"type":"session_meta","payload":{payload}}}"#);
+            assert!(
+                parse_codex_rollout_metadata(&line)
+                    .expect("metadata")
+                    .is_child,
+                "payload was not classified as a child: {payload}"
+            );
+        }
     }
 
     #[test]
-    fn test_parse_codex_cwd_from_json_invalid_json() {
-        assert_eq!(parse_codex_cwd_from_json("not json at all"), None);
+    fn test_parse_codex_rollout_metadata_keeps_user_forks_top_level() {
+        let line = r#"{"type":"session_meta","payload":{"cwd":"/repo","thread_source":"user","source":"cli","forked_from_id":"parent"}}"#;
+        assert_eq!(
+            parse_codex_rollout_metadata(line),
+            Some(CodexRolloutMetadata {
+                cwd: "/repo".to_string(),
+                is_child: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_codex_rollout_metadata_missing_field() {
+        let line = r#"{"type":"session_meta","payload":{}}"#;
+        assert_eq!(parse_codex_rollout_metadata(line), None);
+    }
+
+    #[test]
+    fn test_parse_codex_rollout_metadata_invalid_json() {
+        assert_eq!(parse_codex_rollout_metadata("not json at all"), None);
     }
 
     #[test]
@@ -3449,6 +3521,56 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn test_codex_capture_skips_newer_subagent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let project_dir = tmp.path().join("test-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let top_level_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let child_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let top_level =
+            sessions_dir.join(format!("rollout-2025-03-06T10-30-00-{top_level_id}.jsonl"));
+        let child = sessions_dir.join(format!("rollout-2025-03-06T10-31-00-{child_id}.jsonl"));
+        std::fs::write(
+            &top_level,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"cwd":"{}","thread_source":"user","source":"cli"}}}}"#,
+                project_dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"cwd":"{}","thread_source":"subagent","source":{{"subagent":{{"thread_spawn":{{}}}}}},"parent_thread_id":"{top_level_id}"}}}}"#,
+                project_dir.display()
+            ),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&top_level)
+            .unwrap()
+            .set_modified(now - std::time::Duration::from_secs(60))
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&child)
+            .unwrap()
+            .set_modified(now)
+            .unwrap();
+
+        let _guard = CodexHomeGuard::set(tmp.path().to_str().unwrap());
+        let result =
+            capture_codex_session_id(project_dir.to_str().unwrap(), &HashSet::new()).unwrap();
+        assert_eq!(result, top_level_id);
+    }
+
+    #[test]
     fn test_select_codex_session_in_container_most_recent() {
         let uuid_old = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
         let uuid_new = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -3491,6 +3613,27 @@ mod tests {
         let result =
             select_codex_session_in_container(stdout.as_bytes(), "/workspace", &exclusion).unwrap();
         assert_eq!(result, uuid_available);
+    }
+
+    #[test]
+    fn test_select_codex_session_in_container_skips_newer_subagent() {
+        let top_level_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let child_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let stdout = format!(
+            "\
+===CODEX:1700000000:rollout-2025-01-01T00-00-00-{top_level_id}.jsonl===
+{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"/workspace\",\"thread_source\":\"user\",\"source\":\"cli\"}}}}
+===END===
+===CODEX:1700001000:rollout-2025-01-02T00-00-00-{child_id}.jsonl===
+{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"/workspace\",\"thread_source\":\"subagent\",\"source\":{{\"subagent\":{{\"thread_spawn\":{{}}}}}},\"parent_thread_id\":\"{top_level_id}\"}}}}
+===END===
+"
+        );
+
+        let result =
+            select_codex_session_in_container(stdout.as_bytes(), "/workspace", &HashSet::new())
+                .unwrap();
+        assert_eq!(result, top_level_id);
     }
 
     #[test]

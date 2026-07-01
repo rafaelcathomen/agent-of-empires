@@ -3666,6 +3666,33 @@ async fn acp_event_listener(state: Arc<AppState>) {
             }
         };
 
+        // Imported history is persisted and broadcast for rendering, but it is
+        // not live work. Suppress status and notification side effects until
+        // the explicit replay boundary lands. Errors and session assignment
+        // still pass so a failed import surfaces and a successful one clears
+        // `import_pending`.
+        let suppress_import_side_effects = {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .find(|instance| instance.id == frame.session_id)
+                .is_some_and(|instance| {
+                    suppress_import_replay_side_effects(
+                        instance.import_pending == Some(true),
+                        frame.event.as_ref(),
+                    )
+                })
+        };
+        if suppress_import_side_effects {
+            tracing::trace!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                seq = frame.seq,
+                "suppressing live side effects for imported history"
+            );
+            continue;
+        }
+
         // Detect wake-fire: a `UserPromptSent` arriving at-or-after a
         // `WakeupScheduled`'s `at` timestamp means the agent's pending
         // wake just fired. Push opt-in to the user's phone so /loop
@@ -4111,6 +4138,23 @@ pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusInten
         Event::RateLimitAutoResumed { .. } => Some(StatusIntent::HealError),
         _ => None,
     }
+}
+
+#[cfg(feature = "serve")]
+fn suppress_import_replay_side_effects(import_pending: bool, event: &crate::acp::Event) -> bool {
+    use crate::acp::Event;
+    import_pending
+        && !matches!(
+            event,
+            Event::Stopped { reason } if reason == "history_replay_complete"
+        )
+        && !matches!(
+            event,
+            Event::AcpSessionAssigned { .. }
+                | Event::AgentStartupError { .. }
+                | Event::IncompatibleAgent { .. }
+                | Event::SessionContextReset { .. }
+        )
 }
 
 /// Test-only constructors that integration tests in `tests/` need to drive
@@ -4899,6 +4943,44 @@ mod tests {
             }),
             Some(StatusIntent::HealError)
         );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn import_replay_suppresses_live_side_effects_until_boundary() {
+        use crate::acp::Event;
+
+        assert!(suppress_import_replay_side_effects(
+            true,
+            &Event::UserPromptSent {
+                text: "historical prompt".into(),
+                attachments: Vec::new(),
+            }
+        ));
+        assert!(suppress_import_replay_side_effects(
+            true,
+            &Event::AgentMessageChunk {
+                text: "historical reply".into(),
+            }
+        ));
+        assert!(!suppress_import_replay_side_effects(
+            true,
+            &Event::Stopped {
+                reason: "history_replay_complete".into(),
+            }
+        ));
+        assert!(!suppress_import_replay_side_effects(
+            true,
+            &Event::AcpSessionAssigned {
+                acp_session_id: "session-id".into(),
+            }
+        ));
+        assert!(!suppress_import_replay_side_effects(
+            false,
+            &Event::AgentMessageChunk {
+                text: "live reply".into(),
+            }
+        ));
     }
 
     #[cfg(feature = "serve")]

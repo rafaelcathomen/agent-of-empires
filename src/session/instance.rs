@@ -1700,6 +1700,36 @@ impl Instance {
         super::capture::compose_exclusion(&self.id, &self.retroactive_capture_excludes)
     }
 
+    /// Resolve the terminal agent identity before converting to structured view.
+    ///
+    /// The poller publishes to tmux before the daemon necessarily persists its
+    /// in-memory copy, so the live hidden environment is authoritative. Use the
+    /// batch reader even for one session because it refreshes the cross-process
+    /// cache instead of accepting a stale positive entry.
+    #[cfg(any(feature = "serve", test))]
+    pub(crate) fn terminal_session_id_for_conversion(&self) -> Option<String> {
+        let live = self.tmux_env_session_name().and_then(|session_name| {
+            crate::tmux::env::get_hidden_env_batch(
+                &[session_name.as_str()],
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            )
+            .into_iter()
+            .next()
+            .and_then(|(_, value)| value)
+            .filter(|id| super::capture::is_valid_session_id(id))
+        });
+
+        live.or_else(|| {
+            self.agent_session_id
+                .clone()
+                .filter(|id| super::capture::is_valid_session_id(id))
+        })
+        .or_else(|| {
+            self.try_retroactive_capture()
+                .filter(|id| super::capture::is_valid_session_id(id))
+        })
+    }
+
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
         let result: Option<String> = match self.tool.as_str() {
             "claude" => {
@@ -8707,6 +8737,30 @@ mod tests {
 
             let own_exclusion = crate::session::capture::compose_exclusion(&peer.id, &extra);
             assert!(!own_exclusion.contains(PEER_SID));
+        }
+
+        #[test]
+        #[serial]
+        fn conversion_identity_prefers_live_tmux_capture() {
+            if skip_if_no_tmux() {
+                return;
+            }
+
+            let mut inst = make_inst("conversion-capture", "conversion-capture");
+            inst.tool = "codex".to_string();
+            inst.agent_session_id = Some(PEER_SID.to_string());
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+            crate::tmux::env::set_hidden_env(
+                tmux.name(),
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                VALID_SID,
+            )
+            .unwrap();
+
+            assert_eq!(
+                inst.terminal_session_id_for_conversion().as_deref(),
+                Some(VALID_SID)
+            );
         }
 
         #[test]

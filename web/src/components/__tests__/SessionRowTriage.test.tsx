@@ -450,6 +450,24 @@ describe("SessionRow context menu", () => {
     expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).toBeNull();
     expect(screen.queryByTestId("sidebar-context-menu-disable-structured")).toBeNull();
   });
+
+  it("uses the running structured navigation session for conversion eligibility and confirmation title", () => {
+    const ws = workspace("w-mixed-structured", [
+      session({ id: "terminal-sibling", title: "terminal sibling", view: "terminal", acp_capable: true }),
+      session({ id: "structured-target", title: "structured target", view: "structured", status: "Running" }),
+    ]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+
+    expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).toBeNull();
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-disable-structured"));
+    expect(screen.getByTestId("session-view-conversion-dialog").textContent).toContain("structured target");
+  });
 });
 
 describe("SessionRow triage actions", () => {
@@ -656,6 +674,44 @@ describe("SessionRow triage actions", () => {
     const [url, init] = fetchSpy.mock.calls[0]!;
     expect(url).toBe("/api/sessions/sess-disable/acp/disable");
     expect(init?.method).toBe("POST");
+  });
+
+  it("confirmed structured disable targets the running structured navigation session", async () => {
+    const ws = workspace("w-mixed-disable", [
+      session({ id: "terminal-sibling", view: "terminal", acp_capable: true }),
+      session({ id: "structured-target", title: "structured target", view: "structured", status: "Running" }),
+    ]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-disable-structured"));
+    fireEvent.click(screen.getByRole("button", { name: "Convert to terminal" }));
+
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    expect(fetchSpy.mock.calls[0]![0]).toBe("/api/sessions/structured-target/acp/disable");
+  });
+
+  it("structured enable targets the running terminal navigation session", async () => {
+    const ws = workspace("w-mixed-enable", [
+      session({ id: "structured-sibling", view: "structured" }),
+      session({ id: "terminal-target", view: "terminal", acp_capable: true, status: "Running" }),
+    ]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-disable-structured")).toBeNull();
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-enable-structured"));
+
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    expect(fetchSpy.mock.calls[0]![0]).toBe("/api/sessions/terminal-target/acp/enable");
   });
 
   it("New Session click calls onCreateSession with the row's repo path", () => {

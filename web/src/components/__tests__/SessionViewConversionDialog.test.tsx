@@ -95,6 +95,22 @@ describe("SessionViewConversionDialog", () => {
     expect(onCancel).not.toHaveBeenCalled();
   });
 
+  it("keeps the dialog open and re-enables controls after a rejected confirmation", async () => {
+    const onConfirm = vi.fn().mockRejectedValue(new Error("network failure"));
+    const onCancel = vi.fn();
+
+    render(<SessionViewConversionDialog sessionTitle="codex" onConfirm={onConfirm} onCancel={onCancel} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Convert to terminal" }));
+
+    await vi.waitFor(() => {
+      expect((screen.getByRole("button", { name: "Convert to terminal" }) as HTMLButtonElement).disabled).toBe(false);
+    });
+    expect(screen.getByTestId("session-view-conversion-dialog")).not.toBeNull();
+    expect((screen.getByRole("button", { name: "Cancel" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(onCancel).not.toHaveBeenCalled();
+  });
+
   it("prevents cancellation and a second conversion while confirmation is in flight", () => {
     let resolveConfirm: ((result: boolean) => void) | undefined;
     const onConfirm = vi.fn(

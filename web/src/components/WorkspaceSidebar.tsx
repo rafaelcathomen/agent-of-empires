@@ -945,6 +945,7 @@ export const SessionRow = memo(function SessionRow({
   // rare; pick the first structured view session in the workspace.
   const acpSession = workspace.sessions.find((s) => s.view === "structured");
   const runningSession = workspace.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
+  const navigationSession = runningSession ?? firstSession;
   const singleSession = workspace.sessions.length === 1;
   const sessionTitle = firstSession?.title.trim() ?? "";
   const branchLabel = workspace.branch ?? null;
@@ -986,7 +987,7 @@ export const SessionRow = memo(function SessionRow({
   // and the auto-mark only ever lands on Idle anyway.
   const showUnreadGlyph = isUnread && (sessionStatus === "Idle" || sessionStatus === "Unknown");
   const sessionId = firstSession?.id;
-  const navigationSessionId = runningSession?.id ?? firstSession?.id ?? null;
+  const navigationSessionId = navigationSession?.id ?? null;
   const sessionPath = navigationSessionId ? `/session/${encodeURIComponent(navigationSessionId)}` : "/";
   const isDeleting = sessionStatus === "Deleting";
   const notifyPreset = detectNotifyPreset(
@@ -1109,15 +1110,15 @@ export const SessionRow = memo(function SessionRow({
 
   const handleEnableStructured = async () => {
     setContextMenu(null);
-    if (!sessionId) return;
-    const result = await enableStructuredView(sessionId);
+    if (!navigationSessionId) return;
+    const result = await enableStructuredView(navigationSessionId);
     if (!result.ok) reportError(result.message);
   };
 
   const openDisableStructured = () => {
     setContextMenu(null);
-    if (!sessionId) return;
-    setTerminalConversion({ id: sessionId, title: label });
+    if (!navigationSessionId) return;
+    setTerminalConversion({ id: navigationSessionId, title: navigationSession?.title.trim() || label });
   };
 
   const confirmDisableStructured = async (): Promise<boolean> => {
@@ -1583,7 +1584,7 @@ export const SessionRow = memo(function SessionRow({
                     Edit group
                   </button>
                 )}
-                {!readOnly && firstSession?.view === "terminal" && firstSession.acp_capable && (
+                {!readOnly && navigationSession?.view === "terminal" && navigationSession.acp_capable && (
                   <button
                     onClick={() => void handleEnableStructured()}
                     data-testid="sidebar-context-menu-enable-structured"
@@ -1592,7 +1593,7 @@ export const SessionRow = memo(function SessionRow({
                     Convert to structured view
                   </button>
                 )}
-                {!readOnly && firstSession?.view === "structured" && (
+                {!readOnly && navigationSession?.view === "structured" && (
                   <button
                     onClick={openDisableStructured}
                     data-testid="sidebar-context-menu-disable-structured"

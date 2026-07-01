@@ -268,6 +268,12 @@ fn trim_trailing_blank_rows(raw: &[u8]) -> &[u8] {
 /// running aoe.
 fn tmux_supports_pipe_pane_io() -> bool {
     static SUPPORTED: LazyLock<bool> = LazyLock::new(|| {
+        // Escape hatch: if a tmux version we treat as fixed still segfaults on
+        // the dead-pane write, set AOE_DISABLE_PIPE_PANE_IO=1 to force the safe
+        // capture fallback without waiting on a rebuild.
+        if std::env::var_os("AOE_DISABLE_PIPE_PANE_IO").is_some() {
+            return false;
+        }
         let Ok(out) = Command::new("tmux").arg("-V").output() else {
             return false;
         };

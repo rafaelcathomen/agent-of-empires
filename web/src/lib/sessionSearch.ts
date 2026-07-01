@@ -1,5 +1,3 @@
-import type { SidebarGroup } from "./sidebarGroups";
-import type { NestedSidebarGroup } from "./sidebarGroups";
 import type { SessionResponse, Workspace } from "./types";
 
 // A contiguous matched span within a source string, as [startInclusive,
@@ -56,52 +54,6 @@ export function workspaceMatches(ws: Workspace, needle: string): boolean {
   }
   if (ws.agents.some((a) => matchesText(a, needle))) return true;
   return ws.sessions.some((s) => sessionSearchFields(s).some((f) => matchesText(f, needle)));
-}
-
-// A row survives if the workspace matches OR the group header name matches
-// (so typing a group/repo name keeps that group's rows visible, matching the
-// existing sidebar behavior). `needle` MUST be pre-normalized.
-function rowSurvives(ws: Workspace, headerNames: string[], needle: string): boolean {
-  if (workspaceMatches(ws, needle)) return true;
-  return headerNames.some((name) => matchesText(name, needle));
-}
-
-// Filter the flat SidebarGroup[] model: keep each group's workspaces that
-// survive, then drop groups left with no rows. An empty/whitespace query is
-// the identity (returns the input array unchanged) so callers can use the
-// same code path with and without an active filter. Group objects are
-// shallow-cloned with a fresh `workspaces` array; the original groups array
-// is never mutated.
-export function filterSidebarGroups(groups: SidebarGroup[], query: string): SidebarGroup[] {
-  const needle = normalizeQuery(query);
-  if (needle === "") return groups;
-  return groups
-    .map((g) => ({
-      ...g,
-      workspaces: g.workspaces.filter((v) => rowSurvives(v.workspace, [g.displayName], needle)),
-    }))
-    .filter((g) => g.workspaces.length > 0);
-}
-
-// Filter the nested (repo -> subgroup) model the same way: a row survives if
-// the workspace matches, or its subgroup or repo header name matches; empty
-// subgroups then empty repos drop out. Identity on an empty query.
-export function filterNestedSidebarGroups(nested: NestedSidebarGroup[], query: string): NestedSidebarGroup[] {
-  const needle = normalizeQuery(query);
-  if (needle === "") return nested;
-  return nested
-    .map((ng) => ({
-      repo: ng.repo,
-      subgroups: ng.subgroups
-        .map((sg) => ({
-          ...sg,
-          workspaces: sg.workspaces.filter((v) =>
-            rowSurvives(v.workspace, [sg.displayName, ng.repo.displayName], needle),
-          ),
-        }))
-        .filter((sg) => sg.workspaces.length > 0),
-    }))
-    .filter((ng) => ng.subgroups.length > 0);
 }
 
 // Compute the matched spans of `query` within `text` for highlighting. Uses

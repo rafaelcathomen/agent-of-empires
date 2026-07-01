@@ -8,16 +8,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import {
-  filterNestedSidebarGroups,
-  filterSidebarGroups,
-  highlightRanges,
-  matchesText,
-  normalizeQuery,
-  projectNameOf,
-  workspaceMatches,
-} from "../sessionSearch";
-import type { SidebarGroup, SidebarWorkspaceView, NestedSidebarGroup } from "../sidebarGroups";
+import { highlightRanges, matchesText, normalizeQuery, projectNameOf, workspaceMatches } from "../sessionSearch";
 import type { SessionResponse, Workspace } from "../types";
 
 function session(over: Partial<SessionResponse> = {}): SessionResponse {
@@ -62,31 +53,6 @@ function workspace(over: Partial<Workspace> = {}): Workspace {
     primaryAgent: "claude",
     status: "idle",
     sessions: [session()],
-    ...over,
-  };
-}
-
-function view(ws: Workspace): SidebarWorkspaceView {
-  return { key: ws.id, workspace: ws };
-}
-
-function group(over: Partial<SidebarGroup> = {}): SidebarGroup {
-  return {
-    id: "g1",
-    kind: "sessionGroup",
-    displayName: "Feature Work",
-    defaultDisplayName: "Feature Work",
-    alias: null,
-    color: null,
-    remoteOwner: null,
-    workspaces: [view(workspace())],
-    status: "idle",
-    collapsed: false,
-    capabilities: { appearance: false, reorder: false, create: "generic" },
-    groupPath: "feature",
-    registeredProjects: [],
-    pinned: false,
-    pinnedEmpty: false,
     ...over,
   };
 }
@@ -139,58 +105,6 @@ describe("workspaceMatches", () => {
   });
   it("returns false when nothing matches", () => {
     expect(workspaceMatches(workspace(), "zzz")).toBe(false);
-  });
-});
-
-describe("filterSidebarGroups", () => {
-  it("returns the same array reference for an empty/whitespace query (identity)", () => {
-    const groups = [group()];
-    expect(filterSidebarGroups(groups, "   ")).toBe(groups);
-  });
-  it("drops non-matching rows and then empty groups, without mutating input", () => {
-    const keep = workspace({ id: "keep", displayName: "Orion task" });
-    const drop = workspace({
-      id: "drop",
-      displayName: "Zeta task",
-      projectPath: "/x/zeta",
-      sessions: [session({ title: "Zeta task", project_path: "/x/zeta" })],
-    });
-    const g = group({ workspaces: [view(keep), view(drop)] });
-    const out = filterSidebarGroups([g], "orion");
-    expect(out).toHaveLength(1);
-    expect(out[0]!.workspaces.map((v) => v.workspace.id)).toEqual(["keep"]);
-    // purity: original group still has both rows
-    expect(g.workspaces).toHaveLength(2);
-  });
-  it("keeps all rows of a group whose header name matches", () => {
-    const g = group({
-      displayName: "Feature Work",
-      workspaces: [view(workspace({ id: "a", displayName: "nomatch", sessions: [session({ title: "nomatch" })] }))],
-    });
-    const out = filterSidebarGroups([g], "feature");
-    expect(out[0]!.workspaces.map((v) => v.workspace.id)).toEqual(["a"]);
-  });
-  it("returns [] when nothing matches", () => {
-    expect(filterSidebarGroups([group()], "zzzz")).toEqual([]);
-  });
-});
-
-describe("filterNestedSidebarGroups", () => {
-  function nested(): NestedSidebarGroup {
-    return {
-      repo: group({ id: "repo", kind: "repo", displayName: "orion" }),
-      subgroups: [group({ id: "sg", displayName: "Feature Work", workspaces: [view(workspace({ id: "a" }))] })],
-    };
-  }
-  it("identity on empty query", () => {
-    const ng = [nested()];
-    expect(filterNestedSidebarGroups(ng, "")).toBe(ng);
-  });
-  it("keeps a row when only the repo header matches; drops empty repos otherwise", () => {
-    const out = filterNestedSidebarGroups([nested()], "orion");
-    expect(out).toHaveLength(1);
-    expect(out[0]!.subgroups[0]!.workspaces.map((v) => v.workspace.id)).toEqual(["a"]);
-    expect(filterNestedSidebarGroups([nested()], "zzzz")).toEqual([]);
   });
 });
 

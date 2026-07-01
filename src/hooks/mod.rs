@@ -405,8 +405,8 @@ fn hook_command_session_id_host() -> String {
     // value resolved into a shell variable must be exported to reach the child.
     format!(
         "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || AOE_INSTANCE_ID=$(tmux show-environment -h AOE_INSTANCE_ID 2>/dev/null | grep \"^AOE_INSTANCE_ID=\" | cut -d= -f2-); \
-         [ -n \"$AOE_INSTANCE_ID\" ] || exit 0; export AOE_INSTANCE_ID; \
-         command -v aoe >/dev/null 2>&1 || exit 0; \
+         [ -n \"$AOE_INSTANCE_ID\" ] || {{ cat >/dev/null 2>&1; exit 0; }}; export AOE_INSTANCE_ID; \
+         command -v aoe >/dev/null 2>&1 || {{ cat >/dev/null 2>&1; exit 0; }}; \
          aoe __extract-session-id 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
     )
 }
@@ -419,8 +419,8 @@ fn hook_command_session_id_host() -> String {
 fn hook_command_subagent(delta: i64, target: HookInstallTarget) -> String {
     match target {
         HookInstallTarget::Host => format!(
-            "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || exit 0; \
-             command -v aoe >/dev/null 2>&1 || exit 0; \
+            "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || {{ cat >/dev/null 2>&1; exit 0; }}; \
+             command -v aoe >/dev/null 2>&1 || {{ cat >/dev/null 2>&1; exit 0; }}; \
              aoe __hook-subagent --delta {delta} 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
         ),
         // Sandbox sessions install with the Host target in practice; `aoe` is

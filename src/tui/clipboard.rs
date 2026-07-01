@@ -33,28 +33,20 @@ const MAX_BYTES: usize = 1024 * 1024;
 /// platform supports. Returns the number of bytes (post-truncation)
 /// emitted.
 pub fn copy_to_clipboard(text: &str) -> usize {
-    let truncated = if text.len() > MAX_BYTES {
-        &text.as_bytes()[..MAX_BYTES]
-    } else {
-        text.as_bytes()
-    };
-    let truncated_str = match std::str::from_utf8(truncated) {
-        Ok(s) => s,
-        Err(e) => std::str::from_utf8(&truncated[..e.valid_up_to()]).unwrap_or(""),
-    };
+    let truncated_str = truncate_to_limit(text);
 
     let subprocess = try_subprocess(truncated_str);
-    let osc52 = write_osc52(truncated);
+    let osc52 = write_osc52(truncated_str.as_bytes());
 
     tracing::info!(
         target: "tui.clipboard",
-        bytes = truncated.len(),
+        bytes = truncated_str.len(),
         subprocess = format!("{:?}", subprocess).as_str(),
         osc52_ok = osc52.is_ok(),
         "preview drag-select copy"
     );
 
-    truncated.len()
+    truncated_str.len()
 }
 
 /// Push `text` to the PRIMARY selection (the X11/Wayland mouse-selection

@@ -525,9 +525,11 @@ impl RenameDialog {
             return DialogResult::Continue;
         }
 
-        // Heat field: Space/Enter cycle the tri-state override
-        // None -> Some(true) -> Some(false) -> None.
-        if self.is_heat_field() && matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
+        // Heat field: Space cycles the tri-state override
+        // None -> Some(true) -> Some(false) -> None. Enter is deliberately NOT
+        // bound so it keeps its dialog-wide confirm/submit meaning, matching the
+        // color and branch-toggle fields.
+        if self.is_heat_field() && key.code == KeyCode::Char(' ') {
             self.heat_enabled = match self.heat_enabled {
                 None => Some(true),
                 Some(true) => Some(false),
@@ -1222,7 +1224,7 @@ impl RenameDialog {
             hint_spans.push(Span::raw(" toggle  "));
         }
         if self.is_color_field() {
-            hint_spans.push(Span::styled("Enter", Style::default().fg(theme.hint)));
+            hint_spans.push(Span::styled("Space", Style::default().fg(theme.hint)));
             hint_spans.push(Span::raw(" pick color  "));
         }
         if self.is_group_field() && !self.existing_groups.is_empty() {
@@ -2229,7 +2231,7 @@ mod tests {
     }
 
     #[test]
-    fn heat_field_tri_state_cycles_into_submit() {
+    fn heat_field_space_cycles_enter_submits() {
         let mut dialog = RenameDialog::new("t", "", "default", default_profiles(), Vec::new())
             .with_session_settings(None, None);
         // Tab to the heat field (title->group->profile->heat).
@@ -2238,21 +2240,15 @@ mod tests {
         dialog.handle_key(key(KeyCode::Tab));
         assert!(dialog.is_heat_field());
         dialog.handle_key(key(KeyCode::Char(' '))); // None -> Some(true)
-        match dialog.handle_key(key(KeyCode::Enter)) {
-            // Enter on the heat field cycles rather than submits, so the first
-            // Enter advances to Some(false). Press Tab off then Enter to submit.
-            DialogResult::Continue => {}
-            _ => panic!("heat Enter should cycle"),
-        }
-        // Now heat_enabled is Some(false). Move focus off heat and submit.
-        dialog.handle_key(key(KeyCode::Tab)); // color
-        dialog.handle_key(key(KeyCode::Tab)); // wrap to title
+        dialog.handle_key(key(KeyCode::Char(' '))); // Some(true) -> Some(false)
+                                                    // Enter on the heat field now SUBMITS (Space is the only cycle key),
+                                                    // matching the app-wide Enter=confirm convention and the color field.
         match dialog.handle_key(key(KeyCode::Enter)) {
             DialogResult::Submit(data) => {
                 assert_eq!(data.heat_enabled, Some(Some(false)));
                 assert_eq!(data.manual_color, None);
             }
-            _ => panic!("expected submit"),
+            _ => panic!("Enter on the heat field should submit"),
         }
     }
 

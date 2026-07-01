@@ -122,7 +122,7 @@ impl GroupGhostCompletion {
             return None;
         }
         let needle_suffix = format!("/{value}");
-        let mut suffix_matches: Vec<String> = existing_groups
+        let suffix_matches: Vec<String> = existing_groups
             .iter()
             .filter(|g| {
                 g.ends_with(&needle_suffix)
@@ -133,26 +133,22 @@ impl GroupGhostCompletion {
             })
             .cloned()
             .collect();
-        if suffix_matches.is_empty() {
+        // Only offer a ghost when EXACTLY ONE path matches. resolve_group_path
+        // (src/session/groups.rs) resolves a leaf to a full path only when it is
+        // unambiguous; on multiple matches, accepting the ghost would commit an
+        // arbitrary pick that disagrees with what Enter does (Enter creates a new
+        // top-level group), silently mis-parenting the session. So on ambiguity
+        // show nothing and let the user type more to disambiguate. (Tier 1 has
+        // already ruled out `value` being an exact existing path, so a single
+        // suffix match is always strictly longer than `value`.)
+        let [full_match] = suffix_matches.as_slice() else {
             return None;
-        }
-        // Deterministic pick: shortest path first (closest to the typed leaf),
-        // lexicographic tie-break, so multi-match accept never varies.
-        suffix_matches.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
-        let match_count = suffix_matches.len();
-        let full_match = suffix_matches[0].clone();
-        if full_match == value {
-            return None;
-        }
-        let mut ghost_text = format!(" -> {full_match}");
-        if match_count > 1 {
-            ghost_text.push_str(&format!(" (+{} more)", match_count - 1));
-        }
+        };
         Some(Self {
             input_snapshot: value,
             cursor_snapshot: cursor_char,
-            ghost_text,
-            full_match,
+            ghost_text: format!(" -> {full_match}"),
+            full_match: full_match.clone(),
         })
     }
 
@@ -587,37 +583,22 @@ mod tests {
     }
 
     #[test]
-    fn ghost_multiple_suffix_matches_deterministic() {
-        // Two leaf matches: shortest-then-lexicographic pick is stable, and
-        // accept yields that first candidate (never silently both).
+    fn ghost_ambiguous_suffix_matches_show_no_ghost() {
+        // Multiple leaf matches are ambiguous: resolve_group_path refuses to
+        // resolve, and Enter would create a new top-level group, so the ghost
+        // must NOT commit an arbitrary pick. compute() returns None.
         let input = Input::new("clients".to_string());
         let g = groups(&["work/clients", "personal/clients"]);
-        let a = GroupGhostCompletion::compute(&input, &g, true)
-            .unwrap()
-            .ghost_text()
-            .to_string();
-        let b = GroupGhostCompletion::compute(&input, &g, true)
-            .unwrap()
-            .ghost_text()
-            .to_string();
-        assert_eq!(a, b);
-        assert!(a.contains("(+1 more)"));
-        // Shortest path first: "work/clients" (12) sorts before "personal/clients" (16).
-        let accepted = GroupGhostCompletion::compute(&input, &g, true)
-            .unwrap()
-            .accept(&input)
-            .unwrap();
-        assert_eq!(accepted, "work/clients");
+        assert!(GroupGhostCompletion::compute(&input, &g, true).is_none());
 
-        // Equal-length paths fall to the lexicographic tie-break: "aaa/leaf"
-        // sorts before "zzz/leaf".
+        // A single, unambiguous leaf match still completes to the full path.
         let input2 = Input::new("leaf".to_string());
-        let g2 = groups(&["zzz/leaf", "aaa/leaf"]);
-        let accepted2 = GroupGhostCompletion::compute(&input2, &g2, true)
+        let g2 = groups(&["deep/nest/leaf"]);
+        let accepted = GroupGhostCompletion::compute(&input2, &g2, true)
             .unwrap()
             .accept(&input2)
             .unwrap();
-        assert_eq!(accepted2, "aaa/leaf");
+        assert_eq!(accepted, "deep/nest/leaf");
     }
 
     #[test]

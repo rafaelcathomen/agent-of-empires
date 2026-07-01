@@ -13,7 +13,6 @@ use super::automation::AutomationCommands;
 use super::context::ContextCommands;
 use super::curator::CuratorCommands;
 use super::extract_session_id::ExtractSessionIdArgs;
-use super::fork::ForkArgs;
 use super::group::GroupCommands;
 use super::hook_heat::HookHeatArgs;
 use super::hook_subagent::HookSubagentArgs;
@@ -77,10 +76,6 @@ pub struct Cli {
 pub enum Commands {
     /// Add a new session
     Add(Box<AddArgs>),
-
-    /// Fork an existing session: start a new conversation seeded from a
-    /// parent session's context, optionally in a fresh git worktree branch
-    Fork(ForkArgs),
 
     /// Adopt an existing tmux session (an agent you started yourself) into aoe
     Register(RegisterArgs),
@@ -285,7 +280,6 @@ pub enum Commands {
 /// `command_name` output is a member.
 pub const CLI_COMMAND_NAMES: &[&str] = &[
     "add",
-    "fork",
     "register",
     "agents",
     "automation",
@@ -332,7 +326,6 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
 pub fn command_name(command: &Commands) -> Option<&'static str> {
     Some(match command {
         Commands::Add(_) => "add",
-        Commands::Fork(_) => "fork",
         Commands::Register(_) => "register",
         Commands::Agents => "agents",
         Commands::Automation { .. } => "automation",

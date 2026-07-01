@@ -111,11 +111,6 @@ pub struct NewSessionData {
     /// `<app_dir>/scratch/<id>/` and persist `instance.scratch = true`.
     /// Mutually exclusive with worktree mode.
     pub scratch: bool,
-    /// Parent session id to fork from (set by the Shift+N new-from-selection
-    /// flow). When `Some`, the created session gets a one-shot
-    /// `ResumeIntent::Fork(parent)` so its first launch seeds from the
-    /// parent's context. `None` for a plain new session.
-    pub fork_parent_id: Option<String>,
 }
 
 pub struct NewSessionDialog {
@@ -242,17 +237,6 @@ pub struct NewSessionDialog {
     /// Rects for the worktree-config overlay, keyed by
     /// `worktree_config_focused_field`.
     pub(super) worktree_config_rects: Vec<(usize, ratatui::layout::Rect)>,
-    /// Parent session id when this dialog was opened to fork (Shift+N from a
-    /// selected session). `None` for a plain new session. When `Some`, the
-    /// submission carries `fork_parent_id` and the form renders the
-    /// "new git branch (worktree)" fork toggle.
-    pub(super) fork_parent_id: Option<String>,
-    /// Parent session title, used to auto-name the fork branch
-    /// (`fork/<parent-title>`) when `use_fork_branch` is on.
-    pub(super) fork_parent_title: Option<String>,
-    /// Fork toggle: create the forked session in a fresh git worktree on a
-    /// new branch. Default OFF; only meaningful when `fork_parent_id` is set.
-    pub(super) use_fork_branch: bool,
 }
 
 /// Shared logic for handling key events in an editable list (env keys or env values).
@@ -511,9 +495,6 @@ impl NewSessionDialog {
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
             worktree_config_rects: Vec::new(),
-            fork_parent_id: None,
-            fork_parent_title: None,
-            use_fork_branch: false,
         }
     }
 
@@ -528,32 +509,6 @@ impl NewSessionDialog {
     /// Pre-fill the group field (e.g. from a selected session or group).
     pub fn set_group(&mut self, group: String) {
         self.group = Input::new(group);
-    }
-
-    /// Mark this dialog as a fork of `parent_id` (Shift+N from a selected
-    /// session). Records the parent title used to auto-name the fork branch
-    /// and enables the fork-branch toggle row (default OFF).
-    pub fn set_fork_parent(&mut self, parent_id: String, parent_title: String) {
-        self.fork_parent_id = Some(parent_id);
-        self.fork_parent_title = Some(parent_title);
-        self.use_fork_branch = false;
-    }
-
-    /// Toggle the "fork with a new git branch (worktree)" option. When on,
-    /// the submission enables a worktree on an auto-named `fork/<parent-title>`
-    /// branch; when off, the fork reuses the parent's setup with no worktree.
-    pub(super) fn toggle_fork_branch(&mut self) {
-        if self.fork_parent_id.is_some() {
-            self.use_fork_branch = !self.use_fork_branch;
-        }
-    }
-
-    /// Auto-generated branch name for a fork-with-worktree submission.
-    pub(super) fn fork_branch_name(&self) -> Option<String> {
-        self.fork_parent_title.as_ref().map(|title| {
-            let slug = crate::session::worktree_edit::worktree_leaf_from_title(title);
-            format!("fork/{}", slug)
-        })
     }
 
     /// Build the dialog pre-populated from an automation's launch spec, so a
@@ -870,9 +825,6 @@ impl NewSessionDialog {
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
             worktree_config_rects: Vec::new(),
-            fork_parent_id: None,
-            fork_parent_title: None,
-            use_fork_branch: false,
         }
     }
 
@@ -943,9 +895,6 @@ impl NewSessionDialog {
             sandbox_config_rects: Vec::new(),
             tool_config_rects: Vec::new(),
             worktree_config_rects: Vec::new(),
-            fork_parent_id: None,
-            fork_parent_title: None,
-            use_fork_branch: false,
         }
     }
 
@@ -1295,19 +1244,6 @@ impl NewSessionDialog {
                 self.workspace_repos.clear();
                 self.workspace_repos_expanded = false;
             }
-            self.error_message = None;
-            return DialogResult::Continue;
-        }
-
-        // Ctrl+F toggles the fork-branch option from anywhere in the form,
-        // but only when this dialog was opened to fork a session (Shift+N
-        // from a selection). When on, the fork lands in a fresh
-        // `fork/<parent-title>` worktree branch. No-op otherwise.
-        if key.code == KeyCode::Char('f')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && self.fork_parent_id.is_some()
-        {
-            self.toggle_fork_branch();
             self.error_message = None;
             return DialogResult::Continue;
         }
@@ -2043,20 +1979,8 @@ impl NewSessionDialog {
                 None
             };
 
-        // Fork with a new git branch: override the worktree fields with an
-        // auto-named `fork/<parent-title>` branch created fresh. Takes
-        // precedence over the form's own worktree toggle so the fork lands
-        // in its own branch regardless of the inherited worktree default.
-        let fork_with_branch = self.fork_parent_id.is_some() && self.use_fork_branch;
-        let (worktree_enabled, worktree_branch, create_new_branch) = if fork_with_branch {
-            (true, self.fork_branch_name(), true)
-        } else {
-            (
-                !self.scratch && self.worktree_enabled,
-                worktree_branch,
-                self.create_new_branch,
-            )
-        };
+        let worktree_enabled = !self.scratch && self.worktree_enabled;
+        let create_new_branch = self.create_new_branch;
 
         DialogResult::Submit(NewSessionData {
             profile: self.selected_profile().to_string(),
@@ -2090,7 +2014,6 @@ impl NewSessionDialog {
             extra_args: self.extra_args.value().trim().to_string(),
             command_override: self.command_override.value().trim().to_string(),
             scratch: self.scratch,
-            fork_parent_id: self.fork_parent_id.clone(),
         })
     }
 

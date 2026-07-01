@@ -336,7 +336,6 @@ async fn main() -> Result<()> {
 
     let result = match cli.command {
         Some(Commands::Add(args)) => cli::add::run(&profile, *args).await,
-        Some(Commands::Fork(args)) => cli::fork::run(&profile, args).await,
         Some(Commands::Automation { command }) => cli::automation::run(&profile, command).await,
         Some(Commands::Register(args)) => cli::register::run(&profile, args).await,
         Some(Commands::List(args)) => cli::list::run(&profile, args).await,

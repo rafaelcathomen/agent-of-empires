@@ -89,11 +89,6 @@ impl NewSessionDialog {
         if !is_host_only {
             constraints.push(Constraint::Length(2)); // Worktree Branch
         }
-        // Fork-branch toggle row, only when this dialog forks a session.
-        let show_fork_row = self.fork_parent_id.is_some();
-        if show_fork_row {
-            constraints.push(Constraint::Length(2)); // Fork branch toggle
-        }
         if has_sandbox {
             constraints.push(Constraint::Length(2)); // Sandbox checkbox (summary only)
         }
@@ -328,44 +323,6 @@ impl NewSessionDialog {
             let area = chunks[ci];
             frame.render_widget(Paragraph::new(Line::from(spans)), area);
             self.focusable_rects.push((worktree_field, area));
-            ci += 1;
-        }
-
-        // Fork-branch toggle row (only when forking a selected session).
-        // Toggled with Ctrl+F (not a focusable field); when on, the fork
-        // lands in a fresh `fork/<parent-title>` worktree branch.
-        if show_fork_row {
-            let checkbox = if self.use_fork_branch { "[x]" } else { "[ ]" };
-            let checkbox_style = if self.use_fork_branch {
-                Style::default().fg(theme.accent).bold()
-            } else {
-                Style::default().fg(theme.dimmed)
-            };
-            let text_style = if self.use_fork_branch {
-                Style::default().fg(theme.accent)
-            } else {
-                Style::default().fg(theme.dimmed)
-            };
-            let mut spans = vec![
-                Span::styled("Fork:", Style::default().fg(theme.text)),
-                Span::raw(" "),
-                Span::styled(checkbox, checkbox_style),
-                Span::styled(" new git branch (worktree)", text_style),
-            ];
-            if self.use_fork_branch {
-                if let Some(branch) = self.fork_branch_name() {
-                    spans.push(Span::styled(
-                        format!("  ({})", branch),
-                        Style::default().fg(theme.dimmed),
-                    ));
-                }
-            }
-            spans.push(Span::styled(
-                "  (Ctrl+F)",
-                Style::default().fg(theme.dimmed),
-            ));
-            let area = chunks[ci];
-            frame.render_widget(Paragraph::new(Line::from(spans)), area);
             ci += 1;
         }
 

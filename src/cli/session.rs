@@ -1499,7 +1499,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 title
             );
         }
-        crate::session::ResumeIntent::Default | crate::session::ResumeIntent::Fork(_) => {
+        crate::session::ResumeIntent::Default => {
             unreachable!("set_resume only constructs Use or Cleared intents")
         }
     }

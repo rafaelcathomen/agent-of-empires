@@ -293,15 +293,6 @@ impl HomeView {
         let mut instance = build_result.instance;
         instance.source_profile = target_profile.clone();
 
-        // Context-fork: a one-shot `ResumeIntent::Fork(parent)` so the first
-        // launch seeds the new session from the parent's conversation, then
-        // auto-promotes to `Default`. Record the lineage on
-        // `parent_session_id` too.
-        if let Some(parent_id) = data.fork_parent_id {
-            instance.resume_intent = crate::session::ResumeIntent::Fork(parent_id.clone());
-            instance.parent_session_id = Some(parent_id);
-        }
-
         let session_id = instance.id.clone();
 
         // Ensure target profile storage exists

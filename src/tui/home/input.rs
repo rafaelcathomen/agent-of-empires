@@ -2765,16 +2765,6 @@ impl HomeView {
             })
             .or_else(|| self.selected_group.clone());
 
-        // Forking is keyed on a concretely-selected session: Shift+N from a
-        // session row makes the new session a context-fork of it. The
-        // group/project header path (no `selected_session`) opens a plain
-        // new-session dialog with no fork.
-        let fork_parent = self
-            .selected_session
-            .as_ref()
-            .and_then(|id| self.get_instance(id))
-            .map(|inst| (inst.id.clone(), inst.title.clone()));
-
         if prefill_path.is_some() || prefill_group.is_some() {
             let existing_groups: Vec<String> =
                 self.all_groups().iter().map(|g| g.path.clone()).collect();
@@ -2794,9 +2784,6 @@ impl HomeView {
             }
             if let Some(group) = prefill_group {
                 dialog.set_group(group);
-            }
-            if let Some((parent_id, parent_title)) = fork_parent {
-                dialog.set_fork_parent(parent_id, parent_title);
             }
             // Skip to the title whenever the path is genuinely prefilled,
             // whether inherited from a session or borrowed from a project/group
@@ -6225,7 +6212,6 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             scratch: false,
-            fork_parent_id: None,
         }
     }
 

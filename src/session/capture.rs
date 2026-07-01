@@ -124,10 +124,7 @@ pub(crate) fn capture_claude_session_id(
 /// 1. anchor stale or absent → return `best` (most-recent unexcluded jsonl).
 /// 2. `best` exists, fresh, and strictly newer than the anchor → return
 ///    `best`. The caller promotes `last_known` so the poller adopts the new
-///    UUID after `/clear` / `/new` / `--fork-session` mints a new jsonl. The
-///    `--fork-session` case is reached via `ResumeIntent::Fork`, which auto-
-///    promotes to `Default` after the launch, so a restart does not re-fork;
-///    the poller adopts the forked session id captured here.
+///    UUID after `/clear` / `/new` mints a new jsonl.
 /// 3. otherwise → return the anchor (covers steady-state and the case where
 ///    a sibling's most-recent write was filtered out by `exclusion`).
 fn scan_claude_project_dir(

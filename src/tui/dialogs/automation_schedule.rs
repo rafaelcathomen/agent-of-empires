@@ -423,7 +423,6 @@ mod tests {
             extra_args: "--foo".into(),
             command_override: String::new(),
             scratch: false,
-            fork_parent_id: None,
         }
     }
 

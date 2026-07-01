@@ -8,7 +8,14 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { fetchAcpAgents, installAcpAgent, switchAcpAgent, type SwitchAgentResponse } from "./api";
+import {
+  disableStructuredView,
+  enableStructuredView,
+  fetchAcpAgents,
+  installAcpAgent,
+  switchAcpAgent,
+  type SwitchAgentResponse,
+} from "./api";
 
 const originalFetch = globalThis.fetch;
 
@@ -122,6 +129,46 @@ describe("switchAcpAgent", () => {
     (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(new Response("conflict", { status: 409 }));
     const result = await switchAcpAgent("s-1", "codex");
     expect(result).toBeNull();
+  });
+});
+
+describe("structured view switching", () => {
+  it("enables structured view with an encoded session id", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      ok({ session_id: "weird/id", view: "structured" }),
+    );
+
+    await expect(enableStructuredView("weird/id")).resolves.toEqual({
+      ok: true,
+      response: { session_id: "weird/id", view: "structured" },
+    });
+    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(String(url)).toContain("/api/sessions/weird%2Fid/acp/enable");
+    expect((init as RequestInit).method).toBe("POST");
+  });
+
+  it("returns a server message when view conversion is rejected", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response("no structured view agent registered", { status: 400 }),
+    );
+    await expect(enableStructuredView("s-1")).resolves.toEqual({
+      ok: false,
+      message: "no structured view agent registered",
+    });
+  });
+
+  it("disables structured view with an encoded session id", async () => {
+    (globalThis.fetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      ok({ session_id: "weird/id", view: "terminal" }),
+    );
+
+    await expect(disableStructuredView("weird/id")).resolves.toEqual({
+      ok: true,
+      response: { session_id: "weird/id", view: "terminal" },
+    });
+    const [url, init] = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(String(url)).toContain("/api/sessions/weird%2Fid/acp/disable");
+    expect((init as RequestInit).method).toBe("POST");
   });
 });
 

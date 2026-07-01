@@ -1584,7 +1584,7 @@ export const SessionRow = memo(function SessionRow({
                     Edit group
                   </button>
                 )}
-                {!readOnly && navigationSession?.view === "terminal" && navigationSession.acp_capable && (
+                {!readOnly && navigationSession?.view !== "structured" && navigationSession?.acp_capable && (
                   <button
                     onClick={() => void handleEnableStructured()}
                     data-testid="sidebar-context-menu-enable-structured"

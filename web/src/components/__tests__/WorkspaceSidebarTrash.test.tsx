@@ -151,6 +151,41 @@ describe("WorkspaceSidebar Trash control (#2489, #2512)", () => {
     expect(props.onDeleteSession).toHaveBeenCalledWith("trashed-ws");
   });
 
+  it("orders the Trash rows newest-trashed first", () => {
+    const older = workspace("older-ws", [session({ id: "o1", trashed_at: "2026-01-01T00:00:00Z" })]);
+    const newer = workspace("newer-ws", [session({ id: "n1", trashed_at: "2026-06-01T00:00:00Z" })]);
+    // Pass oldest-first to prove the panel re-sorts rather than echoing input order.
+    renderSidebar({
+      groups: buildSessionGroups([older, newer], {
+        idleDecayWindowMs: 60_000,
+        sortMode: "lastActivity",
+        isCollapsed: () => false,
+      }),
+      trashedWorkspaces: [older, newer],
+    });
+    fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));
+    const rows = screen.getAllByTestId("sidebar-trash-row");
+    expect(rows[0].textContent).toContain("newer-ws");
+    expect(rows[1].textContent).toContain("older-ws");
+  });
+
+  it("renders the count badge next to the Trash icon, not against Settings (#2574)", () => {
+    // The badge must sit right after the Trash icon at the left of the control.
+    // A `flex-1` label that preceded the badge would shove the count to the
+    // button's right edge, where it reads as belonging to the Settings gear.
+    renderWithTrash();
+    const toggle = screen.getByTestId("sidebar-trash-toggle");
+    const badge = screen.getByTestId("sidebar-trash-count");
+    expect(badge.textContent).toBe("1");
+    // Badge is inside the Trash control, not the Settings button.
+    expect(toggle.contains(badge)).toBe(true);
+    // The "Trash" label follows the badge in DOM order; the badge is not the
+    // right-most child pushed up against Settings.
+    const label = Array.from(toggle.querySelectorAll("span")).find((s) => s.textContent === "Trash");
+    expect(label).toBeTruthy();
+    expect(badge.compareDocumentPosition(label!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("closes the Trash popover on Escape", () => {
     renderWithTrash();
     fireEvent.click(screen.getByTestId("sidebar-trash-toggle"));

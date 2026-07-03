@@ -830,6 +830,23 @@
       "components": ["web/src/App.tsx", "web/src/components/command-palette/CommandPalette.tsx"]
     },
     {
+      "id": "palette.category-tabs",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/command-palette/__tests__/CommandPalette.test.tsx"],
+      "components": [
+        "web/src/components/command-palette/CommandPalette.tsx",
+        "web/src/components/command-palette/groups.ts"
+      ]
+    },
+    {
+      "id": "palette.session-triage",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/__tests__/useCommandActions.test.tsx"],
+      "components": ["web/src/hooks/useCommandActions.ts", "web/src/App.tsx"]
+    },
+    {
       "id": "sidebar.scratch-group",
       "kind": "mocked-playwright",
       "risk": "medium",
@@ -912,6 +929,20 @@
       "risk": "medium",
       "specs": ["src/components/__tests__/WorkspaceSidebarSearch.test.tsx"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.trash-control",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.trash-order",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/lib/__tests__/sidebarTrash.test.ts", "src/components/__tests__/WorkspaceSidebarTrash.test.tsx"],
+      "components": ["web/src/lib/sidebarSort.ts", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
       "id": "sidebar.new-session-tooltips",
@@ -1160,6 +1191,13 @@
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
+      "id": "session.trash.restore-banner",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/acp/__tests__/TrashedWorkerStoppedBanner.test.tsx"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "session.group-edit",
       "kind": "live-playwright",
       "risk": "high",
@@ -1397,6 +1435,13 @@
       "risk": "medium",
       "specs": ["tests/live/disconnect-banner.spec.ts"],
       "components": ["web/src/components/DisconnectBanner.tsx"]
+    },
+    {
+      "id": "connectivity.lifecycle-fetch-toasts",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/fetchInterceptor.more.test.ts"],
+      "components": ["web/src/lib/fetchInterceptor.ts"]
     },
     {
       "id": "git-clone",
@@ -1776,8 +1821,12 @@
       "id": "acp.markdown",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/components/acp/Markdown.test.tsx", "src/components/acp/Markdown.breaks.test.tsx"],
-      "components": ["web/src/components/acp/Markdown.tsx"]
+      "specs": [
+        "src/components/acp/Markdown.test.tsx",
+        "src/components/acp/Markdown.breaks.test.tsx",
+        "src/components/acp/__tests__/artifactMedia.test.tsx"
+      ],
+      "components": ["web/src/components/acp/Markdown.tsx", "web/src/components/acp/artifactMedia.tsx"]
     },
     {
       "id": "acp.file-links",

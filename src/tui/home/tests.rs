@@ -387,6 +387,17 @@ fn disable_delete_to_trash() {
     crate::session::config::save_config(&config).unwrap();
 }
 
+/// Turn on `session.confirm_delete` so `d` guards the trash with a
+/// confirmation dialog instead of trashing on the keystroke. Must run after
+/// `setup_test_home` so it writes into the test HOME. See #2583.
+fn enable_confirm_delete() {
+    let mut config = crate::session::config::load_config()
+        .unwrap()
+        .unwrap_or_default();
+    config.session.confirm_delete = true;
+    crate::session::config::save_config(&config).unwrap();
+}
+
 fn create_test_env_with_groups() -> TestEnv {
     use crate::session::config::GroupByMode;
     let temp = TempDir::new().unwrap();
@@ -644,6 +655,97 @@ fn unread_dot_yields_to_a_running_status() {
         !render(&mut env).contains('●'),
         "a running row must keep its spinner, not the unread dot"
     );
+}
+
+/// Sunk rows never paint the unread dot. Archiving or snoozing an unread
+/// row dismisses it; surfacing it as unread contradicts that. The snooze
+/// case must hold in every sort mode, not just Attention (#2571).
+#[test]
+#[serial]
+fn unread_dot_suppressed_on_archived_and_snoozed() {
+    use crate::session::config::SortOrder;
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    let theme = load_theme("empire");
+
+    let render = |env: &mut TestEnv| -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+        }
+        out
+    };
+
+    // Baseline: an idle unread row paints the dot.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+        inst.mark_unread();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        render(&mut env).contains('●'),
+        "an idle unread row should paint the unread dot"
+    );
+
+    // Snoozed, in a non-Attention sort: the dot must be gone even though the
+    // snooze decoration itself is Attention-only.
+    env.view.sort_order = SortOrder::Newest;
+    env.view.mutate_instance(&id, |inst| inst.snooze(30));
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        !render(&mut env).contains('●'),
+        "a snoozed unread row must not paint the unread dot outside Attention sort"
+    );
+
+    // Snoozed in Attention sort: still no dot.
+    env.view.sort_order = SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        !render(&mut env).contains('●'),
+        "a snoozed unread row must not paint the unread dot in Attention sort"
+    );
+
+    // Archived: the archive override already mutes the glyph; guard it stays muted.
+    env.view.mutate_instance(&id, |inst| {
+        inst.unsnooze();
+        inst.archive();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        !render(&mut env).contains('●'),
+        "an archived unread row must not paint the unread dot"
+    );
+}
+
+/// Render suppression is cosmetic: archive/snooze leave the `unread` flag on
+/// disk so unarchiving or unsnoozing brings the marker back (#2571).
+#[test]
+fn unread_flag_survives_sink_round_trip() {
+    let mut inst = crate::session::Instance::new("rt", "/tmp/rt");
+    inst.mark_unread();
+
+    inst.archive();
+    assert!(inst.is_unread(), "archive must not clear unread");
+    inst.unarchive();
+    assert!(inst.is_unread(), "unarchive must keep unread");
+
+    inst.snooze(30);
+    assert!(inst.is_unread(), "snooze must not clear unread");
+    inst.unsnooze();
+    assert!(inst.is_unread(), "unsnooze must keep unread");
 }
 
 /// Dwell-to-read: an unread row that stays selected past `UNREAD_DWELL`
@@ -6796,6 +6898,73 @@ fn d_on_session_with_default_trash_persists_trash_marker() {
     assert!(
         disk_row.is_trashed(),
         "pressing d must persist trashed_at so a storage refresh cannot resurrect a killed session"
+    );
+}
+
+/// With `session.confirm_delete` on, `d` opens a confirmation dialog and does
+/// not trash until the dialog is accepted; accepting then runs the same trash
+/// path as the instant flow. See #2583.
+#[test]
+#[serial]
+fn d_with_confirm_delete_prompts_before_trashing() {
+    let mut env = create_test_env_with_sessions(2);
+    enable_confirm_delete();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_trashed(),
+        "confirm_delete on must not trash the session on the keystroke"
+    );
+    let dialog = env
+        .view
+        .confirm_dialog
+        .as_ref()
+        .expect("confirm_delete on must open a confirmation dialog");
+    assert_eq!(dialog.action(), "trash_session");
+    assert_eq!(
+        env.view.pending_trash_session.as_deref(),
+        Some(id.as_str()),
+        "the pending trash target must be the selected session"
+    );
+
+    // Accepting the dialog trashes via the same trash_session_by_id path.
+    env.view.dispatch_confirm_submit("trash_session");
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "accepting the confirm dialog must trash the session"
+    );
+    assert!(
+        env.view.pending_trash_session.is_none(),
+        "the pending trash target must be cleared once consumed"
+    );
+}
+
+/// Cancelling the `session.confirm_delete` dialog leaves the session untouched
+/// and clears the pending target. See #2583.
+#[test]
+#[serial]
+fn confirm_delete_dialog_cancel_leaves_session() {
+    let mut env = create_test_env_with_sessions(2);
+    enable_confirm_delete();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+    assert!(env.view.confirm_dialog.is_some());
+
+    env.view.handle_key(key(KeyCode::Esc), None);
+    assert!(
+        env.view.confirm_dialog.is_none(),
+        "Esc must dismiss the confirm dialog"
+    );
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_trashed(),
+        "cancelling the confirm dialog must not trash the session"
+    );
+    assert!(
+        env.view.pending_trash_session.is_none(),
+        "cancelling must clear the pending trash target"
     );
 }
 

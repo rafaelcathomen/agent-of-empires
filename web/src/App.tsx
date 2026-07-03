@@ -29,7 +29,7 @@ import { useDiffFiles } from "./hooks/useDiffFiles";
 import { useDiffComments } from "./hooks/useDiffComments";
 import { clearStoredComments, sweepOrphanComments } from "./components/diff/comments/storage";
 import { SendCommentsDialog } from "./components/diff/comments/SendCommentsDialog";
-import { useCommandActions, buildConversationActions } from "./hooks/useCommandActions";
+import { useCommandActions, buildConversationActions, type SessionStateAction } from "./hooks/useCommandActions";
 import { usePluginCommands } from "./hooks/usePluginCommands";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
@@ -40,7 +40,12 @@ import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab } from "./lib/
 import { isPluginPaneId, usePluginPanes, type PluginPane } from "./lib/pluginPanes";
 import { PluginPaneBody } from "./components/plugin/PluginSlots";
 import { TOUR_ANCHORS, tourAnchor } from "./lib/tourSteps";
-import { deleteWorkspaceSessions, restoreSessions, trashSessions } from "./lib/trashActions";
+import {
+  deleteWorkspaceSessions,
+  restoreSessions,
+  trashedWorkspaceRestoreIds,
+  trashSessions,
+} from "./lib/trashActions";
 import {
   loginStatus,
   logout,
@@ -59,17 +64,22 @@ import {
   deleteProject,
   setSessionUnread,
   killTerminal,
+  setSessionPin,
+  setSessionArchive,
+  setSessionSnooze,
+  trashSession,
+  restoreSession,
 } from "./lib/api";
 import type { DeleteSessionOptions, ServerAbout } from "./lib/api";
 import { normalizeProjectPathKey } from "./lib/registeredProjects";
 import { IdleDecayWindowContext, parseIdleDecayWindowMs, useIdleDecayWindowMs } from "./lib/idleDecay";
 import { parseUnreadIndicatorEnabled, UnreadIndicatorContext, useUnreadIndicatorEnabled } from "./lib/unreadIndicator";
-import { toastBus } from "./lib/toastBus";
+import { toastBus, reportError } from "./lib/toastBus";
 import { resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
-import { WorkspaceSidebar } from "./components/WorkspaceSidebar";
+import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { StopSessionDialog } from "./components/StopSessionDialog";
 import { TopBar } from "./components/TopBar";
@@ -583,6 +593,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   // handlers below can clear it on close/toggle. Consumed lower down by
   // useConversationSearch.
   const [paletteQuery, setPaletteQuery] = useState("");
+  // Session id awaiting a snooze duration from the palette's "Snooze…" action;
+  // drives the shared SnoozeModal. Null when no snooze is in flight.
+  const [snoozeTargetId, setSnoozeTargetId] = useState<string | null>(null);
   const [showAbout, setShowAbout] = useState(false);
   const [telemetryConsentNeeded, setTelemetryConsentNeeded] = useState(false);
   // Whether the telemetry status fetch has settled. `telemetryConsentNeeded`
@@ -1339,15 +1352,43 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     ),
   );
 
+  // Palette triage toggles for the active session. "snooze" needs a duration,
+  // so it opens the shared modal; the rest are argless server toggles that
+  // apply the returned snapshot immediately (re-bucketing without waiting for
+  // the poll) and surface a toast on failure.
+  const handleSessionStateAction = useCallback(
+    async (id: string, action: SessionStateAction) => {
+      if (action === "snooze") {
+        setSnoozeTargetId(id);
+        return;
+      }
+      const run: Record<Exclude<SessionStateAction, "snooze">, () => Promise<SessionResponse | null>> = {
+        pin: () => setSessionPin(id, true),
+        unpin: () => setSessionPin(id, false),
+        archive: () => setSessionArchive(id, true),
+        unarchive: () => setSessionArchive(id, false),
+        unsnooze: () => setSessionSnooze(id, null),
+        trash: () => trashSession(id),
+        untrash: () => restoreSession(id),
+      };
+      const result = await run[action]();
+      if (result) applySession(result);
+      else reportError(`Failed to ${action} session`);
+    },
+    [applySession],
+  );
+
   const commandActions = useCommandActions({
     sessions,
     activeSessionId,
+    activeSession: activeSession ?? null,
     loginRequired,
     hasActiveSession: !!activeSession,
     readOnly: !!serverAbout?.read_only,
     onNewSession: handleNewSession,
     onNewScratch: handleNewScratch,
     onSelectSession: handleSelectSession,
+    onSessionStateAction: handleSessionStateAction,
     onToggleDiff: toggleDiff,
     onOpenSettings: handleOpenSettings,
     onOpenHelp: handleOpenHelp,
@@ -1525,6 +1566,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
                         archivedAt={activeSession.archived_at ?? null}
                         snoozedUntil={activeSession.snoozed_until ?? null}
                         trashedAt={activeSession.trashed_at ?? null}
+                        onRestore={
+                          activeSession.trashed_at
+                            ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, activeSessionId!))
+                            : undefined
+                        }
                         onOpenFileRef={handleOpenFileRef}
                         fileRefSession={activeSession}
                         onOpenAgentsPane={openAgentsPane}
@@ -1911,6 +1957,21 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           onSearchChange={setPaletteQuery}
           searching={conversationSearching}
         />
+
+        {snoozeTargetId && (
+          <SnoozeModal
+            title="Snooze session"
+            onCancel={() => setSnoozeTargetId(null)}
+            onPick={(minutes) => {
+              const id = snoozeTargetId;
+              setSnoozeTargetId(null);
+              void setSessionSnooze(id, minutes).then((result) => {
+                if (result) applySession(result);
+                else reportError("Failed to snooze session");
+              });
+            }}
+          />
+        )}
 
         {activeWorkspace && activeSession && (
           <MobileRightPanelPicker

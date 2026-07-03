@@ -277,10 +277,12 @@ impl Session {
             return Ok(false);
         }
 
-        // `^.0` targets the first window's first pane regardless of
-        // base-index (matches is_pane_dead/capture_pane targeting). The
-        // `-k` flag forces respawn even though the pane has a remembered
-        // exit status; without it tmux refuses to respawn dead panes.
+        // `^.0` targets the first window's first pane: `^` picks the
+        // first winlink (base-index agnostic), but the `.0` index
+        // resolves only when `pane-base-index` is 0. Production pins
+        // that on every session via `append_pane_base_index_args`
+        // (see #488, #2231). The `-k` flag forces respawn past the
+        // remembered exit status; without it tmux refuses to respawn.
         let target = format!("{}:^.0", self.name);
         let mut args: Vec<String> = vec![
             "respawn-pane".to_string(),
@@ -1119,7 +1121,9 @@ mod tests {
             return;
         }
         let guard = TmuxTestSession::new("aoe_test_race");
-        // A pane that scrolls as fast as tmux can ingest.
+        // A pane that scrolls as fast as tmux can ingest. The trailing
+        // `set-option pane-base-index 0` chain mirrors `append_pane_base_index_args`
+        // so `^.0` resolves on hosts with `pane-base-index 1` set globally (see #2231).
         let out = Command::new("tmux")
             .args([
                 "new-session",
@@ -1131,6 +1135,12 @@ mod tests {
                 "-y",
                 "24",
                 "bash -c 'i=0; while true; do echo line-$((i++)); done'",
+                ";",
+                "set-option",
+                "-t",
+                guard.name(),
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("tmux new-session");
@@ -1237,6 +1247,8 @@ mod tests {
         // 5 columns, so the cursor lands at (5, 0). `sleep` keeps the pane
         // alive across the capture; generous so a test thread starved by
         // parallel suite load can't outlive the pane before capturing.
+        // Pin `pane-base-index 0` so `^.0` resolves on hosts with
+        // `pane-base-index 1` set globally (see #488, #2231).
         let status = Command::new("tmux")
             .args([
                 "new-session",
@@ -1248,6 +1260,12 @@ mod tests {
                 "-y",
                 "10",
                 "sh -c 'printf hello; sleep 60'",
+                ";",
+                "set-option",
+                "-t",
+                &name,
+                "pane-base-index",
+                "0",
             ])
             .status()
             .expect("tmux new-session");

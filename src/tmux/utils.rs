@@ -1,6 +1,7 @@
 //! tmux utility functions
 
 use anyhow::{bail, Result};
+use std::process::Command;
 use std::sync::OnceLock;
 
 pub fn strip_ansi(content: &str) -> String {

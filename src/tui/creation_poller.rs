@@ -383,6 +383,7 @@ mod tests {
                 child_session_id: "child-uuid".into(),
             }),
             existing_instances: Vec::new(),
+            existing_groups: Vec::new(),
             hooks: None,
         };
         let (progress_tx, _progress_rx) = mpsc::channel();

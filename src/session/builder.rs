@@ -1864,7 +1864,7 @@ mod tests {
                 child_session_id: "child-uuid".into(),
             }),
         };
-        let inst = build_instance(params, &[], &[], "default")
+        let inst = build_instance(params, &[], &[], &[], "default")
             .unwrap()
             .instance;
         // The pre-pinned child id lives in agent_session_id; the parent rides on
@@ -1905,7 +1905,7 @@ mod tests {
                 parent_acp_session_id: "parent-acp-id".into(),
             }),
         };
-        let inst = build_instance(params, &[], &[], "default")
+        let inst = build_instance(params, &[], &[], &[], "default")
             .unwrap()
             .instance;
         // The structured arm forces the structured view and sets the two paired
@@ -1971,7 +1971,7 @@ mod tests {
         params.worktree_enabled = true;
         params.worktree_branch = Some("feat".to_string());
 
-        let err = match build_instance(params, &[], &[], "default") {
+        let err = match build_instance(params, &[], &[], &[], "default") {
             Ok(_) => panic!("worktree on a non-git path must error"),
             Err(e) => e,
         };

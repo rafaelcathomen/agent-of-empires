@@ -1,9 +1,11 @@
+#[cfg(feature = "serve")]
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
 use crate::automation::cron;
 use crate::automation::model::Automation;
+#[cfg(feature = "serve")]
 use crate::automation::store::AutomationStore;
 #[cfg(feature = "serve")]
 use crate::session::Instance;

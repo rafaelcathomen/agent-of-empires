@@ -248,14 +248,25 @@ pub fn stop_all_sessions() -> anyhow::Result<usize> {
 /// Returns a map from session name to metadata for the first window's first pane.
 ///
 /// Returns `Err` when the underlying `tmux list-panes` call fails to spawn or
-/// exits non-zero. Callers MUST distinguish this from `Ok(map)` where a missing
-/// key means the session is genuinely absent: `Err` means we don't know.
-/// Startup recovery treats `Err` as "skip this pass" to avoid killing a
-/// possibly-live pane on a transient tmux glitch; status pollers treat it as
-/// `unwrap_or_default()` because their semantics are unchanged by an empty map.
+/// exits non-zero for an unrecognized reason. Callers MUST distinguish this
+/// from `Ok(map)` where a missing key means the session is genuinely absent:
+/// `Err` means we don't know. Startup recovery treats `Err` as "skip this
+/// pass" to avoid killing a possibly-live pane on a transient tmux glitch;
+/// status pollers treat it as `unwrap_or_default()` because their semantics
+/// are unchanged by an empty map.
+///
+/// A non-zero exit whose stderr says there is no reachable tmux server at all
+/// (see [`utils::stderr_indicates_no_tmux_server`]) is unambiguous, not a
+/// glitch: it means zero panes exist, so it returns `Ok(HashMap::new())`
+/// rather than `Err`. This matters most at a cold boot, before any tmux
+/// server has ever started: without this distinction, startup recovery's
+/// first-ever probe on a fresh machine hit the generic `Err` branch and
+/// skipped relaunching every session, since it cannot tell "no server yet"
+/// apart from "tmux glitched, don't touch anything".
 pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     let start = Instant::now();
     let output = tmux_command()
+        .env("LC_ALL", "C")
         .args([
             "list-panes",
             "-a",
@@ -268,6 +279,11 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             Ok(parse_pane_metadata(&stdout))
+        }
+        Ok(out)
+            if utils::stderr_indicates_no_tmux_server(&String::from_utf8_lossy(&out.stderr)) =>
+        {
+            Ok(HashMap::new())
         }
         Ok(out) => {
             tracing::warn!(

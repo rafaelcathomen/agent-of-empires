@@ -181,6 +181,7 @@ pub fn ensure_pm_session(profile: &str, group_path: &str) -> Result<Option<Strin
         command_override: String::new(),
         extra_repo_paths: Vec::new(),
         scratch: true,
+        fork_seed: None,
     };
 
     let title_refs: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();

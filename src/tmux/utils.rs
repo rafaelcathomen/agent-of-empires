@@ -1,6 +1,7 @@
 //! tmux utility functions
 
 use anyhow::{bail, Result};
+use std::process::Command;
 use std::sync::OnceLock;
 
 pub fn strip_ansi(content: &str) -> String {
@@ -291,14 +292,25 @@ pub fn tmux_prefix_display() -> &'static str {
     })
 }
 
+/// True when a tmux failure's stderr indicates there is no reachable server
+/// at all (as opposed to some other real failure), in the C locale: either a
+/// clean "never started" (`no server running`) or a stale/dead socket left
+/// behind by a crashed server (`error connecting`, e.g. after an unclean
+/// shutdown that didn't remove its socket file). Distinct from a
+/// session-specific "not found" message (see [`kill_session_if_present`]),
+/// which callers check separately since it doesn't apply to server-wide
+/// probes like `list-panes -a` / `list-sessions`.
+pub(crate) fn stderr_indicates_no_tmux_server(stderr: &str) -> bool {
+    stderr.contains("no server running") || stderr.contains("error connecting")
+}
+
 /// Run `tmux kill-session -t <name>`. A missing session is treated as
 /// success, since the goal is "this session is not present": `can't find
 /// session` (the session is gone, e.g. callers commonly kill the pane's
 /// process tree first, which can tear the session down before this lands)
-/// and `no server running` (no tmux server at all, so no session exists)
-/// are both swallowed in the C locale. Any other tmux failure returns
-/// `Err`. Caller is responsible for `refresh_session_cache` after a
-/// successful kill.
+/// and "no server at all" (see [`stderr_indicates_no_tmux_server`]) are both
+/// swallowed in the C locale. Any other tmux failure returns `Err`. Caller is
+/// responsible for `refresh_session_cache` after a successful kill.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
     let output = crate::tmux::tmux_command()
         .env("LC_ALL", "C")
@@ -306,9 +318,8 @@ pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let absent = stderr.contains("can't find session")
-            || stderr.contains("no server running")
-            || stderr.contains("error connecting");
+        let absent =
+            stderr.contains("can't find session") || stderr_indicates_no_tmux_server(&stderr);
         if !absent {
             bail!("Failed to kill tmux session '{}': {}", name, stderr);
         }
@@ -334,6 +345,33 @@ fn format_tmux_prefix(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_stderr_indicates_no_tmux_server_matches_known_messages() {
+        assert!(stderr_indicates_no_tmux_server(
+            "no server running on /tmp/tmux-1000/default\n"
+        ));
+        assert!(stderr_indicates_no_tmux_server(
+            "error connecting to /tmp/tmux-1000/default (No such file or directory)\n"
+        ));
+        // A stale socket left by a crashed server reports connection refused,
+        // not "no server running"; this is the exact case that regressed
+        // `batch_pane_metadata` into aborting startup recovery on a cold
+        // boot (the socket file can survive a reboot even though nothing is
+        // listening on it).
+        assert!(stderr_indicates_no_tmux_server(
+            "error connecting to /tmp/tmux-1000/default (Connection refused)\n"
+        ));
+    }
+
+    #[test]
+    fn test_stderr_indicates_no_tmux_server_rejects_other_failures() {
+        assert!(!stderr_indicates_no_tmux_server(
+            "can't find session: aoe_franka_cde819a1\n"
+        ));
+        assert!(!stderr_indicates_no_tmux_server(""));
+        assert!(!stderr_indicates_no_tmux_server("permission denied\n"));
+    }
 
     #[test]
     fn test_sanitize_session_name() {

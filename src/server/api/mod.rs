@@ -27,25 +27,26 @@ mod telemetry;
 pub use acp::{
     acp_attachment, acp_cancel, acp_context_primer, acp_disable, acp_enable, acp_files,
     acp_force_end_turn, acp_prompt, acp_prompt_diff_comments, acp_replay, acp_set_config_option,
-    acp_set_mode, acp_worker_log, install_agent, list_acp_agents, list_claude_sessions,
-    resolve_approval, resolve_elicitation, shutdown_acp, spawn_acp, switch_acp_agent,
+    acp_set_mode, acp_worker_log, get_option_catalog, install_agent, list_acp_agents,
+    list_claude_sessions, resolve_approval, resolve_elicitation, shutdown_acp, spawn_acp,
+    switch_acp_agent,
 };
 
 #[cfg(feature = "serve")]
 pub use client_log::post_client_log;
-pub use git::{clone_repo, list_branches};
+pub use git::{clone_repo, is_git_repo, list_branches};
 pub use log_level::{get_log_level, patch_log_level};
 pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_conflict};
 pub use plugins::{
     apply_plugin_update, dismiss_plugin_update, invoke_plugin_action, list_plugins,
     plugin_commands, plugin_details, plugin_discover, plugin_job_status, plugin_ui_state,
-    plugin_update_preview, plugin_updates, preview_plugin_install, set_plugin_enabled,
-    start_plugin_install, start_plugin_uninstall,
+    plugin_update_preview, plugin_updates, preview_plugin_install, serve_plugin_icon,
+    set_plugin_enabled, start_plugin_install, start_plugin_uninstall,
 };
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
-    force_smart_rename, get_recent_projects, kill_terminal, list_sessions,
+    force_smart_rename, get_recent_projects, kill_terminal, list_sessions, paste_image,
     preview_volume_ignores_globs, read_output, rename_session, restore_session, search_sessions,
     send_message, serve_session_artifact, session_diff_file, session_diff_files, set_worktree_name,
     start_session, stop_session, trash_session, update_session_archive, update_session_diff_base,
@@ -85,6 +86,37 @@ pub(super) fn validate_no_shell_injection(value: &str, field_name: &str) -> Resu
         return Err(format!(
             "Invalid character '{}' in {}. Shell metacharacters are not allowed.",
             c, field_name
+        ));
+    }
+    Ok(())
+}
+
+/// Unicode bidirectional-format characters (category Cf): `char::is_control()`
+/// only covers Cc, so these pass through unblocked otherwise. Left in a
+/// display label, they let the rendered text reorder relative to what's
+/// stored (Trojan-Source-style spoofing, e.g. CVE-2021-42574) in shared UI
+/// surfaces. This is the same set rustc's own bidi lint blocks in source
+/// literals.
+const BIDI_CONTROL_CHARS: &[char] = &[
+    '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', // LRE RLE PDF LRO RLO
+    '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}', // LRI RLI FSI PDI
+];
+
+/// Validate a pure display label (session title, group path): these are
+/// never passed to a shell or interpreted as a path (#2624), so unlike
+/// `validate_no_shell_injection` this allows apostrophes, punctuation, and
+/// most metacharacters. It still rejects control characters and bidi
+/// override/isolate characters, since a literal newline, NUL, or bidi
+/// override corrupts single-line UI rendering, storage, or the displayed
+/// text's actual order regardless of shell context.
+pub(super) fn validate_display_label(value: &str, field_name: &str) -> Result<(), String> {
+    if let Some(c) = value
+        .chars()
+        .find(|c| c.is_control() || BIDI_CONTROL_CHARS.contains(c))
+    {
+        return Err(format!(
+            "Invalid control character U+{:04X} in {}.",
+            c as u32, field_name
         ));
     }
     Ok(())
@@ -558,6 +590,59 @@ mod tests {
                 "validate_no_shell_injection should reject {:?} but accepted {:?}",
                 c,
                 input
+            );
+        }
+    }
+
+    /// #2624: real-world session titles/groups (imported from Claude Code
+    /// summaries) routinely contain apostrophes, question marks, and other
+    /// shell metacharacters that are harmless for a display label.
+    #[test]
+    fn display_label_accepts_common_punctuation() {
+        for value in [
+            "I've read @filename?",
+            "I'm testing this out",
+            "Goal: fix the parser",
+            "What's next?",
+            "Fix [draft] (wip) ~ #123",
+            "work/claude/imports",
+        ] {
+            assert!(
+                validate_display_label(value, "title").is_ok(),
+                "should accept {:?}",
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn display_label_rejects_control_characters() {
+        for value in [
+            "bad\nname",
+            "bad\rname",
+            "bad\tname",
+            "bad\u{1b}name",
+            "bad\0name",
+        ] {
+            assert!(
+                validate_display_label(value, "title").is_err(),
+                "should reject {:?}",
+                value
+            );
+        }
+    }
+
+    /// `is_control()` alone misses Cf-category bidi override/isolate chars;
+    /// unblocked, they let a title's rendered order differ from what's
+    /// stored (Trojan-Source-style spoofing).
+    #[test]
+    fn display_label_rejects_bidi_control_characters() {
+        for &c in BIDI_CONTROL_CHARS {
+            let value = format!("bad{}name", c);
+            assert!(
+                validate_display_label(&value, "title").is_err(),
+                "should reject {:?}",
+                value
             );
         }
     }

@@ -379,17 +379,57 @@ fn socket_exists(path: &Path) -> bool {
     }
 }
 
-/// Reap the runner for `session_id`: SIGTERM its whole process group (if
-/// the registry entry exists), then remove the registry entry and socket.
+/// Resolve the runner's PID from whichever source is still legible: the
+/// on-disk record first, then (only when `load` returns `Err`, not when
+/// it returns `Ok(None)`) `SO_PEERCRED` on the live socket. The
+/// distinction matters: `Ok(None)` means the runner is already gone, so
+/// falling through to the socket would just probe a stale inode; `Err`
+/// means we lost the primary channel and must reach for the secondary
+/// before the runner escapes both SIGTERM and the shutdown wait. `load`
+/// returns `Err` only for true I/O failures (permissions, wrong file
+/// type, transient); JSON parse errors are coerced to `Ok(None)`
+/// upstream. See #2102.
+pub fn pid_source_for(session_id: &str) -> Option<u32> {
+    match load(session_id) {
+        Ok(Some(record)) => (record.pid > 0).then_some(record.pid),
+        Ok(None) => None,
+        Err(e) => {
+            let sock = socket_path_for(session_id).ok()?; // same validator as load(); degrades to None on invalid id
+            let pid = crate::process::worker::peer_pid_from_socket(&sock);
+            match pid {
+                Some(peer_pid) => warn!(
+                    target: "acp.registry",
+                    session = %session_id,
+                    pid = peer_pid,
+                    "worker registry unreadable; recovered runner PID via SO_PEERCRED on socket: {e}"
+                ),
+                None => warn!(
+                    target: "acp.registry",
+                    session = %session_id,
+                    "worker registry unreadable and no peer PID on socket; \
+                     runner may be orphaned under PID 1: {e}"
+                ),
+            }
+            pid
+        }
+    }
+}
+
+/// Reap the runner for `session_id`: resolve its PID via `pid_source_for`
+/// (on-disk record, or `SO_PEERCRED` on the live socket when the record is
+/// unreadable; see #2102), SIGTERM its whole process group, then remove
+/// the registry entry and socket.
+///
 /// The canonical teardown used by the supervisor's shutdown paths and by a
 /// fresh spawn that supersedes a stale runner, so no prior agent tree is
-/// left orphaned. The SIGTERM is sent unconditionally: the process group
-/// can outlive its leader pid, so gating on leader liveness would skip the
+/// left orphaned. When a PID is resolved, the signal targets the whole
+/// process group (`killpg`) rather than the leader alone: the group can
+/// outlive its leader pid, so gating on leader liveness would skip the
 /// killpg and leak surviving descendants. `killpg` ignores ESRCH, so an
 /// already-empty group is a harmless no-op. See #1689.
 pub fn terminate(session_id: &str) {
-    if let Ok(Some(record)) = load(session_id) {
-        crate::process::worker::terminate_process_group(record.pid);
+    if let Some(pid) = pid_source_for(session_id) {
+        crate::process::worker::terminate_process_group(pid);
     }
     delete(session_id).ok();
 }
@@ -401,7 +441,11 @@ mod tests {
     use tempfile::TempDir;
 
     fn with_temp_home<F: FnOnce()>(f: F) {
-        let tmp = TempDir::new().unwrap();
+        // Root under /tmp instead of the default $TMPDIR (which on
+        // macOS points into /var/folders/... and blows past the
+        // ~104-char sun_path limit once we tack on <app_dir>/acp-workers/
+        // <session_id>.sock inside a peer_pid test).
+        let tmp = TempDir::with_prefix_in("aoe-registry-", "/tmp").unwrap();
         let original = std::env::var_os("HOME");
         let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
         // SAFETY: tests are serialized via `#[serial]`; the env mutation
@@ -832,5 +876,79 @@ mod tests {
         assert!(socket_path_for("foo/bar").is_err());
         assert!(log_path_for("").is_err());
         assert!(restart_marker_path(".hidden").is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn pid_source_for_prefers_record_pid_when_load_ok_some() {
+        with_temp_home(|| {
+            let rec = WorkerRecord::new(
+                "sess-ok-some".into(),
+                4242,
+                PathBuf::from("/tmp/unused"),
+                "claude-agent-acp".into(),
+                "claude".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            save(&rec).unwrap();
+            assert_eq!(pid_source_for("sess-ok-some"), Some(4242));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn pid_source_for_returns_none_when_load_ok_none() {
+        with_temp_home(|| {
+            // No record on disk AND no socket: the runner is already
+            // gone, so we must NOT fall through to the peer probe (the
+            // socket, if any, would be a stale inode from a prior spawn).
+            assert_eq!(pid_source_for("sess-missing"), None);
+        });
+    }
+
+    /// #2102: the load-Err branch consults `peer_pid_from_socket` so an
+    /// unreadable registry file no longer means the runner
+    /// escapes SIGTERM and the shutdown_and_wait poll. Binding a
+    /// listener in the test process makes own PID the peer, which is
+    /// what the helper must surface.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn pid_source_for_falls_back_to_peer_pid_on_load_err() {
+        with_temp_home(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let session_id = "sess-load-err";
+            let rec = WorkerRecord::new(
+                session_id.into(),
+                4242,
+                socket_path_for(session_id).unwrap(),
+                "claude-agent-acp".into(),
+                "claude".into(),
+                PathBuf::from("/repo"),
+                None,
+                vec![],
+                vec![],
+                None,
+                None,
+            );
+            save(&rec).unwrap();
+            // Force load() -> Err via chmod 0o000.
+            let rec_path = record_path(session_id).unwrap();
+            std::fs::set_permissions(&rec_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(
+                load(session_id).is_err(),
+                "fixture must force load() to return Err"
+            );
+            // Bind a real UDS listener in the test process so peer_pid
+            // resolves to own PID.
+            let sock_path = socket_path_for(session_id).unwrap();
+            let _listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+            assert_eq!(pid_source_for(session_id), Some(std::process::id()));
+        });
     }
 }

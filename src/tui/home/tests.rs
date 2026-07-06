@@ -4605,6 +4605,7 @@ fn test_create_session_in_all_mode_is_findable() {
         extra_args: String::new(),
         command_override: String::new(),
         scratch: false,
+        fork_seed: None,
     };
 
     let session_id = view.create_session(data).unwrap();
@@ -5134,6 +5135,195 @@ fn test_session_context_menu_new_session_prefills_from_session() {
         .expect("NewFromSelection should open the new-session dialog");
     assert_eq!(dialog.path_value(), "/tmp/work");
     assert_eq!(dialog.group_value(), "work");
+}
+
+#[test]
+#[serial]
+fn fork_from_selection_seeds_terminal_fork_and_inherits_parent_context() {
+    let mut env = create_test_env_empty();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "claude".into();
+    inst.agent_session_id = Some("parent-1111-2222-3333-444444444444".into());
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("fork opens the new-session dialog");
+    let seed = dialog.fork_seed().cloned().expect("fork seed present");
+    match seed {
+        crate::session::ForkSeed::Terminal {
+            parent_agent_session_id,
+            child_session_id,
+        } => {
+            assert_eq!(
+                parent_agent_session_id,
+                "parent-1111-2222-3333-444444444444"
+            );
+            assert_ne!(child_session_id, "parent-1111-2222-3333-444444444444");
+            assert!(!child_session_id.is_empty());
+        }
+        other => panic!("expected Terminal fork seed, got {other:?}"),
+    }
+    assert_eq!(dialog.path_value(), "/tmp/repo");
+}
+
+#[test]
+#[serial]
+fn fork_denied_for_resume_only_agent_shows_info() {
+    let mut env = create_test_env_empty();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "gemini".into();
+    inst.agent_session_id = Some("parent-uuid".into());
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    assert!(
+        env.view.new_dialog.is_none(),
+        "no dialog for an unforkable agent"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "an explanatory info dialog is shown instead"
+    );
+}
+
+/// The fork seed forks the parent's agent, so the dialog must open preselected
+/// on that agent rather than the configured default. A Codex parent forking
+/// while the default tool is claude must land on codex, not claude (otherwise
+/// the dialog's tool and the seed disagree).
+#[test]
+#[serial]
+fn fork_from_selection_preselects_parent_tool() {
+    let mut env = create_test_env_empty();
+    env.view
+        .set_available_tools(AvailableTools::with_tools(&["claude", "codex"]));
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "codex".into();
+    inst.agent_session_id = Some("parent-1111-2222-3333-444444444444".into());
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("fork opens the new-session dialog");
+    assert_eq!(
+        dialog.selected_tool(),
+        "codex",
+        "fork dialog must preselect the parent's agent so it matches the seed"
+    );
+}
+
+/// A structured (ACP) parent forks via the ACP `session/fork` handshake, so the
+/// seed must be `Structured` carrying the parent's captured ACP session id, not
+/// a terminal resume-with-fork-flag seed.
+#[cfg(feature = "serve")]
+#[test]
+#[serial]
+fn fork_from_selection_structured_parent_seeds_structured_fork() {
+    let mut env = create_test_env_empty();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "claude".into();
+    inst.view = crate::session::View::Structured;
+    inst.acp_session_id = Some("acp-parent-9999".into());
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("fork opens the new-session dialog for a structured parent");
+    let seed = dialog.fork_seed().cloned().expect("fork seed present");
+    assert_eq!(
+        seed,
+        crate::session::ForkSeed::Structured {
+            parent_acp_session_id: "acp-parent-9999".into(),
+        },
+        "a structured parent must seed a structured fork from its ACP session id"
+    );
+}
+
+/// A structured parent with no captured ACP session id yet has no conversation
+/// to fork; the dialog must not open and an explanatory info dialog is shown.
+#[cfg(feature = "serve")]
+#[test]
+#[serial]
+fn fork_from_selection_structured_parent_without_acp_id_denies() {
+    let mut env = create_test_env_empty();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "claude".into();
+    inst.view = crate::session::View::Structured;
+    inst.acp_session_id = None;
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    assert!(
+        env.view.new_dialog.is_none(),
+        "no dialog for a structured parent with no captured ACP session"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "an explanatory info dialog is shown instead"
+    );
+}
+
+/// A structured parent whose agent is resume-only (aoe-agent: ACP-capable but
+/// no fork strategy) must be refused at the capability gate, BEFORE the
+/// captured-conversation check, even when it has an acp_session_id. Otherwise
+/// the fork would silently downgrade to session/new at the handshake. This is
+/// the exact silent-downgrade the reviewer flagged; the gate mirrors the REST
+/// create guard and the web `acp_can_fork` projection.
+#[cfg(feature = "serve")]
+#[test]
+#[serial]
+fn fork_from_selection_structured_unforkable_agent_denies() {
+    let mut env = create_test_env_empty();
+    let mut inst = Instance::new("parent", "/tmp/repo");
+    inst.source_profile = "test".to_string();
+    inst.tool = "aoe-agent".into();
+    inst.view = crate::session::View::Structured;
+    // A captured conversation IS present, so only the capability gate can
+    // refuse (proving the gate runs before the acp-id check).
+    inst.acp_session_id = Some("acp-parent-1234".into());
+    let id = inst.id.clone();
+    env.view.add_instance(inst);
+    env.view.selected_session = Some(id);
+
+    env.view.open_fork_from_selection();
+
+    assert!(
+        env.view.new_dialog.is_none(),
+        "no dialog for a structured parent whose agent cannot fork"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "an explanatory 'Fork not supported' info dialog is shown instead"
+    );
 }
 
 #[test]
@@ -5786,6 +5976,7 @@ fn test_apply_creation_results_returns_session_id() {
         extra_args: String::new(),
         command_override: String::new(),
         scratch: false,
+        fork_seed: None,
     };
 
     // Use the async CreationPoller path (pass None hooks, non-sandbox,
@@ -7376,11 +7567,7 @@ fn restart_selected_session_debounces_via_cooldown_map() {
 #[test]
 #[serial]
 fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
-    if std::process::Command::new("tmux")
-        .arg("-V")
-        .output()
-        .is_err()
-    {
+    if crate::tmux::tmux_command().arg("-V").output().is_err() {
         eprintln!("Skipping: tmux not available");
         return;
     }
@@ -7398,7 +7585,7 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
     inst.agent_session_id = Some(stale_sid.to_string());
     let id = inst.id.clone();
     let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-    let _ = std::process::Command::new("tmux")
+    let _ = crate::tmux::tmux_command()
         .args(["kill-session", "-t", &tmux_name])
         .output();
 
@@ -7432,7 +7619,7 @@ fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    let _ = std::process::Command::new("tmux")
+    let _ = crate::tmux::tmux_command()
         .args(["kill-session", "-t", &tmux_name])
         .output();
 
@@ -12968,6 +13155,7 @@ mod new_session_attach_mode {
             extra_args: String::new(),
             command_override: String::new(),
             scratch: false,
+            fork_seed: None,
         }
     }
 
@@ -14033,8 +14221,11 @@ mod right_click_context_menu {
             .map(|(_, l)| *l)
             .collect();
         // Default sort here is Newest, where Snooze is gated out. The unread
-        // toggle is always-on (any sort) and defaults on, so the archived-row
-        // menu is New Session / Rename / Unarchive / Mark unread / Delete.
+        // toggle is always-on (any sort) and defaults on. The default session
+        // tool is claude (a forkable terminal agent), so the Fork row shows;
+        // `right_click_session_menu_hides_fork_for_unforkable_agent` covers the
+        // gated-off case. Menu is New Session / Rename / Unarchive / Mark unread
+        // / Delete / Fork.
         assert_eq!(
             labels,
             vec![
@@ -14042,7 +14233,8 @@ mod right_click_context_menu {
                 "Rename",
                 "Unarchive",
                 "Mark unread",
-                "Delete"
+                "Delete",
+                "Fork session"
             ]
         );
 
@@ -14052,6 +14244,61 @@ mod right_click_context_menu {
         assert!(
             !env.view.get_instance(&id).unwrap().is_archived(),
             "context-menu Unarchive must unarchive the session"
+        );
+    }
+
+    /// A forkable agent (claude, the default test tool) shows the "Fork
+    /// session" row so the mouse path matches the palette action.
+    #[test]
+    #[serial]
+    fn right_click_session_menu_shows_fork_for_forkable_agent() {
+        let mut env = create_test_env_with_sessions(1);
+        setup_inner(&mut env);
+        assert!(env.view.handle_right_click(5, 1));
+        let actions: Vec<ContextMenuAction> = env
+            .view
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items_for_test()
+            .iter()
+            .map(|(a, _)| *a)
+            .collect();
+        assert!(
+            actions.contains(&ContextMenuAction::Fork),
+            "a forkable agent (claude) must show the Fork row"
+        );
+    }
+
+    /// A resume-only agent (gemini declares `ForkStrategy::Unsupported`) cannot
+    /// fork, so the menu must omit the "Fork session" row rather than offer an
+    /// action the palette would refuse.
+    #[test]
+    #[serial]
+    fn right_click_session_menu_hides_fork_for_unforkable_agent() {
+        let mut env = create_test_env_with_sessions(1);
+        setup_inner(&mut env);
+        let id = match &env.view.flat_items[0] {
+            Item::Session { id, .. } => id.clone(),
+            _ => panic!("expected a session row"),
+        };
+        env.view
+            .apply_user_action(&id, |inst| inst.tool = "gemini".to_string())
+            .unwrap();
+        env.view.flat_items = env.view.build_flat_items();
+        assert!(env.view.handle_right_click(5, 1));
+        let actions: Vec<ContextMenuAction> = env
+            .view
+            .context_menu
+            .as_ref()
+            .unwrap()
+            .items_for_test()
+            .iter()
+            .map(|(a, _)| *a)
+            .collect();
+        assert!(
+            !actions.contains(&ContextMenuAction::Fork),
+            "a resume-only agent (gemini) must not show the Fork row"
         );
     }
 
@@ -14093,6 +14340,40 @@ mod right_click_context_menu {
             menu_actions(&env).contains(&ContextMenuAction::ToggleSnooze),
             "Snooze must appear in Attention sort"
         );
+    }
+
+    /// For a forkable agent the Fork row is sort-independent: unlike Snooze
+    /// (gated to Attention sort) it appears in every sort. Whether the row shows
+    /// at all is gated on fork capability, covered by the
+    /// `..._shows_fork_for_forkable_agent` / `..._hides_fork_for_unforkable_agent`
+    /// pair; this test pins that the capability gate does not accidentally
+    /// couple to sort order. The default test tool is claude (forkable).
+    #[test]
+    #[serial]
+    fn right_click_session_menu_offers_fork_in_every_sort_for_forkable_agent() {
+        let mut env = create_test_env_with_sessions(2);
+        setup_inner(&mut env);
+
+        let has_fork = |env: &TestEnv| -> bool {
+            env.view
+                .context_menu
+                .as_ref()
+                .unwrap()
+                .items_for_test()
+                .iter()
+                .any(|(a, _)| *a == ContextMenuAction::Fork)
+        };
+
+        for sort in [SortOrder::Newest, SortOrder::Attention] {
+            env.view.sort_order = sort;
+            env.view.flat_items = env.view.build_flat_items();
+            assert!(env.view.handle_right_click(5, 1));
+            assert!(
+                has_fork(&env),
+                "Fork must be offered for a forkable agent in {sort:?} sort"
+            );
+            env.view.context_menu = None;
+        }
     }
 
     #[test]
@@ -14347,7 +14628,6 @@ mod apply_session_id_updates {
     use super::*;
     use crate::session::poller::SessionPoller;
     use crate::session::ResumeIntent;
-    use std::process::Command;
     use std::sync::{Arc, Mutex};
 
     const NEW_SID: &str = "019342ab-1111-7aaa-8bbb-cccdddeeefff";
@@ -14364,10 +14644,10 @@ mod apply_session_id_updates {
         }
 
         fn create_named(name: String) -> Self {
-            let _ = Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &name])
                 .output();
-            let status = Command::new("tmux")
+            let status = crate::tmux::tmux_command()
                 .args(["new-session", "-d", "-s", &name])
                 .status()
                 .expect("failed to spawn tmux");
@@ -14382,7 +14662,7 @@ mod apply_session_id_updates {
 
     impl Drop for TmuxSession {
         fn drop(&mut self) {
-            let _ = Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &self.0])
                 .output();
             crate::tmux::refresh_session_cache();
@@ -14390,7 +14670,7 @@ mod apply_session_id_updates {
     }
 
     fn skip_if_no_tmux() -> bool {
-        if Command::new("tmux").arg("-V").output().is_err() {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
             eprintln!("Skipping: tmux not available");
             return true;
         }
@@ -14931,5 +15211,107 @@ mod heat_rmenu_tests {
             env.view.instances[0].heat_level,
             HeatLevel::Ramp(_)
         ));
+    }
+}
+
+mod stacked_single_seam {
+    //! Regression coverage for #2301: the list and preview panes must meet
+    //! on a single shared border in every layout (DESIGN.md invariant). The
+    //! stacked layout used to draw the list's BOTTOM and preview's TOP as
+    //! two adjacent horizontal borders, producing a visible doubled seam.
+
+    use super::*;
+    use crate::tui::responsive;
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Row indices whose glyphs are dominated by the horizontal box-drawing
+    /// char used by ratatui's `BorderType::Rounded`. Includes both outer box
+    /// borders and any internal horizontal dividers; the caller relies on
+    /// adjacency to detect a doubled seam, not on the rows being borders
+    /// exclusively.
+    fn horizontal_dense_rows(buf: &ratatui::buffer::Buffer) -> Vec<u16> {
+        const HORIZONTAL: &str = "─";
+        let mut rows = Vec::new();
+        for y in 0..buf.area.height {
+            let mut count = 0u16;
+            for x in 0..buf.area.width {
+                if buf[(x, y)].symbol() == HORIZONTAL {
+                    count += 1;
+                }
+            }
+            // Half the row width is well above the noise floor (title text,
+            // status glyphs, sort indicator) yet still catches the sparse
+            // horizontal chars in a narrow preview.
+            if count >= buf.area.width / 2 {
+                rows.push(y);
+            }
+        }
+        rows
+    }
+
+    fn render_home(env: &mut TestEnv, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let theme = load_theme("empire");
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    #[serial]
+    fn stacked_layout_has_single_horizontal_seam() {
+        let mut env = create_test_env_with_sessions(2);
+        const { assert!(60 < responsive::STACKED_BREAKPOINT) };
+        let buf = render_home(&mut env, 60, 40);
+
+        let border_rows = horizontal_dense_rows(&buf);
+        assert!(
+            border_rows.len() >= 3,
+            "expected at least list-top, shared-seam, and preview-bottom rows; got {border_rows:?}"
+        );
+        for pair in border_rows.windows(2) {
+            assert!(
+                pair[1] - pair[0] > 1,
+                "doubled seam detected: horizontal borders on adjacent rows {} and {} \
+                 (issue #2301). All horizontal-border rows: {:?}",
+                pair[0],
+                pair[1],
+                border_rows,
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn side_by_side_layout_preserves_horizontal_borders() {
+        let mut env = create_test_env_with_sessions(2);
+        const { assert!(120 >= responsive::STACKED_BREAKPOINT) };
+        let buf = render_home(&mut env, 120, 40);
+
+        let border_rows = horizontal_dense_rows(&buf);
+        assert!(
+            !border_rows.is_empty(),
+            "side-by-side must still draw horizontal borders; got {border_rows:?}"
+        );
+        // The single-shared-separator invariant is a global rule, not a
+        // stacked-only rule: if the enum threading ever grows an asymmetric
+        // path that re-doubles a seam in side-by-side, this catches it.
+        for pair in border_rows.windows(2) {
+            assert!(
+                pair[1] - pair[0] > 1,
+                "unexpected horizontal seam doubling in side-by-side between rows {} and {}; \
+                 all border rows: {:?}",
+                pair[0],
+                pair[1],
+                border_rows,
+            );
+        }
     }
 }

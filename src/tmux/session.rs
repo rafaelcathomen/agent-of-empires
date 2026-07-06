@@ -2,7 +2,7 @@
 
 use anyhow::{bail, Result};
 use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -194,7 +194,7 @@ impl Session {
             return exists;
         }
 
-        Command::new("tmux")
+        crate::tmux::tmux_command()
             .args(["has-session", "-t", &self.name])
             .output()
             .map(|o| o.status.success())
@@ -215,7 +215,7 @@ impl Session {
             return Ok(());
         }
 
-        let mut args = build_create_args(&self.name, working_dir, command, size);
+        let mut args = build_create_args(&self.name, working_dir, &[], command, size);
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_mouse_on_args(&mut args, &self.name);
@@ -224,7 +224,7 @@ impl Session {
             append_clipboard_passthrough_args(&mut args, &self.name);
         }
 
-        let output = Command::new("tmux").args(&args).output()?;
+        let output = crate::tmux::tmux_command().args(&args).output()?;
 
         // Note: With -d flag, tmux new-session returns 0 even if the shell command fails.
         // Log args at debug level for troubleshooting.
@@ -296,7 +296,7 @@ impl Session {
             args.push(cmd.to_string());
         }
 
-        let output = Command::new("tmux").args(&args).output()?;
+        let output = crate::tmux::tmux_command().args(&args).output()?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -331,7 +331,7 @@ impl Session {
             return Ok(());
         }
 
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["rename-session", "-t", &self.name, new_name])
             .output()?;
 
@@ -349,7 +349,7 @@ impl Session {
         }
 
         if std::env::var("TMUX").is_ok() {
-            let status = Command::new("tmux")
+            let status = crate::tmux::tmux_command()
                 .args(["switch-client", "-t", &self.name])
                 .status()?;
 
@@ -358,7 +358,7 @@ impl Session {
                 // This handles cases where TMUX env var is inherited but we're
                 // not actually inside a tmux client (e.g., terminal spawned
                 // from within tmux via `open -a Terminal`).
-                let status = Command::new("tmux")
+                let status = crate::tmux::tmux_command()
                     .args(["attach-session", "-t", &self.name])
                     .status()?;
 
@@ -373,7 +373,7 @@ impl Session {
                 }
             }
         } else {
-            let status = Command::new("tmux")
+            let status = crate::tmux::tmux_command()
                 .args(["attach-session", "-t", &self.name])
                 .status()?;
 
@@ -397,7 +397,7 @@ impl Session {
         info.push(format!("exists={}", self.exists()));
         info.push(format!("pane_dead={}", self.is_pane_dead()));
 
-        if let Ok(output) = Command::new("tmux")
+        if let Ok(output) = crate::tmux::tmux_command()
             .args([
                 "display-message",
                 "-t",
@@ -429,7 +429,7 @@ impl Session {
         // Use `^.0` to target the first window's first pane regardless of
         // base-index or which pane is active.  See #435, #488.
         let target = format!("{}:^.0", self.name);
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "capture-pane",
                 "-t",
@@ -475,7 +475,7 @@ impl Session {
         let start = format!("-{}", lines);
         const HEADER_FMT: &str =
             "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}";
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "display-message",
                 "-p",
@@ -546,7 +546,7 @@ impl Session {
         // input land in a different pane than the one being captured.
         let target = format!("{}:^.0", self.name);
         for batch in raw_byte_batches(bytes) {
-            let output = Command::new("tmux")
+            let output = crate::tmux::tmux_command()
                 .args(["send-keys", "-t", &target, "-H"])
                 .args(&batch)
                 .output()?;
@@ -664,7 +664,7 @@ impl Session {
         if !self.exists() {
             return;
         }
-        let _ = Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["set-option", "-t", &self.name, "window-size", "latest"])
             .output();
     }
@@ -687,7 +687,7 @@ impl Session {
         if cols == 0 || rows == 0 || !self.exists() {
             return;
         }
-        let _ = Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args([
                 "resize-window",
                 "-t",
@@ -810,7 +810,7 @@ impl Session {
     }
 
     fn show_user_option(&self, opt: &str) -> Option<String> {
-        let out = Command::new("tmux")
+        let out = crate::tmux::tmux_command()
             .args(["show-options", "-v", "-t", &self.name, opt])
             .output()
             .ok()?;
@@ -826,13 +826,13 @@ impl Session {
     }
 
     fn set_user_option(&self, opt: &str, value: &str) {
-        let _ = Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["set-option", "-t", &self.name, opt, value])
             .output();
     }
 
     fn unset_user_option(&self, opt: &str) {
-        let _ = Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["set-option", "-u", "-t", &self.name, opt])
             .output();
     }
@@ -860,7 +860,7 @@ impl Session {
         let seq = SEND_COUNTER.fetch_add(1, Ordering::Relaxed);
         let buf_name = format!("aoe-send-{}-{}", std::process::id(), seq);
 
-        let mut child = Command::new("tmux")
+        let mut child = crate::tmux::tmux_command()
             .args(["load-buffer", "-b", &buf_name, "-"])
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
@@ -873,7 +873,7 @@ impl Session {
             bail!("tmux load-buffer failed (status={:?})", status.code());
         }
 
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["paste-buffer", "-d", "-p", "-b", &buf_name, "-t", target])
             .output()?;
         if !output.status.success() {
@@ -881,7 +881,7 @@ impl Session {
             // paste-buffer's `-d` only deletes on success; on failure the
             // buffer survives, so clean it up explicitly. Ignore errors
             // from the cleanup so the original failure isn't masked.
-            let _ = Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["delete-buffer", "-b", &buf_name])
                 .output();
             bail!("tmux paste-buffer failed: {}", stderr);
@@ -891,7 +891,7 @@ impl Session {
     }
 
     fn tmux_send(target: &str, args: &[&str]) -> Result<()> {
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .arg("send-keys")
             .args(["-t", target])
             .args(args)
@@ -942,6 +942,7 @@ fn raw_byte_batches(bytes: &[u8]) -> Vec<Vec<String>> {
 pub(crate) fn build_create_args(
     session_name: &str,
     working_dir: &str,
+    env: &[(&str, &str)],
     command: Option<&str>,
     size: Option<(u16, u16)>,
 ) -> Vec<String> {
@@ -953,6 +954,16 @@ pub(crate) fn build_create_args(
         "-c".to_string(),
         working_dir.to_string(),
     ];
+
+    // Explicit per-session environment (`-e KEY=VAL`). `new-session -e`
+    // requires tmux 3.2+; aoe already assumes newer tmux elsewhere (clipboard
+    // passthrough needs 3.3, the VT channel 3.4), so no extra gate is added.
+    // Set so a pane never inherits a stale value from the shared tmux server's
+    // frozen base environment; see the host-terminal call site for why.
+    for (key, value) in env {
+        args.push("-e".to_string());
+        args.push(format!("{key}={value}"));
+    }
 
     if let Some((width, height)) = size {
         args.push("-x".to_string());
@@ -975,7 +986,7 @@ mod tests {
 
     /// Helper: check if tmux is available for tests that need it
     fn tmux_available() -> bool {
-        Command::new("tmux")
+        crate::tmux::tmux_command()
             .arg("-V")
             .output()
             .map(|o| o.status.success())
@@ -1124,7 +1135,7 @@ mod tests {
         // A pane that scrolls as fast as tmux can ingest. The trailing
         // `set-option pane-base-index 0` chain mirrors `append_pane_base_index_args`
         // so `^.0` resolves on hosts with `pane-base-index 1` set globally (see #2231).
-        let out = Command::new("tmux")
+        let out = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1172,7 +1183,7 @@ mod tests {
             return;
         }
         let guard = TmuxTestSession::new("aoe_test_owner");
-        let out = Command::new("tmux")
+        let out = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1249,7 +1260,7 @@ mod tests {
         // parallel suite load can't outlive the pane before capturing.
         // Pin `pane-base-index 0` so `^.0` resolves on hosts with
         // `pane-base-index 1` set globally (see #488, #2231).
-        let status = Command::new("tmux")
+        let status = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1315,7 +1326,7 @@ mod tests {
         let guard = TmuxTestSession::new("aoe_test_remain");
         let session_name = guard.name().to_string();
         // Chain set-option -p with new-session to avoid race condition
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1342,7 +1353,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1500));
 
         // Session should still exist (remain-on-exit keeps it)
-        let exists = Command::new("tmux")
+        let exists = crate::tmux::tmux_command()
             .args(["has-session", "-t", &session_name])
             .output()
             .map(|o| o.status.success())
@@ -1350,7 +1361,7 @@ mod tests {
         assert!(exists, "Session should still exist due to remain-on-exit");
 
         // Pane should be dead (process exited)
-        let pane_dead = Command::new("tmux")
+        let pane_dead = crate::tmux::tmux_command()
             .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
             .output()
             .ok()
@@ -1372,7 +1383,7 @@ mod tests {
         let session_name = guard.name().to_string();
 
         // Create a session with a long-running command
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1398,7 +1409,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         // Pane should NOT be dead (sleep is still running)
-        let pane_dead = Command::new("tmux")
+        let pane_dead = crate::tmux::tmux_command()
             .args(["display-message", "-t", &session_name, "-p", "#{pane_dead}"])
             .output()
             .ok()
@@ -1423,7 +1434,7 @@ mod tests {
         let session_name = guard.name().to_string();
 
         // Create session with a long-running command in window 0
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1448,19 +1459,19 @@ mod tests {
 
         // Force base-index 1 and pane-base-index 1 to simulate users who
         // have both set in their tmux.conf.
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["set-option", "-t", &session_name, "base-index", "1"])
             .output()
             .expect("tmux set-option base-index");
         assert!(output.status.success());
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["set-option", "-t", &session_name, "pane-base-index", "1"])
             .output()
             .expect("tmux set-option pane-base-index");
         assert!(output.status.success());
 
         // Create a second window with a command that exits immediately
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "new-window",
                 "-t",
@@ -1496,7 +1507,7 @@ mod tests {
         let session_name = guard.name().to_string();
 
         // Create session running sleep in the first window
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1515,14 +1526,14 @@ mod tests {
         // Force base-index 1 to simulate users who have set base-index 1 in
         // their tmux.conf. With base-index 1, window 0 does not exist, so any
         // target using :0.0 silently fails.
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["set-option", "-t", &session_name, "base-index", "1"])
             .output()
             .expect("tmux set-option base-index");
         assert!(output.status.success());
 
         // Open a second window running a shell, and make it the active window
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["new-window", "-t", &session_name, "sh"])
             .output()
             .expect("tmux new-window");
@@ -1565,7 +1576,7 @@ mod tests {
         let session_name = guard.name().to_string();
 
         // Create session running sleep (not a shell) in the first window
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1584,14 +1595,14 @@ mod tests {
         // Force base-index 1 to simulate users who have set base-index 1 in
         // their tmux.conf. With base-index 1, window 0 does not exist, so any
         // target using :0.0 silently fails.
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["set-option", "-t", &session_name, "base-index", "1"])
             .output()
             .expect("tmux set-option base-index");
         assert!(output.status.success());
 
         // Open a second window running a shell and make it active
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["new-window", "-t", &session_name, "sh"])
             .output()
             .expect("tmux new-window");
@@ -1624,7 +1635,7 @@ mod tests {
         let session_name = guard.name().to_string();
 
         // Create session with a long-running command (the "agent")
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1648,14 +1659,14 @@ mod tests {
         assert!(output.status.success());
 
         // Split the window -- this creates a new pane running a shell
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["split-window", "-t", &session_name])
             .output()
             .expect("tmux split-window");
         assert!(output.status.success());
 
         // The split pane is now active. Select it explicitly to be sure.
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["select-pane", "-t", &format!("{session_name}:.1")])
             .output()
             .expect("tmux select-pane");
@@ -1690,7 +1701,7 @@ mod tests {
         let session_name = guard.name().to_string();
 
         // Create session with pane-base-index 0 pinned (as aoe does)
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1727,7 +1738,7 @@ mod tests {
         // verify our session-level override keeps pane 0 valid.
 
         // Split the window and make the new pane active
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args(["split-window", "-t", &session_name])
             .output()
             .expect("tmux split-window");
@@ -1763,7 +1774,7 @@ mod tests {
 
     #[test]
     fn test_build_create_args_without_size() {
-        let args = build_create_args("test_session", "/tmp/work", None, None);
+        let args = build_create_args("test_session", "/tmp/work", &[], None, None);
         assert_eq!(
             args,
             vec!["new-session", "-d", "-s", "test_session", "-c", "/tmp/work"]
@@ -1773,8 +1784,36 @@ mod tests {
     }
 
     #[test]
+    fn test_build_create_args_empty_env_adds_no_e_flag() {
+        // Byte-for-byte unchanged args when no env is supplied: the agent
+        // session and container terminals must not regress.
+        let args = build_create_args("s", "/tmp/work", &[], Some("claude"), None);
+        assert!(!args.contains(&"-e".to_string()));
+        assert_eq!(args.last().unwrap(), "claude");
+    }
+
+    #[test]
+    fn test_build_create_args_env_emits_e_flags_before_command() {
+        let args = build_create_args(
+            "s",
+            "/tmp/work",
+            &[("HOME", "/Users/me"), ("SHELL", "/bin/zsh")],
+            Some("'/bin/zsh' -l"),
+            None,
+        );
+        // Each pair becomes an adjacent `-e KEY=VAL`.
+        let e_idx = args.iter().position(|a| a == "-e").unwrap();
+        assert_eq!(args[e_idx + 1], "HOME=/Users/me");
+        assert_eq!(args[e_idx + 3], "SHELL=/bin/zsh");
+        // Env flags precede the trailing command.
+        assert!(e_idx < args.iter().position(|a| a == "'/bin/zsh' -l").unwrap());
+        // `-c` still precedes the env flags.
+        assert!(args.iter().position(|a| a == "-c").unwrap() < e_idx);
+    }
+
+    #[test]
     fn test_build_create_args_with_size() {
-        let args = build_create_args("test_session", "/tmp/work", None, Some((120, 40)));
+        let args = build_create_args("test_session", "/tmp/work", &[], None, Some((120, 40)));
         assert!(args.contains(&"-x".to_string()));
         assert!(args.contains(&"120".to_string()));
         assert!(args.contains(&"-y".to_string()));
@@ -1789,13 +1828,19 @@ mod tests {
 
     #[test]
     fn test_build_create_args_with_command() {
-        let args = build_create_args("test_session", "/tmp/work", Some("claude"), None);
+        let args = build_create_args("test_session", "/tmp/work", &[], Some("claude"), None);
         assert_eq!(args.last().unwrap(), "claude");
     }
 
     #[test]
     fn test_build_create_args_with_size_and_command() {
-        let args = build_create_args("test_session", "/tmp/work", Some("claude"), Some((80, 24)));
+        let args = build_create_args(
+            "test_session",
+            "/tmp/work",
+            &[],
+            Some("claude"),
+            Some((80, 24)),
+        );
 
         // Size args should be present
         assert!(args.contains(&"-x".to_string()));
@@ -1818,7 +1863,7 @@ mod tests {
         let guard = TmuxTestSession::new("aoe_test_shell");
         let session_name = guard.name().to_string();
 
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1853,7 +1898,7 @@ mod tests {
         let guard = TmuxTestSession::new("aoe_test_noshell");
         let session_name = guard.name().to_string();
 
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -1897,7 +1942,7 @@ mod tests {
         // pane-base-index 0 to match what aoe does in production;
         // without this, users with `pane-base-index 1` in their
         // tmux.conf cause the `^.0` target to miss.
-        let output = Command::new("tmux")
+        let output = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",

@@ -16,7 +16,6 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -122,7 +121,7 @@ fn sh_quote(s: &str) -> String {
 }
 
 fn pane_size(target: &str) -> Option<(u16, u16)> {
-    let out = Command::new("tmux")
+    let out = crate::tmux::tmux_command()
         .args([
             "display-message",
             "-p",
@@ -147,7 +146,7 @@ fn pane_size(target: &str) -> Option<(u16, u16)> {
 /// off: `(alternate_on, mouse_tracking, mouse_sgr)`. Used once at arm to seed
 /// the grid's modes, which the rendered-content seed can't carry.
 fn pane_modes(target: &str) -> Option<(bool, bool, bool)> {
-    let out = Command::new("tmux")
+    let out = crate::tmux::tmux_command()
         .args([
             "display-message",
             "-p",
@@ -224,7 +223,7 @@ fn seed_parser(
     if !alt {
         seed_args.extend_from_slice(&["-S", &seed_start]);
     }
-    let Ok(out) = Command::new("tmux").args(&seed_args).output() else {
+    let Ok(out) = crate::tmux::tmux_command().args(&seed_args).output() else {
         return;
     };
     // Trim trailing blank rows: capture-pane pads the body out to the full pane
@@ -274,7 +273,7 @@ fn tmux_supports_pipe_pane_io() -> bool {
         if std::env::var_os("AOE_DISABLE_PIPE_PANE_IO").is_some() {
             return false;
         }
-        let Ok(out) = Command::new("tmux").arg("-V").output() else {
+        let Ok(out) = crate::tmux::tmux_command().arg("-V").output() else {
             return false;
         };
         let v = String::from_utf8_lossy(&out.stdout);
@@ -660,7 +659,7 @@ impl VtChannel {
             sh_quote(&exe.to_string_lossy()),
             sh_quote(&sock_path.to_string_lossy())
         );
-        let armed = Command::new("tmux")
+        let armed = crate::tmux::tmux_command()
             .args(["pipe-pane", "-IO", "-t", &target, &pipe_cmd])
             .output()
             .ok();
@@ -684,7 +683,7 @@ impl VtChannel {
             if Instant::now() >= connect_deadline {
                 tracing::warn!(%target, "vt: forwarder did not connect; falling back to capture");
                 stop.store(true, Ordering::Relaxed);
-                let _ = Command::new("tmux")
+                let _ = crate::tmux::tmux_command()
                     .args(["pipe-pane", "-t", &target])
                     .output();
                 let _ = UnixStream::connect(&sock_path);
@@ -830,7 +829,7 @@ impl Drop for VtChannel {
             }
         }
         self.stop.store(true, Ordering::Relaxed);
-        let _ = Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["pipe-pane", "-t", &self.target])
             .output();
         // Unblock a reader still parked in accept().

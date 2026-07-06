@@ -4,11 +4,16 @@ pub mod artifacts;
 pub mod builder;
 pub(crate) mod capture;
 pub mod civilizations;
+// Discovery of on-disk Claude Code sessions. Lives here (not under the
+// serve-gated `acp` module) because terminal/tmux import via the CLI works in
+// every build; only the structured-view import path needs `serve`.
+pub mod claude_import;
 pub mod config;
 pub(crate) mod container_config;
 pub mod curator;
 pub mod deletion;
 pub(crate) mod environment;
+pub mod fork;
 pub mod group_context;
 mod groups;
 pub mod idle_reap;
@@ -46,6 +51,7 @@ pub use config::{
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
+pub use fork::{ForkDenied, ForkSeed};
 pub use groups::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     archived_project_sub_path, flatten_sessions_by_attention, flatten_tree,
@@ -54,6 +60,8 @@ pub use groups::{
     GroupTree, Item, ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, TRASH_SECTION_NAME,
     TRASH_SECTION_PATH,
 };
+#[cfg(feature = "serve")]
+pub(crate) use instance::ResumeAttemptPolicy;
 pub(crate) use instance::{persist_session_to_storage, ResumeIntent, SidWrite};
 pub use instance::{
     EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, SessionBucket,

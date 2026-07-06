@@ -28,7 +28,8 @@ Three equivalent surfaces:
   enable/disable.
 - **Web dashboard**: Settings, then the Plugins tab. The same list and toggles.
   Enabling or disabling a plugin requires an elevated (passphrase) session when
-  login is enabled and is blocked in read-only mode.
+  login is enabled and is blocked in read-only mode; localhost browsers skip
+  the passphrase step, matching the CLI's same-host trust model.
 
 A plugin's enable-state is stored under `[plugins."<id>"]` in `config.toml` and
 survives every config save.
@@ -50,11 +51,11 @@ first-party plugins land as each piece is verified.
 
 ## Installing external plugins
 
-External plugins are community code that you install at your own risk. Install
-and uninstall are CLI-only (`aoe plugin` is reserved for management); the TUI
-and web surfaces show the result but do not install. Updating an already
-installed plugin can be done from the CLI or approved in-app (see Trust and
-capabilities below).
+External plugins are community code that you install at your own risk. Install,
+update, and uninstall from the CLI (`aoe plugin`) or from the web dashboard's
+Plugins settings (Marketplace searches the `aoe-plugin` GitHub topic; each
+mutating action confirms the plugin's capabilities first). See Trust and
+capabilities below.
 
 ```sh
 aoe plugin install gh:owner/repo          # latest release (the audited default)

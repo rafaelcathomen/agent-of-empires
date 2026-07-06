@@ -48,6 +48,9 @@ pub struct InstanceParams {
     /// the deletion path removes the directory. Mutually exclusive with
     /// worktree/workspace and with non-empty `extra_repo_paths`.
     pub scratch: bool,
+    /// One-shot fork seed. When `Some`, the freshly-built instance is set up
+    /// to fork its parent on first launch instead of starting fresh.
+    pub fork_seed: Option<crate::session::ForkSeed>,
 }
 
 /// Result of building an instance, tracking what was created for cleanup purposes.
@@ -532,11 +535,16 @@ pub fn build_instance(
             // Single worktree mode (existing logic)
             let path = PathBuf::from(&params.path);
             if !GitWorktree::is_git_repo(&path) {
-                bail!(
+                // Typed error (not a bare `bail!` string) so the web handler's
+                // whitelist forwards an actionable message instead of the
+                // opaque "Failed to create session". The context keeps the
+                // fuller tip for callers that surface the anyhow chain (CLI,
+                // TUI).
+                return Err(anyhow::Error::new(GitError::NotAGitRepo).context(format!(
                     "Worktree mode requires a git repository, but this path is not one: {}\n\
                      Tip: start an in-place session (no worktree) here, or point at a git repository.",
                     path.display()
-                );
+                )));
             }
             let main_repo_path_raw = GitWorktree::find_main_repo(&path)?;
             let main_repo_path = main_repo_path_raw
@@ -719,6 +727,41 @@ pub fn build_instance(
         });
     }
 
+    if let Some(seed) = params.fork_seed {
+        match seed {
+            crate::session::ForkSeed::Terminal {
+                parent_agent_session_id,
+                child_session_id,
+            } => {
+                // Pre-pin the child id so it is durable on disk before launch,
+                // and carry the parent on the one-shot Fork intent.
+                instance.agent_session_id = Some(child_session_id);
+                instance.resume_intent = crate::session::ResumeIntent::Fork {
+                    from: parent_agent_session_id,
+                };
+            }
+            crate::session::ForkSeed::Structured {
+                parent_acp_session_id,
+            } => {
+                // Structured fork: force the structured view, seed the parent
+                // for the ACP session/fork handshake, and replay history into
+                // the (empty) event store on first connect. The marker fields
+                // live behind the serve feature, so without it a structured
+                // fork is inapplicable and this arm is a no-op. Bind the field
+                // to `_` on bare-core so the destructure reads it without an
+                // `allow(unused_variables)` suppression (AGENTS.md).
+                #[cfg(feature = "serve")]
+                {
+                    instance.view = crate::session::View::Structured;
+                    instance.fork_pending = Some(parent_acp_session_id);
+                    instance.import_pending = Some(true);
+                }
+                #[cfg(not(feature = "serve"))]
+                let _ = parent_acp_session_id;
+            }
+        }
+    }
+
     Ok(BuildResult {
         instance,
         created_worktree,
@@ -780,14 +823,13 @@ pub fn cleanup_instance(
 
     if let Some(sandbox) = &instance.sandbox_info {
         if sandbox.enabled {
+            // Direct idempotent teardown, never gated on a separate existence
+            // probe: a transient `inspect` failure must not skip removal and
+            // orphan a live container. Volumes are swept inside `teardown`.
             let container = containers::DockerContainer::from_session_id(&instance.id);
-            if container.exists().unwrap_or(false) {
-                if let Err(e) = container.remove(true) {
-                    tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
-                }
+            if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
+                tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
             }
-            // Remove named ignore volumes even if the container is already gone.
-            container.remove_named_ignore_volumes(&instance.id);
         }
     }
 
@@ -1634,6 +1676,7 @@ mod tests {
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
             scratch: false,
+            fork_seed: None,
         }
     }
 
@@ -1797,6 +1840,92 @@ mod tests {
     }
 
     #[test]
+    fn build_instance_applies_terminal_fork_seed() {
+        use crate::session::ForkSeed;
+        let params = InstanceParams {
+            title: "Forked".into(),
+            path: "/tmp".into(),
+            group: String::new(),
+            tool: "claude".into(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            sandbox: false,
+            sandbox_image: String::new(),
+            yolo_mode: false,
+            extra_env: vec![],
+            extra_args: String::new(),
+            command_override: String::new(),
+            extra_repo_paths: vec![],
+            scratch: false,
+            fork_seed: Some(ForkSeed::Terminal {
+                parent_agent_session_id: "parent-uuid".into(),
+                child_session_id: "child-uuid".into(),
+            }),
+        };
+        let inst = build_instance(params, &[], &[], "default")
+            .unwrap()
+            .instance;
+        // The pre-pinned child id lives in agent_session_id; the parent rides on
+        // the one-shot Fork intent.
+        assert_eq!(inst.agent_session_id.as_deref(), Some("child-uuid"));
+        assert!(
+            matches!(
+                inst.resume_intent,
+                crate::session::instance::ResumeIntent::Fork { ref from } if from == "parent-uuid"
+            ),
+            "fork intent must carry the parent id in `from`, got {:?}",
+            inst.resume_intent
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn build_instance_applies_structured_fork_seed() {
+        use crate::session::ForkSeed;
+        let params = InstanceParams {
+            title: "Forked".into(),
+            path: "/tmp".into(),
+            group: String::new(),
+            tool: "claude".into(),
+            worktree_enabled: false,
+            worktree_branch: None,
+            create_new_branch: false,
+            base_branch: None,
+            sandbox: false,
+            sandbox_image: String::new(),
+            yolo_mode: false,
+            extra_env: vec![],
+            extra_args: String::new(),
+            command_override: String::new(),
+            extra_repo_paths: vec![],
+            scratch: false,
+            fork_seed: Some(ForkSeed::Structured {
+                parent_acp_session_id: "parent-acp-id".into(),
+            }),
+        };
+        let inst = build_instance(params, &[], &[], "default")
+            .unwrap()
+            .instance;
+        // The structured arm forces the structured view and sets the two paired
+        // one-shot markers: fork_pending carries the parent for session/fork,
+        // and import_pending replays history into the fresh event store. A
+        // regression on any of the three should fail here, not only in the
+        // aggregate structured e2e.
+        assert_eq!(inst.view, crate::session::View::Structured);
+        assert_eq!(inst.fork_pending.as_deref(), Some("parent-acp-id"));
+        assert_eq!(inst.import_pending, Some(true));
+        // Structured fork does not pre-pin an agent id (the adapter mints the
+        // child id at handshake) and leaves the terminal Fork intent unset.
+        assert!(inst.agent_session_id.is_none());
+        assert!(!matches!(
+            inst.resume_intent,
+            crate::session::instance::ResumeIntent::Fork { .. }
+        ));
+    }
+
+    #[test]
     #[serial_test::serial]
     fn build_instance_rejects_scratch_with_worktree() {
         let temp_home = tempfile::tempdir().unwrap();
@@ -1819,6 +1948,38 @@ mod tests {
             err.to_string()
                 .contains("Cannot combine --scratch with worktree mode"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_worktree_on_non_git_path_returns_typed_not_a_git_repo() {
+        // A worktree requested on a plain (non-git) folder must fail with the
+        // typed GitError::NotAGitRepo, not a bare `bail!` string. The web
+        // handler only forwards an actionable message for whitelisted typed
+        // GitError variants, so a string bail would surface the opaque
+        // "Failed to create session" instead.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), "").unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        let mut params = custom_agent_params(project.path(), "claude");
+        params.tool = "claude".to_string();
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feat".to_string());
+
+        let err = match build_instance(params, &[], &[], "default") {
+            Ok(_) => panic!("worktree on a non-git path must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.chain()
+                .filter_map(|c| c.downcast_ref::<crate::git::error::GitError>())
+                .any(|g| matches!(g, crate::git::error::GitError::NotAGitRepo)),
+            "expected a typed GitError::NotAGitRepo in the chain, got: {err:#}"
         );
     }
 }

@@ -59,7 +59,7 @@ fn mime_allowed(kind: PromptAttachmentKind, mime: &str) -> bool {
 /// True if `bytes` start with a magic-number signature for a supported
 /// raster image. Guards against a client mislabeling arbitrary bytes as
 /// `image/png` to smuggle them past the allowlist.
-fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
         Some("image/png")
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -313,6 +313,9 @@ pub async fn spawn_acp(
     // supervisor clears any partial replay from a prior attempt after it
     // reserves the worker slot, so we only pass the flag here.
     let seed_history_replay = instance.import_pending == Some(true);
+    // Structured fork: when set, the handshake sends session/fork against this
+    // parent id instead of session/new. Cleared once the forked id lands.
+    let fork_from = instance.fork_pending.clone();
 
     let inst_lock = state.instance_lock(&id).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
@@ -370,6 +373,7 @@ pub async fn spawn_acp(
             model,
             effort: None,
             stored_acp_session_id,
+            fork_from,
             sandbox_info,
             source_profile,
             yolo_mode,
@@ -696,6 +700,18 @@ pub async fn list_acp_agents(State(state): State<Arc<AppState>>) -> impl IntoRes
     Json(entries).into_response()
 }
 
+/// `GET /api/acp/option-catalog`: the recall cache of `config_options` each
+/// agent last advertised (model / mode / thinking choices), keyed by agent
+/// name. The per-agent defaults settings page reads this so its dropdowns can
+/// be populated without a live session. Empty until an agent has run at least
+/// once. See #2631.
+pub async fn get_option_catalog() -> impl IntoResponse {
+    let catalog = tokio::task::spawn_blocking(crate::acp::option_catalog::load)
+        .await
+        .unwrap_or_default();
+    Json(catalog).into_response()
+}
+
 /// Atomically move a structured view session from one ACP backend to another.
 /// Two callers drive this: the rate-limit recovery flow (#1282), which
 /// hands a Claude-rate-limited session off to `codex` (or another
@@ -818,6 +834,8 @@ pub async fn switch_acp_agent(
             // Different ACP backend; the cached Claude session id would
             // be rejected by codex / opencode.
             stored_acp_session_id: None,
+            // Switching ACP backend starts a fresh session, never a fork.
+            fork_from: None,
             sandbox_info,
             source_profile,
             yolo_mode: instance.yolo_mode,
@@ -1141,14 +1159,11 @@ pub async fn acp_prompt(
         .acp_supervisor
         .publish_user_prompt_with_attachments(&id, req.text.clone(), &attachments)
         .await;
-    // Best-effort: auto-rename a still-default-named session from this first
-    // message via AoE's one-shot mode. Detached so it never blocks or fails the
-    // prompt; all gating lives inside. See session::smart_rename.
-    tokio::spawn(crate::session::smart_rename::try_smart_rename(
-        state.clone(),
-        id.clone(),
-        req.text.clone(),
-    ));
+    // Smart-rename now fires from `acp_event_listener` on the first clean
+    // `prompt_complete` `Event::Stopped` for this session, so the one-shot
+    // never races this handler's live worker for the same provider API.
+    // The event-store lookup of the first prompt happens in the listener.
+    // See `session::smart_rename` and #2348.
     let forward_text = match injection {
         Some(section) => format!("{section}{}", req.text),
         None => req.text.clone(),
@@ -1786,6 +1801,8 @@ pub async fn acp_enable(
     // #2276: seed the transcript from the session/load replay when enabling
     // the structured view on an imported session (import_pending, empty store).
     let seed_history_replay = instance.import_pending == Some(true);
+    // Structured fork: send session/fork against the parent id on first connect.
+    let fork_from = instance.fork_pending.clone();
     let profile_for_spawn = profile.clone();
     let command_override = crate::server::acp_reconciler::command_override_for_spawn(
         &instance.tool,
@@ -1824,6 +1841,7 @@ pub async fn acp_enable(
                 model,
                 effort: None,
                 stored_acp_session_id,
+                fork_from,
                 sandbox_info,
                 source_profile,
                 yolo_mode,
@@ -2309,7 +2327,7 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    let mut sessions = tokio::task::spawn_blocking(crate::acp::claude_import::scan_sessions)
+    let mut sessions = tokio::task::spawn_blocking(crate::session::claude_import::scan_sessions)
         .await
         .unwrap_or_default();
     // Drop sessions AoE owns: importing one is a no-op and they are noise in
@@ -2355,7 +2373,7 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     });
     // Cap AFTER ownership filtering so a burst of AoE-managed sessions can't
     // push real imports off the (newest-first) list. See #2276.
-    sessions.truncate(crate::acp::claude_import::MAX_SESSIONS);
+    sessions.truncate(crate::session::claude_import::MAX_SESSIONS);
     Json(sessions).into_response()
 }
 

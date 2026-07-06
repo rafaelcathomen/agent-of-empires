@@ -2,8 +2,8 @@
 //!
 //! After a system reboot, tmux loses all its sessions. AoE sessions whose
 //! agent supports `--resume <sid>` (claude, opencode, codex, gemini, vibe,
-//! pi, hermes, kiro, qwen) can be transparently recreated by replaying the
-//! resume cascade in `start_with_resume_fallback`. This module centralises
+//! pi, hermes, kiro, qwen, copilot) can be transparently recreated by replaying
+//! the resume cascade in `start_with_resume_fallback`. This module centralises
 //! the candidate selection and the cross-process exclusion needed to make
 //! that safe when both the TUI (`aoe`) and the daemon (`aoe serve`) are
 //! running.
@@ -143,9 +143,7 @@ pub fn is_recovery_candidate(inst: &Instance) -> bool {
 /// Best-effort: `tmux start-server` is idempotent; if tmux is unavailable the
 /// caller will fail downstream with a more specific error.
 pub fn warm_tmux_server() {
-    let _ = std::process::Command::new("tmux")
-        .arg("start-server")
-        .status();
+    let _ = crate::tmux::tmux_command().arg("start-server").status();
 }
 
 /// Maximum number of recovery workers running concurrently. Sized to cover

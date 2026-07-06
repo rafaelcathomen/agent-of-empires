@@ -2290,8 +2290,11 @@ impl HomeView {
         // Disk subscriptions stay scoped to the loaded storages: in
         // single-profile mode (`aoe --profile X`) the user opted into
         // exactly that profile's instance state, so we don't watch
-        // sessions.json/groups.json for unrelated profiles.
-        let initial_disk_profiles: Vec<String> = view.storages.keys().cloned().collect();
+        // sessions.json/groups.json for unrelated profiles. Sorted so
+        // the install-loop's last-write-wins target stays stable across
+        // HashMap rehash between rewire ticks (see #2584).
+        let mut initial_disk_profiles: Vec<String> = view.storages.keys().cloned().collect();
+        initial_disk_profiles.sort();
         view.rewire_disk_subscriptions(&initial_disk_profiles);
         // Config subscriptions are intentionally asymmetric: even in
         // single-profile mode, peer edits to ANY profile's config.toml
@@ -2344,7 +2347,9 @@ impl HomeView {
                     error = %error,
                     "list_profiles failed during reload_storage_only; reusing loaded storages for watcher rewires"
                 );
-                self.storages.keys().cloned().collect()
+                let mut keys: Vec<String> = self.storages.keys().cloned().collect();
+                keys.sort();
+                keys
             }
         };
 
@@ -2359,7 +2364,8 @@ impl HomeView {
         // so the unconditional call is a no-op on a stable profile set.
         self.rewire_config_subscriptions(&current_profiles);
         if self.active_profile.is_some() {
-            let active_only: Vec<String> = self.storages.keys().cloned().collect();
+            let mut active_only: Vec<String> = self.storages.keys().cloned().collect();
+            active_only.sort();
             self.rewire_disk_subscriptions(&active_only);
         } else {
             self.rewire_disk_subscriptions(&current_profiles);
@@ -2510,7 +2516,9 @@ impl HomeView {
         match crate::session::list_profiles() {
             Ok(profiles) => {
                 let disk_targets: Vec<String> = if self.active_profile.is_some() {
-                    self.storages.keys().cloned().collect()
+                    let mut keys: Vec<String> = self.storages.keys().cloned().collect();
+                    keys.sort();
+                    keys
                 } else {
                     profiles.clone()
                 };
@@ -3014,6 +3022,18 @@ impl HomeView {
                             );
                         }
                         Ok(crate::session::StartOutcome::Fresh) => {}
+                        Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
+                            // Defensive: `is_recovery_candidate` already excludes
+                            // sids equal to `resume_probe_failed_sid`, so this
+                            // should not normally fire here. See #2609.
+                            tracing::info!(
+                                target: "session.startup_recovery",
+                                id = %instance_id,
+                                %title,
+                                %sid,
+                                "started fresh; sid previously failed a resume probe",
+                            );
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 target: "session.startup_recovery",
@@ -3144,6 +3164,22 @@ impl HomeView {
                                 "Restart Failed",
                                 &format!(
                                     "Resume failed for sid {sid}; preserved for explicit retry"
+                                ),
+                            ));
+                        }
+                        Ok(crate::session::StartOutcome::FreshAfterFailedResume { sid }) => {
+                            tracing::info!(
+                                target: "session.restart",
+                                id = %session_id,
+                                %sid,
+                                "started fresh; sid previously failed a resume probe",
+                            );
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Restarted",
+                                &format!(
+                                    "Started fresh; a prior resume attempt failed for sid {sid}. \
+                                     The old conversation is still reachable via the agent's \
+                                     own resume/history picker."
                                 ),
                             ));
                         }
@@ -4436,7 +4472,9 @@ impl HomeView {
                     error = %e,
                     "list_profiles failed during switch_profile; reusing loaded storages for config rewire"
                 );
-                self.storages.keys().cloned().collect()
+                let mut keys: Vec<String> = self.storages.keys().cloned().collect();
+                keys.sort();
+                keys
             }
         };
         self.rewire_config_subscriptions(&config_targets);
@@ -4958,7 +4996,7 @@ impl HomeView {
         if pane.width == 0 || pane.height == 0 {
             return;
         }
-        let resize_status = std::process::Command::new("tmux")
+        let resize_status = crate::tmux::tmux_command()
             .args([
                 "resize-window",
                 "-t",

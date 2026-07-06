@@ -19,16 +19,16 @@ use super::poller::SessionPoller;
 
 use crate::session::capture::{
     capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
-    capture_gemini_session_id, capture_hermes_session_id, capture_pi_session_id,
-    capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
-    codex_poll_fn_sandboxed, gemini_poll_fn, gemini_poll_fn_sandboxed, generate_claude_session_id,
-    hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id, opencode_poll_fn,
-    opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed,
-    try_capture_codex_session_id_in_container, try_capture_gemini_session_id_in_container,
-    try_capture_hermes_session_id_in_container, try_capture_opencode_session_id,
-    try_capture_opencode_session_id_in_container, try_capture_pi_session_id_in_container,
-    try_capture_vibe_session_id_in_container, validated_session_id, vibe_poll_fn,
-    vibe_poll_fn_sandboxed,
+    capture_copilot_session_id, capture_gemini_session_id, capture_hermes_session_id,
+    capture_pi_session_id, capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed,
+    codex_poll_fn, codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn,
+    gemini_poll_fn_sandboxed, generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed,
+    is_valid_session_id, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
+    pi_poll_fn_sandboxed, try_capture_codex_session_id_in_container,
+    try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
+    try_capture_opencode_session_id, try_capture_opencode_session_id_in_container,
+    try_capture_pi_session_id_in_container, try_capture_vibe_session_id_in_container,
+    validated_session_id, vibe_poll_fn, vibe_poll_fn_sandboxed,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +112,30 @@ pub enum StartOutcome {
     /// actually occurred this call depends on the caller having killed
     /// any pre-existing pane first.
     Fresh,
+    /// A resume was skipped, and the session started fresh instead, because
+    /// `sid` already failed a resume probe once before. Retrying the
+    /// identical sid would only reproduce the original `ResumeFailed`
+    /// forever, so this launch routes through `ResumeIntent::Cleared`
+    /// instead (same as a manual `aoe session set-session-id ""`): a fresh
+    /// sid is assigned and `sid` is not carried forward. Distinct from
+    /// `Fresh` so callers can tell the user their conversation did not
+    /// resume, instead of silently starting a blank session; the prior
+    /// conversation is still reachable through the agent's own resume/
+    /// history picker. See #2609.
+    FreshAfterFailedResume { sid: String },
+}
+
+/// Governs whether `start_with_resume_fallback` may pass `--resume <sid>` at
+/// all, independent of the per-sid loop-breaker (`resume_probe_failed_sid`),
+/// which always applies regardless of policy. `HonorAutoResumeSetting` is
+/// used by explicit user restart/reattach (`e`, `Enter`); `Allow` is used by
+/// Send Message and Live Send, which must keep trying to preserve agent
+/// context even when the user has disabled auto-resume for manual restarts.
+/// See #2609.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeAttemptPolicy {
+    HonorAutoResumeSetting,
+    Allow,
 }
 
 /// What `start_with_size_opts` did with the agent's session id this call.
@@ -352,6 +376,12 @@ pub(crate) enum ResumeIntent {
     /// after the launch completes (one-shot semantics).
     #[serde(rename = "Cleared")]
     Cleared,
+    /// One-shot fork seed: on the next (first) launch, resume `from` and fork
+    /// into a NEW session whose id was pre-pinned in `agent_session_id`.
+    /// Auto-promotes to `Default` after that launch, exactly like `Cleared`,
+    /// so later restarts resume the child's own id with a plain `--resume`.
+    #[serde(rename = "Fork")]
+    Fork { from: String },
 }
 
 impl ResumeIntent {
@@ -611,6 +641,17 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "ResumeIntent::is_default")]
     pub(crate) resume_intent: ResumeIntent,
 
+    /// Runtime-only, one-shot: set by `start_with_resume_fallback` right
+    /// before calling `start_with_size_opts` to force this single launch
+    /// through the `ResumeIntent::Cleared` path (no `--resume` flag, fresh
+    /// sid) without persisting a real `Cleared` write ahead of time. Not
+    /// serialized; `reconcile_from_disk` explicitly carries it across the
+    /// `*self = disk` reload since it otherwise has no disk representation.
+    /// Consumed (reset to `false`) at the top of `start_with_size_opts`. See
+    /// #2609.
+    #[serde(skip)]
+    pub(crate) force_fresh_next_launch: bool,
+
     /// Runtime-only: which profile this instance was loaded from. Not persisted to disk.
     #[serde(default, skip_serializing)]
     pub source_profile: String,
@@ -689,6 +730,14 @@ pub struct Instance {
     /// on a fragile title suffix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automation_id: Option<String>,
+
+    /// One-shot structured-fork seed: the parent ACP session id to fork from
+    /// on first connect. Set at creation, consumed when the adapter assigns
+    /// the forked child id (see `apply_acp_session_change`). `None` for
+    /// non-fork sessions. Skipped in serialization when absent.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_pending: Option<String>,
 
     // Runtime state (not serialized)
     #[serde(skip)]
@@ -780,6 +829,61 @@ fn build_resume_flags(tool: &str, session_id: &str, is_existing_session: bool) -
     }
 }
 
+/// Build the launch flags for a one-shot terminal fork. Returns the empty
+/// string for an unforkable agent or an invalid id (mirroring
+/// `build_resume_flags`'s fail-closed contract). The child id is pre-pinned so
+/// the forked session is durable on disk before launch.
+fn build_fork_flags(tool: &str, parent_id: &str, child_id: &str) -> String {
+    use crate::agents::{get_agent, ForkStrategy, ResumeStrategy};
+
+    if !is_valid_session_id(parent_id) || !is_valid_session_id(child_id) {
+        tracing::warn!(target: "session.store",
+            "Refusing to build fork flags: invalid id (parent={parent_id:?} child={child_id:?})");
+        return String::new();
+    }
+    let Some(agent) = get_agent(tool) else {
+        return String::new();
+    };
+    match agent.fork_strategy {
+        ForkStrategy::ClaudeFork => {
+            format!("--resume {parent_id} --fork-session --session-id {child_id}")
+        }
+        ForkStrategy::CodexFork => {
+            // Codex mints its own forked id; child_id is unused. The subcommand
+            // is inserted after the binary by apply_session_flags.
+            format!("fork {parent_id}")
+        }
+        ForkStrategy::Flag(fork_flag) => {
+            // Resume the parent session (using the agent's own resume flag),
+            // then add the fork flag; the agent mints the new id.
+            match agent.resume_strategy {
+                ResumeStrategy::Flag(resume_flag) => {
+                    format!("{resume_flag} {parent_id} {fork_flag}")
+                }
+                _ => String::new(),
+            }
+        }
+        ForkStrategy::Unsupported => String::new(),
+    }
+}
+
+/// Splice `part` into `cmd`: insert it right after the binary (before other
+/// flags) when it is a subcommand, else append it. Shared by the resume and
+/// fork launch-flag builders.
+fn splice_subcommand_or_append(cmd: &mut String, part: &str, is_subcommand: bool) {
+    if is_subcommand {
+        if let Some(space_pos) = cmd.find(' ') {
+            let binary = &cmd[..space_pos];
+            let flags = &cmd[space_pos..];
+            *cmd = format!("{} {}{}", binary, part, flags);
+        } else {
+            *cmd = format!("{} {}", cmd, part);
+        }
+    } else {
+        *cmd = format!("{} {}", cmd, part);
+    }
+}
+
 fn append_resume_flags(
     tool: &str,
     session_id: Option<&str>,
@@ -798,17 +902,7 @@ fn append_resume_flags(
             get_agent(tool).map(|a| &a.resume_strategy),
             Some(ResumeStrategy::Subcommand(_))
         );
-        if is_subcommand {
-            if let Some(space_pos) = cmd.find(' ') {
-                let binary = &cmd[..space_pos];
-                let flags = &cmd[space_pos..];
-                *cmd = format!("{} {}{}", binary, resume_part, flags);
-            } else {
-                *cmd = format!("{} {}", cmd, resume_part);
-            }
-        } else {
-            *cmd = format!("{} {}", cmd, resume_part);
-        }
+        splice_subcommand_or_append(cmd, &resume_part, is_subcommand);
         tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, resume_part);
         return true;
     }
@@ -916,7 +1010,7 @@ fn override_if_distinct(stored: Option<&str>, fresh: String) -> Option<String> {
 
 fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
     let suffix = format!("_{}", truncate_id(instance_id, 8));
-    let output = std::process::Command::new("tmux")
+    let output = crate::tmux::tmux_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output()
         .ok()?;
@@ -1005,6 +1099,7 @@ impl Instance {
             agent_session_id: None,
             resume_probe_failed_sid: None,
             resume_intent: ResumeIntent::Default,
+            force_fresh_next_launch: false,
             source_profile: String::new(),
             notify_on_waiting: None,
             notify_on_idle: None,
@@ -1022,6 +1117,8 @@ impl Instance {
             import_pending: None,
             initial_prompt: String::new(),
             automation_id: None,
+            #[cfg(feature = "serve")]
+            fork_pending: None,
             last_error_check: None,
             last_start_time: None,
             last_error: None,
@@ -1213,6 +1310,7 @@ impl Instance {
         disk.session_id_poller = self.session_id_poller.take();
         disk.retroactive_capture_excludes = std::mem::take(&mut self.retroactive_capture_excludes);
         disk.pane_dead_observed = self.pane_dead_observed;
+        disk.force_fresh_next_launch = self.force_fresh_next_launch;
         disk.source_profile = std::mem::take(&mut self.source_profile);
         // `before_start_env` is `#[serde(skip)]`, so the disk snapshot always
         // has it empty. Carry the live value forward; otherwise this reload
@@ -1702,6 +1800,16 @@ impl Instance {
                 }
                 return (session_id, false);
             }
+            ResumeIntent::Fork { .. } => {
+                // The child id was pre-generated and stored in
+                // agent_session_id at creation. acquire returns it as the
+                // session this instance owns; the actual fork flags
+                // (--resume <parent> --fork-session --session-id <child>) are
+                // emitted by apply_session_flags, which reads the parent off
+                // the Fork intent. Report `false` (not an in-place resume): a
+                // fork starts a new session.
+                return (self.agent_session_id.clone(), false);
+            }
             ResumeIntent::Default => {}
         }
 
@@ -1870,6 +1978,18 @@ impl Instance {
                     capture_hermes_session_id(&self.project_path, &exclusion).ok()
                 }
             }
+            "copilot" => {
+                // Copilot stores sessions in a SQLite db. Host capture reads it
+                // directly; sandbox resume is a follow-up (the container's db is
+                // not read over `docker exec`), so a sandboxed Copilot session
+                // simply starts fresh on restart.
+                if self.is_sandboxed() {
+                    None
+                } else {
+                    let exclusion = self.retroactive_capture_exclusion_set();
+                    capture_copilot_session_id(&self.project_path, &exclusion).ok()
+                }
+            }
             _ => None,
         };
         result.and_then(validated_session_id)
@@ -1919,7 +2039,32 @@ impl Instance {
     }
 
     fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
-        let (session_id, is_existing) = self.acquire_session_id();
+        if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
+            let child = self.agent_session_id.clone();
+            if let Some(child_id) = child.as_deref() {
+                let fork_part = build_fork_flags(&self.tool, &from, child_id);
+                if !fork_part.is_empty() {
+                    // Codex's fork is a subcommand and must sit right after the
+                    // binary (before other flags), like its resume subcommand.
+                    // Flag-shaped forks (claude, opencode) append.
+                    let is_subcommand = matches!(
+                        crate::agents::get_agent(&self.tool).map(|a| &a.fork_strategy),
+                        Some(crate::agents::ForkStrategy::CodexFork)
+                    );
+                    splice_subcommand_or_append(cmd, &fork_part, is_subcommand);
+                }
+            }
+            // A fork is a fresh session, not an in-place resume.
+            return false;
+        }
+        let (mut session_id, is_existing) = self.acquire_session_id();
+        // Sandboxed Copilot starts fresh: the session db lives inside the
+        // container, so a host-captured or manually pinned sid would launch
+        // `--session-id <id>` against a UUID that does not resolve there.
+        // Capture is already host-only above; drop the sid to gate emission too.
+        if self.tool == "copilot" && self.is_sandboxed() {
+            session_id = None;
+        }
         let emitted =
             append_resume_flags(&self.tool, session_id.as_deref(), is_existing, cmd, context);
         is_existing && emitted
@@ -2259,6 +2404,17 @@ impl Instance {
         // CAS baseline). Covers resume-probe launches and explicit fresh
         // launches since both call this function.
         self.reconcile_from_disk();
+
+        // Consume the one-shot override, if `start_with_resume_fallback` set
+        // it, now that `reconcile_from_disk`'s `*self = disk` reload can no
+        // longer clobber it. Forces this launch through the same
+        // `ResumeIntent::Cleared` path a manual `aoe session set-session-id
+        // ""` would take: no `--resume` flag, fresh sid, one-shot
+        // auto-promote back to `Default` on disk after this launch persists.
+        // See #2609.
+        if std::mem::take(&mut self.force_fresh_next_launch) {
+            self.resume_intent = ResumeIntent::Cleared;
+        }
 
         self.reconcile_sidecar_into_disk();
 
@@ -2820,9 +2976,14 @@ impl Instance {
         expected_prior_intent: ResumeIntent,
     ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
-        // The one-shot `Cleared` intent auto-promotes to `Default` after a
-        // successful launch so a restart never re-clears.
-        let promote_cleared = matches!(expected_prior_intent, ResumeIntent::Cleared);
+        // Both Cleared and Fork are one-shot: after the launch they ran with
+        // completes, the session resumes its own id normally, so the intent
+        // must auto-promote to Default. A fork left as Fork on disk would
+        // re-fork the parent on the next restart (double-fork).
+        let promote_one_shot = matches!(
+            expected_prior_intent,
+            ResumeIntent::Cleared | ResumeIntent::Fork { .. }
+        );
 
         if let Some(ref sid) = new_sid {
             if !is_valid_session_id(sid) {
@@ -2868,7 +3029,7 @@ impl Instance {
             inst.agent_session_id = new_sid_for_closure.clone();
             inst.resume_probe_failed_sid = None;
 
-            if promote_cleared {
+            if promote_one_shot {
                 if inst.resume_intent == expected_prior_intent_for_closure {
                     inst.resume_intent = ResumeIntent::Default;
                 } else {
@@ -2887,7 +3048,7 @@ impl Instance {
         match outcome {
             Ok(SidWrite::Applied) => {
                 self.resume_probe_failed_sid = None;
-                if promote_cleared {
+                if promote_one_shot {
                     if let Ok(insts) = storage.load() {
                         if let Some(disk) = insts.into_iter().find(|i| i.id == self.id) {
                             self.resume_intent = disk.resume_intent;
@@ -3020,6 +3181,11 @@ impl Instance {
             .clone();
         let container = DockerContainer::new(&self.id, &image);
 
+        // Direct is_running()? / exists()? here rather than probe_running():
+        // this function already returns Result, so `?` correctly propagates
+        // a daemon-down transient to the caller as Err, letting them render
+        // an actionable error rather than silently falling through to a
+        // create attempt that would also fail. See #2596.
         if container.is_running()? {
             // Already up: not a come-up, so don't re-mint. Fill lazily only if a
             // fresh process attached to a running container with no values yet.
@@ -3375,6 +3541,20 @@ impl Instance {
                     ))
                 }
             }
+            "copilot" => {
+                // Host-only: the Copilot session-store SQLite db is read
+                // directly on the host. Sandboxed sessions have no poller, so
+                // their session id is never captured and they start fresh on
+                // restart (sandbox resume is a follow-up).
+                if self.is_sandboxed() {
+                    return;
+                }
+                Box::new(copilot_poll_fn(
+                    self.project_path.clone(),
+                    self.id.clone(),
+                    extra_excludes,
+                ))
+            }
             _ => return,
         };
 
@@ -3450,16 +3630,36 @@ impl Instance {
     }
 
     /// Restart the session, optionally skipping on_launch hooks (e.g. when
-    /// they already ran in the background creation poller).
+    /// they already ran in the background creation poller). Honors
+    /// `SessionConfig::auto_resume_on_restart`; this is the explicit
+    /// user-initiated restart/reattach path (`e`, `Enter`, CLI `session
+    /// restart`, startup recovery). See #2609.
     pub fn restart_with_size_opts(
         &mut self,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
     ) -> Result<StartOutcome> {
+        self.restart_with_resume_policy(
+            size,
+            skip_on_launch,
+            ResumeAttemptPolicy::HonorAutoResumeSetting,
+        )
+    }
+
+    /// Shared restart cascade behind `restart_with_size_opts`. Broken out so
+    /// `ensure_pane_ready_with_size`'s dead-pane respawn (Send Message / Live
+    /// Send) can pass `ResumeAttemptPolicy::Allow`, keeping those surfaces
+    /// unaffected by `auto_resume_on_restart`. See #2609.
+    fn restart_with_resume_policy(
+        &mut self,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        resume_policy: ResumeAttemptPolicy,
+    ) -> Result<StartOutcome> {
         self.stop_poller();
         self.session_id_poller = None;
         self.kill_clean()?;
-        self.start_with_resume_fallback(size, skip_on_launch)
+        self.start_with_resume_fallback(size, skip_on_launch, resume_policy)
     }
 
     /// Settle-based pane probe used by the resume-fallback cascade.
@@ -3526,6 +3726,14 @@ impl Instance {
     ///      `StartOutcome::ResumeFailed`. A dead pane is not proof that the
     ///      sid is invalid, so this path must not clear it or launch fresh.
     ///
+    /// `resume_policy` gates step 1: `HonorAutoResumeSetting` additionally
+    /// requires `SessionConfig::auto_resume_on_restart`; `Allow` always
+    /// permits an attempt (subject to `should_attempt_resume`). Independent
+    /// of policy, a sid that already equals `resume_probe_failed_sid` from a
+    /// prior call never re-attempts resume: it returns
+    /// `StartOutcome::FreshAfterFailedResume` instead of repeating the same
+    /// doomed probe. See #2609.
+    ///
     /// Latency: only fires the probe when `--resume <sid>` is being passed
     /// to a freshly-created tmux session. Healthy resumes on real agents
     /// pay `RESUME_PROBE_POST_SHELL_GRACE` (~2s) once on cold start;
@@ -3543,6 +3751,7 @@ impl Instance {
         &mut self,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
+        resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
         // Clear `Status::Error` on entry so a successful relaunch from any
         // restart surface (REST `ensure_session`, TUI Enter/restart, CLI
@@ -3586,19 +3795,52 @@ impl Instance {
         // attempted, the race is just kill_clean cache staleness).
         let pane_was_preexisting = self.tmux_session().is_ok_and(|s| s.exists());
 
+        // Decide BEFORE launching whether this call may pass `--resume`, since
+        // that flag is baked into the command by `acquire_session_id` inside
+        // `start_with_size_opts`, not by anything read afterward. Only
+        // intervenes on the ambient auto-resume path (`ResumeIntent::Default`):
+        // an explicit one-shot `Use`/`Fork`/`Cleared` intent (e.g. just set via
+        // `aoe session set-session-id`) is a deliberate user action and must
+        // not be silently overridden by the restart-time policy or
+        // loop-breaker. When it fires, `force_fresh_next_launch` routes the
+        // launch through the same `ResumeIntent::Cleared` path a manual
+        // `set-session-id ""` would take. See #2609.
+        let mut skipped_failed_resume_sid: Option<String> = None;
+        if self.resume_intent == ResumeIntent::Default {
+            if let Some(sid) = self.agent_session_id.clone() {
+                let resume_allowed_by_policy = match resume_policy {
+                    ResumeAttemptPolicy::Allow => true,
+                    ResumeAttemptPolicy::HonorAutoResumeSetting => {
+                        super::profile_config::resolve_config_or_warn(&self.effective_profile())
+                            .session
+                            .auto_resume_on_restart
+                    }
+                };
+                let resume_capable = should_attempt_resume(Some(&sid), &self.tool);
+                let probe_already_failed = self.resume_probe_failed_sid.as_deref() == Some(&sid);
+                if resume_capable && probe_already_failed {
+                    // Loop-breaker: a sid that already failed a probe is never
+                    // retried automatically, regardless of policy, mirroring
+                    // the check `is_recovery_candidate` already applies to
+                    // the passive startup sweep. Without it, `e`/`Enter`
+                    // retries the identical doomed sid forever.
+                    skipped_failed_resume_sid = Some(sid);
+                    self.force_fresh_next_launch = true;
+                } else if resume_capable && !resume_allowed_by_policy {
+                    self.force_fresh_next_launch = true;
+                }
+            }
+        }
+
         let outcome = self.start_with_size_opts(size, skip_on_launch)?;
 
-        // Computed post-`start_with_size_opts` so it reflects post-reconcile
-        // state. A pre-call read would miss a peer-CLI `Use(X)` write that
-        // landed since the daemon's last status_poll, causing the cascade
-        // to skip the very Use(X_dead) case Tier-1's downgrade is meant to
-        // handle.
-        //
         // Gated on `LaunchSidOutcome::Existing` so fresh launches (Cleared,
         // no observed sid + Claude UUID generation) skip the probe and
         // honestly report `Fresh`. Without this gate, every Claude launch
         // would probe (~2s) and return `Resumed` because acquire always
-        // assigns a UUID, even when no `--resume` was passed.
+        // assigns a UUID, even when no `--resume` was passed. When the
+        // pre-launch decision above forced `Cleared`, `outcome` is already
+        // `LaunchSidOutcome::Fresh` here, so this naturally yields `None`.
         let attempted_sid = match &outcome {
             LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(sid), &self.tool) => {
                 Some(sid.clone())
@@ -3640,7 +3882,10 @@ impl Instance {
         // `start_with_size_opts`'s internal `session.exists()` check, in
         // which case `outcome` could be `Existing` despite the snapshot.
         if !attempting_resume || pane_was_preexisting {
-            return Ok(StartOutcome::Fresh);
+            return Ok(match skipped_failed_resume_sid {
+                Some(sid) => StartOutcome::FreshAfterFailedResume { sid },
+                None => StartOutcome::Fresh,
+            });
         }
 
         // Tier-1 settle probe. On Err (rare: only when `tmux_session()`
@@ -3763,28 +4008,35 @@ impl Instance {
             // Route fresh starts through the resume probe so a sid loaded
             // from disk that crashes the agent on launch is detected and
             // preserved with a loop-breaker instead of being retried
-            // automatically.
+            // automatically. Always `Allow`: Send Message and Live Send must
+            // keep trying to preserve agent context regardless of
+            // `auto_resume_on_restart`, which only scopes explicit
+            // restart/reattach. See #2609.
             let outcome = self
-                .start_with_resume_fallback(size, false)
+                .start_with_resume_fallback(size, false, ResumeAttemptPolicy::Allow)
                 .map_err(EnsureReadyError::Tmux)?;
             match outcome {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
-                StartOutcome::Resumed | StartOutcome::Fresh => {}
+                StartOutcome::Resumed
+                | StartOutcome::Fresh
+                | StartOutcome::FreshAfterFailedResume { .. } => {}
             }
             self.wait_for_pane_ready(&session);
             return Ok(EnsureReadyOutcome::Started);
         }
         if session.is_pane_dead() {
             let outcome = self
-                .restart_with_size(size)
+                .restart_with_resume_policy(size, false, ResumeAttemptPolicy::Allow)
                 .map_err(EnsureReadyError::Tmux)?;
             match outcome {
                 StartOutcome::ResumeFailed { sid } => {
                     return Ok(EnsureReadyOutcome::ResumeFailed { sid });
                 }
-                StartOutcome::Resumed | StartOutcome::Fresh => {}
+                StartOutcome::Resumed
+                | StartOutcome::Fresh
+                | StartOutcome::FreshAfterFailedResume { .. } => {}
             }
             self.wait_for_pane_ready(&session);
             return Ok(EnsureReadyOutcome::Respawned);
@@ -3869,13 +4121,37 @@ impl Instance {
     /// Stop the session: kill the tmux session and stop the Docker container
     /// (if sandboxed). The container is stopped but not removed, so it can be
     /// restarted on re-attach.
+    ///
+    /// On a docker inspect failure ([`crate::containers::Probe::Unknown`])
+    /// the stop is attempted anyway with a `warn!` log, so a possibly-live
+    /// container is not silently abandoned. A second `warn!` is emitted if
+    /// the stop itself also fails (e.g. docker daemon is down); the overall
+    /// `stop()` return still succeeds in that case (best-effort: the session
+    /// record is marked Stopped regardless).
     pub fn stop(&self) -> Result<()> {
         self.kill()?;
 
         if self.is_sandboxed() {
             let container = containers::DockerContainer::from_session_id(&self.id);
-            if container.is_running().unwrap_or(false) {
-                container.stop()?;
+            match container.probe_running() {
+                containers::Probe::Running => container.stop()?,
+                containers::Probe::NotRunning => {}
+                containers::Probe::Unknown(e) => {
+                    tracing::warn!(
+                        target: "containers.runtime",
+                        session = %self.id,
+                        error = %e,
+                        "docker inspect failed while probing sandbox container before session stop; attempting stop anyway to avoid leaving a possibly-live container behind"
+                    );
+                    if let Err(stop_err) = container.stop() {
+                        tracing::warn!(
+                            target: "containers.runtime",
+                            session = %self.id,
+                            error = %stop_err,
+                            "sandbox container stop failed after probe failure; container may already be gone or docker is unreachable"
+                        );
+                    }
+                }
             }
         }
 
@@ -5248,6 +5524,28 @@ mod tests {
         assert!(back.is_trashed());
     }
 
+    // A non-fork session omits fork_pending on the wire (skip_serializing_if),
+    // so legacy sessions.json without the key deserializes to None and no
+    // migration is needed. A seeded fork id round-trips.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn test_fork_pending_serde_roundtrip_and_default() {
+        let fresh = Instance::new("s", "/tmp/x");
+        let fresh_json = serde_json::to_string(&fresh).expect("serialize fresh");
+        assert!(
+            !fresh_json.contains("fork_pending"),
+            "None fork_pending must not be serialized"
+        );
+        let parsed: Instance = serde_json::from_str(&fresh_json).expect("parse fresh");
+        assert_eq!(parsed.fork_pending, None, "missing fork_pending => None");
+
+        let mut inst = Instance::new("s", "/tmp/x");
+        inst.fork_pending = Some("parent-acp-id".into());
+        let json = serde_json::to_string(&inst).expect("serialize");
+        let back: Instance = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(back.fork_pending.as_deref(), Some("parent-acp-id"));
+    }
+
     #[test]
     fn test_snooze_clears_pin() {
         let mut inst = Instance::new("s", "/tmp/x");
@@ -5509,21 +5807,17 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_ensure_pane_ready_alive_pane_is_noop() {
-        if std::process::Command::new("tmux")
-            .arg("-V")
-            .output()
-            .is_err()
-        {
+        if crate::tmux::tmux_command().arg("-V").output().is_err() {
             eprintln!("tmux not available; skipping");
             return;
         }
 
         let mut inst = Instance::new("ensure_alive_test", "/tmp/test");
         let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-        let _ = std::process::Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
             .output();
-        let created = std::process::Command::new("tmux")
+        let created = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -5552,7 +5846,7 @@ mod tests {
         assert_eq!(inst.last_start_time, prev_start);
         assert_eq!(inst.status, prev_status);
 
-        let _ = std::process::Command::new("tmux")
+        let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &tmux_name])
             .output();
     }
@@ -6291,6 +6585,99 @@ mod tests {
         assert_eq!(flags, "");
     }
 
+    #[test]
+    fn fork_intent_emits_resume_fork_session_and_pins_child() {
+        let flags = build_fork_flags(
+            "claude",
+            "parent-1111-2222-3333-444444444444",
+            "child-5555-6666-7777-888888888888",
+        );
+        assert_eq!(
+            flags,
+            "--resume parent-1111-2222-3333-444444444444 --fork-session --session-id child-5555-6666-7777-888888888888"
+        );
+    }
+
+    #[test]
+    fn fork_flags_reject_invalid_ids() {
+        assert_eq!(
+            build_fork_flags("claude", "$(rm -rf /)", "child"),
+            String::new()
+        );
+        assert_eq!(
+            build_fork_flags("claude", "parent", "; echo pwned"),
+            String::new()
+        );
+    }
+
+    #[test]
+    fn fork_flags_empty_for_unsupported_agent() {
+        assert_eq!(build_fork_flags("cursor", "parent", "child"), String::new());
+    }
+
+    #[test]
+    fn acquire_session_id_fork_pins_child_and_reports_fresh() {
+        let mut inst = Instance::new("Forked", "/tmp/x");
+        inst.tool = "claude".to_string();
+        // The child id was pre-generated and stored in agent_session_id at
+        // creation; the Fork intent carries the parent to resume from.
+        inst.agent_session_id = Some("child-5555-6666-7777-888888888888".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-1111-2222-3333-444444444444".to_string(),
+        };
+        let mut cmd = "claude".to_string();
+        let is_existing = inst.apply_session_flags(&mut cmd, "test");
+        assert_eq!(
+            cmd,
+            "claude --resume parent-1111-2222-3333-444444444444 --fork-session --session-id child-5555-6666-7777-888888888888"
+        );
+        // A fork is a NEW session (not a resume-in-place), so report not-existing.
+        assert!(!is_existing);
+        // The child id we will resume from here on stays pinned in agent_session_id.
+        assert_eq!(
+            inst.agent_session_id.as_deref(),
+            Some("child-5555-6666-7777-888888888888")
+        );
+    }
+
+    #[test]
+    fn fork_flags_for_codex_and_opencode() {
+        // Codex: `fork <parent>` subcommand. child_id unused (codex mints its own).
+        let codex = build_fork_flags("codex", "parent-id", "ignored-child");
+        assert_eq!(codex, "fork parent-id");
+        // OpenCode: resume the parent session and add --fork. agent mints new id.
+        let oc = build_fork_flags("opencode", "parent-id", "ignored-child");
+        assert_eq!(oc, "--session parent-id --fork");
+    }
+
+    #[test]
+    fn fork_command_inserts_codex_subcommand_after_binary() {
+        // codex fork must sit right after the binary, before other flags,
+        // mirroring how codex `resume` is inserted as a subcommand.
+        let mut inst = Instance::new("Forked", "/tmp/x");
+        inst.tool = "codex".to_string();
+        inst.agent_session_id = Some("child-ignored-by-codex".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-1234".to_string(),
+        };
+        let mut cmd = "codex --some-flag".to_string();
+        inst.apply_session_flags(&mut cmd, "test");
+        assert_eq!(cmd, "codex fork parent-1234 --some-flag");
+    }
+
+    #[test]
+    fn fork_command_appends_opencode_flags() {
+        let mut inst = Instance::new("Forked", "/tmp/x");
+        inst.tool = "opencode".to_string();
+        inst.agent_session_id = Some("child-ignored".to_string());
+        inst.resume_intent = ResumeIntent::Fork {
+            from: "parent-9999".to_string(),
+        };
+        let mut cmd = "opencode".to_string();
+        inst.apply_session_flags(&mut cmd, "test");
+        assert_eq!(cmd, "opencode --session parent-9999 --fork");
+    }
+
     // Test: backwards compatibility - load old JSON without agent_session_id
     #[test]
     fn test_backwards_compatibility() {
@@ -6803,10 +7190,9 @@ mod tests {
 
     mod kill_terminal_if_dead {
         use super::*;
-        use std::process::Command;
 
         fn tmux_available() -> bool {
-            Command::new("tmux")
+            crate::tmux::tmux_command()
                 .arg("-V")
                 .output()
                 .map(|o| o.status.success())
@@ -6818,7 +7204,7 @@ mod tests {
         /// the dead-pane state without going through `start_terminal`, which
         /// would also apply unrelated tmux options.
         fn spawn_remain_on_exit(name: &str, cmd: &str) {
-            let output = Command::new("tmux")
+            let output = crate::tmux::tmux_command()
                 .args([
                     "new-session",
                     "-d",
@@ -6848,7 +7234,7 @@ mod tests {
         }
 
         fn cleanup(name: &str) {
-            let _ = Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", name])
                 .output();
             crate::tmux::refresh_session_cache();
@@ -6932,7 +7318,8 @@ mod tests {
 
     mod resume_fallback {
         use super::super::{
-            should_attempt_resume, Instance, LaunchSidOutcome, ResumeIntent, StartOutcome, Status,
+            should_attempt_resume, Instance, LaunchSidOutcome, ResumeAttemptPolicy, ResumeIntent,
+            StartOutcome, Status,
         };
         use serial_test::serial;
         use tempfile::tempdir;
@@ -6960,6 +7347,7 @@ mod tests {
             assert!(should_attempt_resume(Some("session_abc.123"), "opencode"));
             assert!(should_attempt_resume(Some("uuid-abc-123"), "codex"));
             assert!(should_attempt_resume(Some("uuid-abc-123"), "gemini"));
+            assert!(should_attempt_resume(Some("uuid-abc-123"), "copilot"));
         }
 
         #[test]
@@ -6967,10 +7355,6 @@ mod tests {
             assert!(!should_attempt_resume(
                 Some("11111111-1111-1111-1111-111111111111"),
                 "cursor"
-            ));
-            assert!(!should_attempt_resume(
-                Some("11111111-1111-1111-1111-111111111111"),
-                "copilot"
             ));
         }
 
@@ -7388,6 +7772,9 @@ mod tests {
                 ResumeIntent::Default,
                 ResumeIntent::Use("abc".to_string()),
                 ResumeIntent::Cleared,
+                ResumeIntent::Fork {
+                    from: "some-parent-id".to_string(),
+                },
             ] {
                 let json = serde_json::to_string(&intent).unwrap();
                 let back: ResumeIntent = serde_json::from_str(&json).unwrap();
@@ -7408,6 +7795,17 @@ mod tests {
             assert_eq!(
                 serde_json::to_string(&ResumeIntent::Cleared).unwrap(),
                 r#"{"kind":"Cleared"}"#
+            );
+            // `Fork` is a struct variant, so its `value` is a nested object
+            // (`{"from":...}`), not a bare string like `Use`. This shape is
+            // persisted to `sessions.json`; pin it so a refactor cannot break
+            // deserialisation of saved fork seeds.
+            assert_eq!(
+                serde_json::to_string(&ResumeIntent::Fork {
+                    from: "some-parent-id".to_string()
+                })
+                .unwrap(),
+                r#"{"kind":"Fork","value":{"from":"some-parent-id"}}"#
             );
         }
 
@@ -8303,6 +8701,55 @@ mod tests {
 
         #[test]
         #[serial]
+        fn fork_intent_promotes_to_default_after_launch() {
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let profile = "fork-promote";
+            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+            let mut inst = Instance::new("Forked", "/tmp/x");
+            inst.tool = "claude".into();
+            inst.source_profile = profile.into();
+            inst.agent_session_id = Some("019342ab-1234-7def-8901-abcdef012345".into());
+            inst.resume_intent = ResumeIntent::Fork {
+                from: "019342aa-2222-7eee-8fff-aaaabbbbcccc".into(),
+            };
+            let on_disk = inst.clone();
+            storage
+                .update(|i, g| {
+                    *i = vec![on_disk.clone()];
+                    *g = crate::session::GroupTree::new_with_groups(
+                        std::slice::from_ref(&on_disk),
+                        &[],
+                    )
+                    .get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            // Simulate the post-launch persist: expected_prior_intent is the Fork
+            // we launched with; the child id is already pinned in agent_session_id.
+            let expected_prior = inst.resume_intent.clone();
+            let expected_sid = inst.agent_session_id.clone();
+            let _ = inst.persist_session_id(profile, expected_sid.as_deref(), expected_prior);
+
+            let reloaded = storage.load().unwrap();
+            let disk = reloaded.iter().find(|i| i.id == inst.id).unwrap();
+            assert_eq!(
+                disk.resume_intent,
+                ResumeIntent::Default,
+                "Fork must auto-promote to Default after the first launch so restarts resume the child plainly"
+            );
+            assert_eq!(
+                disk.agent_session_id.as_deref(),
+                Some("019342ab-1234-7def-8901-abcdef012345")
+            );
+        }
+
+        #[test]
+        #[serial]
         fn persist_session_id_writes_sid_only_on_default_intent() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
@@ -8501,18 +8948,16 @@ mod tests {
             inst.agent_session_id = Some("11111111-1111-1111-1111-111111111111".to_string());
             inst.tool = "claude".to_string();
 
-            let outcome = inst.start_with_resume_fallback(None, true).unwrap();
+            let outcome = inst
+                .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+                .unwrap();
             assert_eq!(outcome, StartOutcome::Fresh);
         }
 
         #[test]
         #[serial]
         fn fallback_marks_resume_failed_and_preserves_sid_when_pane_dies() {
-            if std::process::Command::new("tmux")
-                .arg("-V")
-                .output()
-                .is_err()
-            {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
                 eprintln!("tmux not available; skipping");
                 return;
             }
@@ -8533,7 +8978,7 @@ mod tests {
             let id = inst.id.clone();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -8546,9 +8991,9 @@ mod tests {
                 })
                 .unwrap();
 
-            let outcome = inst.start_with_resume_fallback(None, true);
+            let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
 
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -8584,11 +9029,7 @@ mod tests {
         #[test]
         #[serial]
         fn fallback_does_not_launch_fresh_when_command_would_live_without_stale_sid() {
-            if std::process::Command::new("tmux")
-                .arg("-V")
-                .output()
-                .is_err()
-            {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
                 eprintln!("tmux not available; skipping");
                 return;
             }
@@ -8620,13 +9061,13 @@ mod tests {
                 .unwrap();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
-            let outcome = inst.start_with_resume_fallback(None, true);
+            let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
 
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -8650,14 +9091,226 @@ mod tests {
             );
         }
 
+        // #2609: `auto_resume_on_restart = false` must stop `--resume <sid>`
+        // from ever reaching the launched command on the restart/reattach
+        // path (`HonorAutoResumeSetting`), while leaving Send Message / Live
+        // Send (`Allow`) unaffected.
+        #[test]
+        #[serial]
+        fn auto_resume_on_restart_false_skips_stored_sid_and_launches_fresh() {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
+                eprintln!("tmux not available; skipping");
+                return;
+            }
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let mut cfg = crate::session::config::Config::default();
+            cfg.session.auto_resume_on_restart = false;
+            crate::session::config::save_config(&cfg).unwrap();
+
+            let storage = crate::session::storage::Storage::new_unwatched("fb-toggle-off").unwrap();
+
+            let stale_sid = "44444444-4444-4444-4444-444444444444".to_string();
+            let mut inst = Instance::new("fallback_toggle_off_test", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.source_profile = "fb-toggle-off".to_string();
+            // Would die if (and only if) `--resume <stale_sid>` reached the
+            // command; with the toggle off it must never be passed, so this
+            // process lives.
+            inst.command = format!(
+                "/bin/sh -c 'case \"$*\" in *{stale}*) exit 1 ;; esac; exec sleep 30' --",
+                stale = stale_sid,
+            );
+            inst.agent_session_id = Some(stale_sid.clone());
+            inst.status = Status::Idle;
+
+            let xs = vec![inst.clone()];
+            storage
+                .update(|i, g| {
+                    *i = xs.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            let outcome = inst.start_with_resume_fallback(
+                None,
+                true,
+                ResumeAttemptPolicy::HonorAutoResumeSetting,
+            );
+
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            assert_eq!(outcome.unwrap(), StartOutcome::Fresh);
+            assert_ne!(
+                inst.agent_session_id.as_deref(),
+                Some(stale_sid.as_str()),
+                "toggle off must generate a fresh sid, not reuse the stale one"
+            );
+        }
+
+        // #2609: Send Message / Live Send (`Allow`) must keep attempting resume
+        // regardless of `auto_resume_on_restart`, so a dead pane still surfaces
+        // `ResumeFailed` (proving `--resume <sid>` was passed) rather than
+        // silently starting fresh and losing agent context.
+        #[test]
+        #[serial]
+        fn allow_policy_still_attempts_resume_when_auto_resume_on_restart_is_false() {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
+                eprintln!("tmux not available; skipping");
+                return;
+            }
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let mut cfg = crate::session::config::Config::default();
+            cfg.session.auto_resume_on_restart = false;
+            crate::session::config::save_config(&cfg).unwrap();
+
+            let storage =
+                crate::session::storage::Storage::new_unwatched("fb-allow-ignores").unwrap();
+
+            let stale_sid = "55555555-5555-5555-5555-555555555555".to_string();
+            let mut inst = Instance::new("fallback_allow_ignores_toggle_test", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.source_profile = "fb-allow-ignores".to_string();
+            inst.command = "/bin/false".to_string();
+            inst.agent_session_id = Some(stale_sid.clone());
+            inst.status = Status::Idle;
+
+            let xs = vec![inst.clone()];
+            storage
+                .update(|i, g| {
+                    *i = xs.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
+
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            assert_eq!(
+                outcome.unwrap(),
+                StartOutcome::ResumeFailed {
+                    sid: stale_sid.clone(),
+                },
+                "Allow must ignore auto_resume_on_restart=false and still attempt resume"
+            );
+        }
+
+        // #2609 core bug: a sid whose resume probe already failed once must
+        // never be retried automatically. Reproduces the reported infinite
+        // loop (two consecutive `e`/`Enter` presses against the same doomed
+        // sid) and proves the second attempt terminates it instead of
+        // repeating `ResumeFailed` forever.
+        #[test]
+        #[serial]
+        fn stale_probe_failed_sid_is_not_retried_on_next_attempt() {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
+                eprintln!("tmux not available; skipping");
+                return;
+            }
+            let temp = tempdir().unwrap();
+            std::env::set_var("HOME", temp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+
+            let storage = crate::session::storage::Storage::new_unwatched("fb-loop-break").unwrap();
+
+            let stale_sid = "66666666-6666-6666-6666-666666666666".to_string();
+            let mut inst = Instance::new("fallback_loop_break_test", "/tmp/x");
+            inst.tool = "claude".to_string();
+            inst.source_profile = "fb-loop-break".to_string();
+            inst.command = "/bin/false".to_string();
+            inst.agent_session_id = Some(stale_sid.clone());
+            inst.status = Status::Idle;
+
+            let xs = vec![inst.clone()];
+            storage
+                .update(|i, g| {
+                    *i = xs.to_vec();
+                    *g = crate::session::GroupTree::new_with_groups(&xs, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+
+            let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            // First attempt: reproduces the pre-existing `ResumeFailed` path,
+            // exactly like `fallback_marks_resume_failed_and_preserves_sid_when_pane_dies`.
+            let first = inst
+                .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+                .unwrap();
+            assert_eq!(
+                first,
+                StartOutcome::ResumeFailed {
+                    sid: stale_sid.clone(),
+                }
+            );
+            assert_eq!(
+                inst.resume_probe_failed_sid.as_deref(),
+                Some(stale_sid.as_str())
+            );
+
+            // Second attempt, same sid, same doomed command: on the pre-fix
+            // tree this reproduces the reported bug (identical `ResumeFailed`
+            // forever). The fix must instead skip the resume attempt and
+            // start fresh.
+            inst.kill_clean().unwrap();
+            let second = inst
+                .start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow)
+                .unwrap();
+
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &tmux_name])
+                .output();
+
+            assert_eq!(
+                second,
+                StartOutcome::FreshAfterFailedResume {
+                    sid: stale_sid.clone(),
+                },
+                "a sid that already failed a resume probe must not be retried automatically"
+            );
+            assert_ne!(
+                inst.agent_session_id.as_deref(),
+                Some(stale_sid.as_str()),
+                "loop-breaker must generate a fresh sid instead of repeating the doomed one"
+            );
+            assert_eq!(
+                inst.resume_probe_failed_sid, None,
+                "loop-breaker's fresh launch clears the stale marker, matching ResumeIntent::Cleared semantics"
+            );
+        }
+
         #[test]
         #[serial]
         fn resume_failed_fires_when_pane_dies_inside_post_shell_grace_window() {
-            if std::process::Command::new("tmux")
-                .arg("-V")
-                .output()
-                .is_err()
-            {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
                 eprintln!("tmux not available; skipping");
                 return;
             }
@@ -8689,13 +9342,13 @@ mod tests {
                 .unwrap();
 
             let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
-            let outcome = inst.start_with_resume_fallback(None, true);
+            let outcome = inst.start_with_resume_fallback(None, true, ResumeAttemptPolicy::Allow);
 
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &tmux_name])
                 .output();
 
@@ -8723,7 +9376,6 @@ mod tests {
         use super::super::{publish_session_to_tmux_env, Instance, ResumeIntent};
         use serial_test::serial;
         use std::collections::HashSet;
-        use std::process::Command;
         use tempfile::{tempdir, TempDir};
 
         const VALID_SID: &str = "019342ab-1234-7def-8901-abcdef012345";
@@ -8741,10 +9393,10 @@ mod tests {
             }
 
             fn create_named(name: String) -> Self {
-                let _ = Command::new("tmux")
+                let _ = crate::tmux::tmux_command()
                     .args(["kill-session", "-t", &name])
                     .output();
-                let status = Command::new("tmux")
+                let status = crate::tmux::tmux_command()
                     .args(["new-session", "-d", "-s", &name])
                     .status()
                     .expect("failed to spawn tmux");
@@ -8759,14 +9411,14 @@ mod tests {
 
         impl Drop for TmuxSession {
             fn drop(&mut self) {
-                let _ = Command::new("tmux")
+                let _ = crate::tmux::tmux_command()
                     .args(["kill-session", "-t", &self.0])
                     .output();
             }
         }
 
         fn skip_if_no_tmux() -> bool {
-            if Command::new("tmux").arg("-V").output().is_err() {
+            if crate::tmux::tmux_command().arg("-V").output().is_err() {
                 eprintln!("Skipping: tmux not available");
                 return true;
             }
@@ -9078,14 +9730,14 @@ mod tests {
     struct KillTmuxOnDrop(String);
     impl Drop for KillTmuxOnDrop {
         fn drop(&mut self) {
-            let _ = std::process::Command::new("tmux")
+            let _ = crate::tmux::tmux_command()
                 .args(["kill-session", "-t", &self.0])
                 .output();
         }
     }
 
     fn tmux_available() -> bool {
-        std::process::Command::new("tmux")
+        crate::tmux::tmux_command()
             .arg("-V")
             .output()
             .map(|o| o.status.success())
@@ -9133,7 +9785,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         let quoted_pane_file =
             format!("'{}'", pane_file.to_string_lossy().replace('\'', r#"'\''"#));
         let launch = format!("cat {quoted_pane_file}; sleep 300");
-        let created = std::process::Command::new("tmux")
+        let created = crate::tmux::tmux_command()
             .args([
                 "new-session",
                 "-d",
@@ -9176,7 +9828,7 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         // authoritative read; a fixed sleep is flaky under parallel test load.
         let mut painted = false;
         for _ in 0..50 {
-            let cap = std::process::Command::new("tmux")
+            let cap = crate::tmux::tmux_command()
                 .args(["capture-pane", "-p", "-t", &session_name])
                 .output();
             if let Ok(out) = cap {

@@ -8,6 +8,7 @@ import {
   fetchSettings,
   createSession,
   fetchVolumeIgnoresPreview,
+  fetchIsGitRepo,
   markVolumeIgnoresGlobsAcknowledged,
   type VolumeIgnoresGlobPreview,
   type HooksNeedTrust,
@@ -39,6 +40,14 @@ const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
  *  every time. See #2210. */
 const MORE_OPTIONS_OPEN_KEY = "aoe-new-session-more-options-open";
 
+/** localStorage key remembering the last agent-instruction text the user
+ *  submitted. Per-browser, so someone who reuses the same instruction on
+ *  every session does not retype it. Free text, so no validation on read
+ *  unlike the tool key. Not ACP-scoped (custom_instruction ships for
+ *  tmux-passthrough sessions too), so it uses the new-session prefix. See
+ *  #2614. */
+const LAST_USED_INSTRUCTION_KEY = "aoe-new-session-last-instruction";
+
 function loadLastUsedTool(): string {
   const stored = safeGetItem(LAST_USED_TOOL_KEY);
   if (stored && ACP_CAPABLE_TOOLS.has(stored)) {
@@ -50,6 +59,14 @@ function loadLastUsedTool(): string {
 function saveLastUsedTool(tool: string): void {
   if (!ACP_CAPABLE_TOOLS.has(tool)) return;
   safeSetItem(LAST_USED_TOOL_KEY, tool);
+}
+
+function loadLastUsedInstruction(): string {
+  return safeGetItem(LAST_USED_INSTRUCTION_KEY) ?? "";
+}
+
+function saveLastUsedInstruction(instruction: string): void {
+  safeSetItem(LAST_USED_INSTRUCTION_KEY, instruction);
 }
 
 function loadMoreOptionsOpen(): boolean {
@@ -64,7 +81,7 @@ function saveMoreOptionsOpen(open: boolean): void {
  *  fresh wizard opens default to whatever the user picked last. The
  *  prefill path overrides this when `prefill.tool` is set. */
 function buildInitialData(): WizardData {
-  return { ...initialData, tool: loadLastUsedTool() };
+  return { ...initialData, tool: loadLastUsedTool(), customInstruction: loadLastUsedInstruction() };
 }
 
 function acpDefaultsFor(session: Record<string, unknown> | undefined, tool: string): { model: string; effort: string } {
@@ -212,6 +229,27 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Probe whether the selected path is a git repository so the worktree
+  // toggle can be disabled for a plain folder (e.g. a root picked via "Use
+  // this folder"). `/api/git/is-repo` uses the same `GitWorktree::is_git_repo`
+  // gate the builder enforces, so the UI matches the server's accept/reject.
+  // Only act on a definitive answer: on a transient failure (null) leave the
+  // optimistic default so a probe blip can't misreport a repo as a non-repo.
+  // Scratch sessions have no path and never use a worktree, so skip the probe.
+  const probePath = state.data.scratch ? "" : state.data.path;
+  useEffect(() => {
+    if (!probePath) return;
+    let cancelled = false;
+    fetchIsGitRepo(probePath).then((isRepo) => {
+      if (!cancelled && isRepo !== null) {
+        dispatch({ type: "SET_FIELD", field: "pathIsGitRepo", value: isRepo });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [probePath]);
+
   const handleChange = useCallback((field: string, value: unknown) => {
     dispatch({ type: "SET_FIELD", field, value });
   }, []);
@@ -297,6 +335,7 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     if (result.ok) {
       dispatch({ type: "SUBMIT_SUCCESS" });
       saveLastUsedTool(tool);
+      saveLastUsedInstruction(body.custom_instruction ?? "");
       const warnings = result.session?.warnings;
       if (warnings && warnings.length > 0) {
         for (const w of warnings) toastBus.handler?.error(w);

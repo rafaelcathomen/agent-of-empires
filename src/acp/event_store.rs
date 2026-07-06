@@ -65,6 +65,15 @@ use crate::events::{self, Order, SeqBound};
 /// retention prune exempts them from eviction (#1049) and the idle-reap
 /// idle clock ignores them (#1689). Centralized so the two cannot silently
 /// desync.
+/// A launched / progressing background agent stops counting toward
+/// `has_in_flight_turn` after this long with no fresh progress and no
+/// terminal event. A live tailer emits a progress snapshot every ~1.5s, so
+/// a gap this large means the tailer died (e.g. a daemon crash) and no
+/// `BackgroundAgentCompleted` will ever arrive; without this bound such an
+/// agent would pin the build-stale respawn pass forever. Comfortably past
+/// the tailer's 300s `ABORT_AFTER`. See #2573.
+const BACKGROUND_AGENT_STALE_AFTER_MS: i64 = 6 * 60 * 1000;
+
 const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "AvailableCommandsUpdated",
     "ModesAvailable",
@@ -231,6 +240,26 @@ impl EventStore {
             self.max_events_per_session,
             NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
         );
+        Ok(())
+    }
+
+    /// Test-only: record an event with an explicit `created_at` (ms epoch)
+    /// so recency-sensitive probes (e.g. the background-agent staleness bound
+    /// in `has_in_flight_turn`) can be exercised deterministically.
+    #[cfg(test)]
+    pub(crate) fn record_at(
+        &self,
+        session_id: &str,
+        seq: u64,
+        event: &Event,
+        created_at_ms: i64,
+    ) -> Result<()> {
+        let json = serde_json::to_string(event)?;
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        events::insert_event(&conn, &self.schema, session_id, seq, &json, created_at_ms)?;
         Ok(())
     }
 
@@ -462,18 +491,8 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let json: String = conn
-            .query_row(
-                "SELECT event_json FROM acp_events
-                 WHERE session_id = ?1
-                   AND event_json LIKE '{\"PlanUpdated\":%'
-                 ORDER BY seq DESC LIMIT 1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten()?;
+        let (_, json) =
+            events::latest_by_discriminant(&conn, &self.schema, session_id, "PlanUpdated")?;
         let event: Event = serde_json::from_str(&json).ok()?;
         if let Event::PlanUpdated { plan } = event {
             Some(plan)
@@ -611,7 +630,7 @@ impl EventStore {
             .query_row(
                 "SELECT event_json, created_at FROM acp_events
                  WHERE session_id = ?1
-                   AND event_json LIKE '{\"RateLimit\":%'
+                   AND discriminant = 'RateLimit'
                  ORDER BY seq DESC LIMIT 1",
                 params![session_id],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -644,18 +663,9 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let json: Option<String> = conn
-            .query_row(
-                "SELECT event_json FROM acp_events
-                 WHERE session_id = ?1
-                   AND event_json LIKE '{\"WakeupScheduled\":%'
-                 ORDER BY seq DESC LIMIT 1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten();
+        let json: Option<String> =
+            events::latest_by_discriminant(&conn, &self.schema, session_id, "WakeupScheduled")
+                .map(|(_, json)| json);
         // No log for the "no row" branch. The web UI polls /api/sessions
         // every ~2-3s and fans this query out per structured view session; every
         // idle session would land here on every poll. The past-due branch
@@ -717,19 +727,9 @@ impl EventStore {
             Err(p) => p.into_inner(),
         };
         // Latest MonitorArmed and its seq.
-        let row: Option<(i64, String)> = conn
-            .query_row(
-                "SELECT seq, event_json FROM acp_events
-                 WHERE session_id = ?1
-                   AND event_json LIKE '{\"MonitorArmed\":%'
-                 ORDER BY seq DESC LIMIT 1",
-                params![session_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()
-            .ok()
-            .flatten();
-        let (armed_seq, json) = row?;
+        let (armed_seq, json) =
+            events::latest_by_discriminant(&conn, &self.schema, session_id, "MonitorArmed")?;
+        let armed_seq = armed_seq as i64;
         // The user taking over clears the badge immediately. No log on the
         // common "no monitor" branch above (this query fans out per
         // structured session on every ~2-3s sessions poll).
@@ -738,7 +738,7 @@ impl EventStore {
                 "SELECT 1 FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
-                   AND event_json LIKE '{\"UserPromptSent\":%'
+                   AND discriminant = 'UserPromptSent'
                  LIMIT 1",
                 params![session_id, armed_seq],
                 |row| row.get(0),
@@ -759,7 +759,7 @@ impl EventStore {
                 "SELECT MIN(seq) FROM acp_events
                  WHERE session_id = ?1
                    AND seq > ?2
-                   AND event_json LIKE '{\"ToolCallStarted\":%'",
+                   AND discriminant = 'ToolCallStarted'",
                 params![session_id, armed_seq],
                 |row| row.get(0),
             )
@@ -772,7 +772,7 @@ impl EventStore {
                     "SELECT 1 FROM acp_events
                      WHERE session_id = ?1
                        AND seq > ?2
-                       AND event_json LIKE '{\"Stopped\":%'
+                       AND discriminant = 'Stopped'
                      LIMIT 1",
                     params![session_id, work_seq],
                     |row| row.get(0),
@@ -856,7 +856,7 @@ impl EventStore {
                 "SELECT seq, event_json FROM acp_events
                  WHERE session_id = ?1
                    AND seq < ?2
-                   AND event_json LIKE '{\"WakeupScheduled\":%'
+                   AND discriminant = 'WakeupScheduled'
                  ORDER BY seq DESC LIMIT 1",
                 params![session_id, prompt_seq_i64],
                 |row| Ok((row.get(0)?, row.get(1)?)),
@@ -914,7 +914,7 @@ impl EventStore {
                  WHERE session_id = ?1
                    AND seq > ?2
                    AND seq < ?3
-                   AND event_json LIKE '{\"UserPromptSent\":%'
+                   AND discriminant = 'UserPromptSent'
                    AND created_at >= ?4",
                 params![session_id, wake_seq, prompt_seq_i64, at_ms],
                 |row| row.get(0),
@@ -997,12 +997,9 @@ impl EventStore {
         collected
     }
 
-    /// Latest event for `session_id` that the sidebar status derivation
-    /// cares about. Used at daemon startup to seed `Instance.status`
-    /// from history: the in-memory status writes that fire on live
-    /// structured view events don't survive restart, so without this scan a
-    /// session that was mid-turn when the previous daemon died would
-    /// render Idle until the next lifecycle event arrived. See #1103.
+    /// Latest terminal-lifecycle event for `session_id`, used by the
+    /// rate-limit park callers to detect a `Stopped{rate_limited}` and
+    /// decide whether to auto-resume or hold the session parked.
     ///
     /// `RateLimitAutoResumed` is included deliberately: the rate-limit
     /// auto-resume reconciler pass publishes it to supersede the terminal
@@ -1011,6 +1008,12 @@ impl EventStore {
     /// re-parking. A new status event added here also participates in
     /// park supersession; keep that in mind before extending the set. See
     /// #1722.
+    ///
+    /// This set intentionally EXCLUDES agent-transcript activity events
+    /// (`ThinkingStarted` / `AgentMessageChunk` / `ToolCallStarted`) so an
+    /// activity event that lands after a `Stopped{rate_limited}` cannot hide
+    /// the park from the resume logic. Status seeding wants the opposite and
+    /// uses `latest_seed_status_event` instead. See #2625.
     pub fn latest_status_event(&self, session_id: &str) -> Option<Event> {
         let conn = match self.conn.lock() {
             Ok(g) => g,
@@ -1038,6 +1041,62 @@ impl EventStore {
                 warn!(
                     target: "acp.event_store",
                     "latest_status_event query for {session_id}: {e}"
+                );
+                None
+            });
+        json.and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    /// Latest event for `session_id` that the sidebar status derivation
+    /// cares about. Used at daemon startup (`seed_acp_statuses`) and on
+    /// reattach to seed `Instance.status` from history: the in-memory status
+    /// writes that fire on live structured view events don't survive restart,
+    /// so without this scan a session that was mid-turn when the previous
+    /// daemon died would render Idle until the next lifecycle event arrived.
+    /// See #1103.
+    ///
+    /// Unlike [`Self::latest_status_event`] this set ALSO matches the
+    /// agent-transcript activity events (`ThinkingStarted` /
+    /// `AgentMessageChunk` / `ToolCallStarted`). The live status path
+    /// (`derive_acp_status`) maps those to `Running`, so a turn that the
+    /// agent resumed on its own after a `Stopped{prompt_complete}` (no new
+    /// `UserPromptSent`, e.g. a fired wakeup or a background job) keeps its
+    /// green dot across a restart instead of collapsing to a stale Idle from
+    /// the earlier `Stopped`. This query must stay in sync with the
+    /// `Set(Running)` / `Set(Waiting)` arms of `derive_acp_status`. See #2625.
+    pub fn latest_seed_status_event(&self, session_id: &str) -> Option<Event> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT event_json FROM acp_events
+                 WHERE session_id = ?1
+                   AND (json_extract(event_json, '$.UserPromptSent') IS NOT NULL
+                     OR json_extract(event_json, '$.ApprovalRequested') IS NOT NULL
+                     OR json_extract(event_json, '$.ApprovalResolved') IS NOT NULL
+                     OR json_extract(event_json, '$.ElicitationRequested') IS NOT NULL
+                     OR json_extract(event_json, '$.ElicitationResolved') IS NOT NULL
+                     OR json_extract(event_json, '$.Stopped') IS NOT NULL
+                     OR json_extract(event_json, '$.RateLimitAutoResumed') IS NOT NULL
+                     OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL
+                     OR json_extract(event_json, '$.AgentMessageChunk') IS NOT NULL
+                     OR json_extract(event_json, '$.ToolCallStarted') IS NOT NULL
+                     -- ThinkingStarted is a unit enum variant, serialized as
+                     -- the bare JSON string \"ThinkingStarted\" rather than an
+                     -- object, so it needs an equality match, not json_extract.
+                     OR event_json = '\"ThinkingStarted\"')
+                 ORDER BY seq DESC
+                 LIMIT 1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(
+                    target: "acp.event_store",
+                    "latest_seed_status_event query for {session_id}: {e}"
                 );
                 None
             });
@@ -1216,7 +1275,58 @@ impl EventStore {
                 return false;
             }
         };
-        terminator.is_none()
+        if terminator.is_none() {
+            return true;
+        }
+        // An async background agent (claude `Agent` tool with `isAsync`) runs
+        // off-protocol and outlives the turn's terminal Stopped: its work is
+        // reported only via BackgroundAgent{Launched,Progress,Completed}
+        // events. Treat the session as in-flight while any launched or
+        // progressing agent has no matching Completed, so a build-stale
+        // respawn does not interrupt it mid-work and drop its transcript.
+        // Bounded two ways so a lost tailer cannot pin the probe forever:
+        // every live tailer emits a terminal BackgroundAgentCompleted
+        // (including stalled / error), AND an agent whose latest progress is
+        // older than BACKGROUND_AGENT_STALE_AFTER_MS stops counting (its
+        // tailer died, e.g. a daemon crash, so no Completed will ever come).
+        // See #2573.
+        let stale_cutoff = chrono::Utc::now().timestamp_millis() - BACKGROUND_AGENT_STALE_AFTER_MS;
+        let bg_in_flight: i64 = match conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                     SELECT aid, MAX(created_at) AS last_at FROM (
+                         SELECT json_extract(event_json, '$.BackgroundAgentLaunched.agent_id') AS aid,
+                                created_at
+                           FROM acp_events WHERE session_id = ?1
+                             AND json_extract(event_json, '$.BackgroundAgentLaunched') IS NOT NULL
+                         UNION ALL
+                         SELECT json_extract(event_json, '$.BackgroundAgentProgress.agent_id'),
+                                created_at
+                           FROM acp_events WHERE session_id = ?1
+                             AND json_extract(event_json, '$.BackgroundAgentProgress') IS NOT NULL
+                     )
+                     WHERE aid IS NOT NULL
+                     GROUP BY aid
+                 ) started
+                 WHERE started.last_at >= ?2
+                   AND started.aid NOT IN (
+                     SELECT json_extract(event_json, '$.BackgroundAgentCompleted.agent_id')
+                       FROM acp_events WHERE session_id = ?1
+                         AND json_extract(event_json, '$.BackgroundAgentCompleted') IS NOT NULL
+                   )",
+                params![session_id, stale_cutoff],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+        {
+            Ok(Some(v)) => v,
+            Ok(None) => 0,
+            Err(e) => {
+                warn!(target: "acp.event_store", "has_in_flight_turn bg-agent query {session_id}: {e}");
+                0
+            }
+        };
+        bg_in_flight > 0
     }
 
     /// Latest `created_at` (ms since epoch) per session for the given
@@ -1318,18 +1428,8 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let json: String = conn
-            .query_row(
-                "SELECT event_json FROM acp_events
-                 WHERE session_id = ?1
-                   AND event_json LIKE '{\"PromptCapabilities\":%'
-                 ORDER BY seq DESC LIMIT 1",
-                params![session_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .ok()
-            .flatten()?;
+        let (_, json) =
+            events::latest_by_discriminant(&conn, &self.schema, session_id, "PromptCapabilities")?;
         match serde_json::from_str::<Event>(&json).ok()? {
             Event::PromptCapabilities {
                 image,
@@ -2339,6 +2439,115 @@ mod tests {
     }
 
     #[test]
+    fn has_in_flight_turn_true_while_background_agent_unfinished() {
+        // #2573: an async background agent runs after the turn's terminal
+        // Stopped. A build-stale respawn must defer until the agent finishes,
+        // so the session counts as in-flight while any launched/progressing
+        // agent has no matching BackgroundAgentCompleted.
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::UserPromptSent {
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::BackgroundAgentProgress {
+                    agent_id: "bg-1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Running,
+                    tool_count: 1,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        // Turn is stopped, but the background agent has no terminal yet.
+        assert!(store.has_in_flight_turn("s-1"));
+        store
+            .record(
+                "s-1",
+                4,
+                &Event::BackgroundAgentCompleted {
+                    agent_id: "bg-1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Completed,
+                    tools: Vec::new(),
+                    result: None,
+                    warning: None,
+                    ended_at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+        // Its completion drains the in-flight state.
+        assert!(!store.has_in_flight_turn("s-1"));
+    }
+
+    #[test]
+    fn has_in_flight_turn_ignores_stale_background_agent() {
+        // #2573: a tailer that died (e.g. daemon crash) leaves a bg agent
+        // with Launched/Progress and no Completed. After the staleness window
+        // it must stop counting, so a lost tailer cannot pin the build-stale
+        // respawn pass forever.
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::UserPromptSent {
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+        let stale_at =
+            chrono::Utc::now().timestamp_millis() - (BACKGROUND_AGENT_STALE_AFTER_MS + 60_000);
+        store
+            .record_at(
+                "s-1",
+                3,
+                &Event::BackgroundAgentProgress {
+                    agent_id: "bg-1".into(),
+                    status: crate::acp::state::BackgroundAgentStatus::Running,
+                    tool_count: 1,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    at: chrono::Utc::now(),
+                },
+                stale_at,
+            )
+            .unwrap();
+        // Progress older than the window with no Completed: treated as gone.
+        assert!(!store.has_in_flight_turn("s-1"));
+    }
+
+    #[test]
     fn has_in_flight_turn_true_when_chunks_unterminated() {
         let (_tmp, store) = open_store(1000);
         store
@@ -2907,6 +3116,104 @@ mod tests {
 
         // Unknown session → None.
         assert!(store.latest_status_event("nope").is_none());
+    }
+
+    /// `latest_seed_status_event` also matches agent-transcript activity
+    /// events, so a turn the agent resumed on its own after a terminal
+    /// `Stopped{prompt_complete}` (no new `UserPromptSent`) seeds Running,
+    /// not a stale Idle, across a daemon restart. `latest_status_event`
+    /// keeps ignoring those activity events so rate-limit park detection is
+    /// unaffected. See #2625.
+    #[test]
+    fn latest_seed_status_event_sees_activity_after_stopped() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::UserPromptSent {
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+        // Agent resumes on its own: streams more output with no new prompt.
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::AgentMessageChunk {
+                    text: "build done".into(),
+                },
+            )
+            .unwrap();
+
+        // Seed derivation follows the activity: the newest status-relevant
+        // event is the AgentMessageChunk, which the live path maps to Running.
+        assert!(matches!(
+            store.latest_seed_status_event("s-1"),
+            Some(Event::AgentMessageChunk { text }) if text == "build done"
+        ));
+        // Park detection still sees only the terminal Stopped.
+        assert!(matches!(
+            store.latest_status_event("s-1"),
+            Some(Event::Stopped { reason }) if reason == "prompt_complete"
+        ));
+
+        // A `ThinkingStarted` alone (no other lifecycle event) seeds via the
+        // activity set, whereas the narrow query returns None.
+        store.record("s-2", 1, &Event::ThinkingStarted).unwrap();
+        assert!(matches!(
+            store.latest_seed_status_event("s-2"),
+            Some(Event::ThinkingStarted)
+        ));
+        assert!(store.latest_status_event("s-2").is_none());
+    }
+
+    /// A rate-limit park must not be hidden from `latest_status_event` by a
+    /// trailing activity event, or the auto-resume logic would try to resume
+    /// a quota-blocked session. `latest_seed_status_event` is free to move on
+    /// (the sidebar shows the resumed work), but the park query stays put.
+    /// See #1722, #2625.
+    #[test]
+    fn latest_status_event_ignores_activity_after_rate_limit_park() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::Stopped {
+                    reason: "rate_limited".into(),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::AgentMessageChunk {
+                    text: "trailing".into(),
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.latest_status_event("s-1"),
+            Some(Event::Stopped { reason }) if reason == "rate_limited"
+        ));
+        assert!(matches!(
+            store.latest_seed_status_event("s-1"),
+            Some(Event::AgentMessageChunk { text }) if text == "trailing"
+        ));
     }
 
     /// `unresolved_approval_nonces` finds `ApprovalRequested` rows whose

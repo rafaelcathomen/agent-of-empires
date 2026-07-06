@@ -17,15 +17,15 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_client_protocol::schema::ErrorCode;
-use agent_client_protocol::schema::{
+use agent_client_protocol::schema::v1::ErrorCode;
+use agent_client_protocol::schema::v1::{
     AudioContent, BlobResourceContents, CancelNotification, ClientCapabilities, ContentBlock,
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
     CreateTerminalResponse, ElicitationAction, ElicitationCapabilities,
     ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
-    FileSystemCapabilities, ImageContent, InitializeRequest, KillTerminalRequest,
-    KillTerminalResponse, LoadSessionRequest, McpServer, MessageId, NewSessionRequest,
-    PermissionOptionKind, PromptRequest, ProtocolVersion, ReadTextFileRequest,
+    FileSystemCapabilities, ForkSessionRequest, ImageContent, InitializeRequest,
+    KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, McpServer, MessageId,
+    NewSessionRequest, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
     SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionId,
@@ -34,6 +34,7 @@ use agent_client_protocol::schema::{
     WaitForTerminalExitRequest, WaitForTerminalExitResponse, WriteTextFileRequest,
     WriteTextFileResponse,
 };
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, JsonRpcRequest, JsonRpcResponse, Responder,
 };
@@ -233,7 +234,7 @@ pub(crate) fn classify_rate_limit_from_message(message: &str) -> Option<RateLimi
 #[request(method = "session/delete", response = DeleteSessionResponse)]
 #[serde(rename_all = "camelCase")]
 struct DeleteSessionRequest {
-    session_id: agent_client_protocol::schema::SessionId,
+    session_id: agent_client_protocol::schema::v1::SessionId,
     /// Emit `_meta: {}` so adapters that validate against the strict
     /// `unstable_session_delete` schema accept the request. Optional
     /// in the TS schema, but a defensive default avoids `-32602
@@ -292,6 +293,10 @@ pub struct SpawnConfig {
     /// Optional default reasoning effort to apply on fresh ACP sessions
     /// through the adapter's `thought_level` config option.
     pub default_effort: Option<String>,
+    /// Optional default mode to apply on fresh ACP sessions through the
+    /// adapter's `category:"mode"` config option. Applied strictly: a value
+    /// the agent does not advertise no-ops with a warning.
+    pub default_mode: Option<String>,
     /// Reserved for a future agent-in-container that natively speaks
     /// the socket transport. The current structured view sandbox path runs
     /// `docker exec` from the host-side runner (which already holds the
@@ -306,6 +311,13 @@ pub struct SpawnConfig {
     /// load failure the task falls back to `session/new` and emits a
     /// `SessionContextReset` event.
     pub stored_acp_session_id: Option<String>,
+    /// When `Some`, this spawn is a structured fork: instead of `session/new`
+    /// or `session/load`, the connection task sends `session/fork` with this
+    /// parent ACP session id (provided the agent advertises the fork
+    /// capability). The adapter mints a new child id, captured via
+    /// `AcpSessionAssigned` and persisted on `Instance.acp_session_id`.
+    /// Sourced from `Instance.fork_pending`.
+    pub fork_from: Option<String>,
     /// When `Some`, the agent runs inside the named Docker container.
     /// Daemon-side spawn wraps the argv in `docker exec` and the
     /// fs/terminal handlers route across the container boundary using
@@ -393,6 +405,10 @@ enum ConnectMode {
         /// instead of suppressing it (imported session, empty store). See
         /// #2276.
         seed_history_replay: bool,
+        /// Parent ACP session id to fork from. When set and the agent
+        /// advertises the fork capability, the handshake sends
+        /// `session/fork` instead of `session/new` / `session/load`.
+        fork_from: Option<String>,
     },
     Resume {
         acp_session_id: String,
@@ -491,6 +507,19 @@ const SILENT_ORPHAN_CHECK_INTERVAL: std::time::Duration = std::time::Duration::f
 /// which resets the idle timer and clears `cost_seen`, so this cannot cut a
 /// live turn short. See #2325.
 const BETWEEN_PROMPT_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Idle grace for a between-prompt agent-initiated turn that streamed
+/// output but never reported a cost-bearing end-of-turn marker and never
+/// scheduled a wake, i.e. a turn that stalled mid-stream (the model
+/// connection dropped, the process parked) rather than finishing cleanly or
+/// parking a monitor. A legitimately parked monitor / `/loop` sets a
+/// `wake_at` and so never lands here; genuinely off-protocol work
+/// (backgrounded Bash) latches the 30-minute floor. So this bucket is the
+/// stall, and it should self-heal in a couple of minutes, not 30. Set to
+/// the vendor-agnostic base grace so a live turn's normal inter-chunk /
+/// inter-tool gaps (which refresh the idle timer) cannot trip it. See
+/// #2573.
+const BETWEEN_PROMPT_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Tick cadence for the between-prompt idle check. Faster than
 /// `SILENT_ORPHAN_CHECK_INTERVAL` so the badge and status clear within a few
@@ -666,9 +695,9 @@ pub(crate) enum LifecycleSignal {
 /// or after final accounting, and treating those as progress would
 /// mask the exact wedge the watchdog is designed to detect. See #1240.
 fn classify_lifecycle_signal(
-    update: &agent_client_protocol::schema::SessionUpdate,
+    update: &agent_client_protocol::schema::v1::SessionUpdate,
 ) -> Option<LifecycleSignal> {
-    use agent_client_protocol::schema::{SessionUpdate, ToolCallStatus};
+    use agent_client_protocol::schema::v1::{SessionUpdate, ToolCallStatus};
     match update {
         SessionUpdate::UsageUpdate(u) if u.cost.is_some() => Some(LifecycleSignal::TerminalUsage),
         SessionUpdate::AgentMessageChunk(_)
@@ -788,15 +817,18 @@ struct SilentOrphanWatchdogConfig {
 ///
 /// - `tool_calls_in_flight` non-empty → watchdog is always suppressed.
 /// - `off_protocol_work_seen.is_some()` → effective grace lifts to at
-///   least `off_protocol_grace_floor` for the rest of this prompt.
+///   least `off_protocol_grace_floor` for the rest of this prompt, EXCEPT
+///   the backgrounded-Bash mid-stream-stall case: `BackgroundCommand` with
+///   `last_refresh_was_progress` bypasses the floor and recovers on the
+///   normal per-prompt grace (#2645).
 /// - `wakeup_suppress_until.is_some()` and `now < deadline` →
 ///   suppressed regardless of grace.
 /// - `cost_seen` switches the no-off-protocol case to fast grace; any
 ///   subsequent `Progress` / `ToolStarted` / `ToolCompleted` /
 ///   `WakeupPending` clears it.
 ///
-/// See #1240 (original wedge), #1360 (async-agent floor), and #1401
-/// (backgrounded Bash + ScheduleWakeup).
+/// See #1240 (original wedge), #1360 (async-agent floor), #1401
+/// (backgrounded Bash + ScheduleWakeup), and #2645 (mid-stream stall).
 #[derive(Debug, Default)]
 struct SilentOrphanWatchdog {
     saw_first_progress: bool,
@@ -805,6 +837,16 @@ struct SilentOrphanWatchdog {
     tool_calls_in_flight: std::collections::HashMap<String, ToolMetadata>,
     off_protocol_work_seen: Option<OffProtocolWorkKind>,
     wakeup_suppress_until: Option<tokio::time::Instant>,
+    /// True when the last signal that refreshed the progress timer was a
+    /// `Progress` (`AgentMessageChunk` / `AgentThoughtChunk` / `Plan` /
+    /// non-terminal `ToolCallUpdate`) rather than a tool boundary
+    /// (`ToolStarted` / `ToolCompleted`) or a `WakeupPending`. Lets
+    /// `effective_grace` tell a model stream that died mid-message apart
+    /// from a backgrounded Bash that is still being polled: a live bash
+    /// surfaces as `BashOutput` tool activity (flag `false`, keeps the
+    /// 30-min floor), while a mid-stream stall leaves the flag `true`
+    /// (recover on the normal per-prompt grace). See #2645.
+    last_refresh_was_progress: bool,
 }
 
 impl SilentOrphanWatchdog {
@@ -826,6 +868,7 @@ impl SilentOrphanWatchdog {
                 self.saw_first_progress = true;
                 self.last_progress_at = Some(now);
                 self.cost_seen = false;
+                self.last_refresh_was_progress = true;
             }
             LifecycleSignal::ToolStarted {
                 id,
@@ -834,6 +877,7 @@ impl SilentOrphanWatchdog {
                 self.saw_first_progress = true;
                 self.last_progress_at = Some(now);
                 self.cost_seen = false;
+                self.last_refresh_was_progress = false;
                 // OR the new flag with any existing metadata. A late
                 // `ToolCallUpdate(InProgress)` lacks `raw_input` and
                 // classifies as `is_background_task = false`; without
@@ -858,6 +902,7 @@ impl SilentOrphanWatchdog {
                 self.saw_first_progress = true;
                 self.last_progress_at = Some(now);
                 self.cost_seen = false;
+                self.last_refresh_was_progress = false;
                 // Defense in depth: trust either the completion-content
                 // marker OR the original raw_input flag. Either path
                 // alone is enough to mark this prompt as having
@@ -905,6 +950,7 @@ impl SilentOrphanWatchdog {
                 self.saw_first_progress = true;
                 self.last_progress_at = Some(now);
                 self.cost_seen = false;
+                self.last_refresh_was_progress = false;
                 // A scheduled wake is deliberate off-protocol idling, not
                 // a wedge: mark the turn so the fast grace (cost_seen)
                 // never applies and the post-`at` grace is the generous
@@ -942,7 +988,21 @@ impl SilentOrphanWatchdog {
     }
 
     fn effective_grace(&self, cfg: SilentOrphanWatchdogConfig) -> std::time::Duration {
-        if self.off_protocol_work_seen.is_some() {
+        // A backgrounded Bash whose turn then died mid-message: the last
+        // signal that refreshed the timer was model stream output
+        // (`Progress`), not a `BashOutput` poll or other tool activity, and
+        // nothing has arrived since. That is a dead stream, not a quietly-
+        // running bash, so bypass the 30-min floor and recover on the normal
+        // per-prompt cascade (~120s base grace). A bash still being polled
+        // refreshes the timer via tool activity, which clears
+        // `last_refresh_was_progress` and keeps the floor. Scoped to
+        // `BackgroundCommand`: an `AsyncAgent` await and a `ScheduledWakeup`
+        // are genuinely invisible off-protocol waits and keep their floor
+        // (preserves #1360 and the monitor-killed-by-watchdog fix). See #2645.
+        let background_stream_stall = self.off_protocol_work_seen
+            == Some(OffProtocolWorkKind::BackgroundCommand)
+            && self.last_refresh_was_progress;
+        if self.off_protocol_work_seen.is_some() && !background_stream_stall {
             cfg.base_grace.max(cfg.off_protocol_grace_floor)
         } else if self.cost_seen && cfg.fast_grace > std::time::Duration::ZERO {
             cfg.fast_grace
@@ -1062,7 +1122,9 @@ fn terminal_stop_reason(
 /// matching the resume-idle watchdog. Mirrors the per-prompt watchdog's
 /// grace policy: the cost-bearing `UsageUpdate` is claude-agent-acp's
 /// end-of-turn marker, so once it has arrived the fast grace applies;
-/// otherwise the vendor-agnostic off-protocol floor governs. A pending
+/// untracked off-protocol work (backgrounded Bash) holds the 30-minute
+/// floor; a turn that streamed but did neither (a stalled stream) recovers
+/// on the intermediate stall grace instead of the floor (#2573). A pending
 /// scheduled wake (`wake_at` in the future) suppresses firing so a
 /// legitimately-sleeping monitor is never killed early; once `wake_at` is
 /// in the past the turn is treated as finished and self-heals fast (#2371).
@@ -1129,7 +1191,7 @@ fn between_prompt_should_fire(
     last_lifecycle_ms: i64,
     wake_at_ms: Option<i64>,
     cost_seen: bool,
-    tools_in_flight: bool,
+    work_in_flight: bool,
     off_protocol_work_seen: bool,
     fast_grace: std::time::Duration,
     floor: std::time::Duration,
@@ -1137,9 +1199,10 @@ fn between_prompt_should_fire(
     if !active {
         return false;
     }
-    // An in-flight tool (npm install, Playwright, a Task subagent) means the
-    // turn is legitimately busy; never fire while one is open. See #1401.
-    if tools_in_flight {
+    // Work in flight (an open ACP tool: npm install, Playwright, a Task
+    // subagent; or a tracked async background agent) means the turn is
+    // legitimately busy; never fire while any is running. See #1401, #2573.
+    if work_in_flight {
         return false;
     }
     // A future wake is the agent legitimately sleeping toward `at`; suppress
@@ -1148,17 +1211,20 @@ fn between_prompt_should_fire(
         return false;
     }
     let expired_wake = wake_at_ms.is_some_and(|at| now_ms >= at);
-    // Off-protocol work (backgrounded Bash, async sub-agent) completes on the
-    // protocol while the real work keeps running, so hold the conservative
-    // floor even though no tool is "in flight". See #1401, #1858. Otherwise a
-    // cost-resolved end-of-turn marker OR an expired wake (the agent should
-    // have resumed and did not) means the turn is done: self-heal fast.
+    // Off-protocol work (backgrounded Bash) completes on the protocol while
+    // the real work keeps running with no completion signal, so hold the
+    // conservative floor even though no tool is "in flight". See #1401,
+    // #1858. A cost-resolved end-of-turn marker OR an expired wake (the agent
+    // should have resumed and did not) means the turn is done: self-heal
+    // fast. Otherwise the turn streamed but never finished cleanly or parked
+    // a wake, a stalled stream: recover on the stall grace (minutes) rather
+    // than the 30-minute floor. See #2573.
     let grace = if off_protocol_work_seen {
         floor
     } else if cost_seen || expired_wake {
         fast_grace
     } else {
-        floor
+        BETWEEN_PROMPT_STALL_GRACE
     };
     now_ms - last_lifecycle_ms >= grace.as_millis() as i64
 }
@@ -1251,9 +1317,9 @@ async fn send_lifecycle_signal(
 /// ID: ...` would otherwise trip the watchdog to its 30-minute floor.
 /// See CodeRabbit review on PR #1406.
 fn detect_off_protocol_work_completed(
-    content: &Option<Vec<agent_client_protocol::schema::ToolCallContent>>,
+    content: &Option<Vec<agent_client_protocol::schema::v1::ToolCallContent>>,
 ) -> Option<OffProtocolWorkKind> {
-    use agent_client_protocol::schema::ToolCallContent;
+    use agent_client_protocol::schema::v1::ToolCallContent;
     let blocks = content.as_ref()?;
     for block in blocks {
         let ToolCallContent::Content(c) = block else {
@@ -1825,6 +1891,7 @@ impl AcpClient {
         let mode = ConnectMode::Fresh {
             stored_acp_session_id: config.stored_acp_session_id.clone(),
             seed_history_replay: config.seed_history_replay,
+            fork_from: config.fork_from.clone(),
         };
         let sandbox_pair = if let Some(info) = &config.sandbox_info {
             // `from_info` resolves the container workdir, which touches git2 and
@@ -1848,6 +1915,7 @@ impl AcpClient {
         let install_binary = config.spec.command.clone();
         let source_profile_for_task = config.source_profile.clone();
         let default_effort = config.default_effort.clone();
+        let default_mode = config.default_mode.clone();
         let mcp_servers = config.mcp_servers.clone();
         if let Some(socket_path) = config.socket_path.clone() {
             // Supersede guard: a fresh spawn overwrites this session's
@@ -1875,6 +1943,7 @@ impl AcpClient {
                 install_binary,
                 source_profile_for_task,
                 default_effort.clone(),
+                default_mode.clone(),
                 mcp_servers,
             )
             .await;
@@ -1898,6 +1967,7 @@ impl AcpClient {
             install_binary,
             source_profile_for_task,
             default_effort,
+            default_mode,
             mcp_servers,
         )
         .await
@@ -1920,6 +1990,7 @@ impl AcpClient {
         install_binary: String,
         source_profile: Option<String>,
         default_effort: Option<String>,
+        default_mode: Option<String>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
         let (stdin, stdout) = {
@@ -1983,6 +2054,7 @@ impl AcpClient {
                 expected_agent,
                 source_profile,
                 default_effort,
+                default_mode,
                 mcp_servers,
             )
             .instrument(conn_span),
@@ -2022,6 +2094,7 @@ impl AcpClient {
         install_binary: String,
         source_profile: Option<String>,
         default_effort: Option<String>,
+        default_mode: Option<String>,
         mcp_servers: Vec<McpServer>,
     ) -> Result<Self, AcpError> {
         // Poll for the runner to finish binding the socket. The runner
@@ -2090,6 +2163,7 @@ impl AcpClient {
                 expected_agent,
                 source_profile,
                 default_effort,
+                default_mode,
                 mcp_servers,
             )
             .instrument(conn_span),
@@ -2177,8 +2251,10 @@ impl AcpClient {
             source_profile,
             None,
             // Reattach uses ConnectMode::Resume, which reuses the stored ACP
-            // session id without sending session/new or session/load, so no
-            // MCP servers are forwarded here (they were sent on first connect).
+            // session id without sending session/new or session/load, so
+            // neither default effort/mode nor MCP servers are forwarded here
+            // (they were applied on first connect).
+            None,
             Vec::new(),
         )
         .await
@@ -2898,35 +2974,47 @@ fn build_sandbox_docker_argv(
     })
 }
 
+/// Env vars forwarded from the operator environment to every spawned
+/// agent, on both the detached-runner path (`apply_env_filter`) and the
+/// in-proc stdio path (`spawn_subprocess`). Both spawn sites `env_clear()`
+/// first, so this is the whole inheritance surface; keeping it in one const
+/// is what stops the two paths drifting apart.
+const ALWAYS_FORWARD_ENV: &[&str] = &[
+    "PATH",
+    "HOME",
+    // XDG_CONFIG_HOME drives `get_app_dir()` on Linux (see
+    // src/session/mod.rs). Without forwarding, the runner falls
+    // back to `$HOME/.config/agent-of-empires[-dev]`, which
+    // diverges from the daemon when the operator (or live test
+    // harness) has set XDG_CONFIG_HOME to a non-default value.
+    // The runner then writes its WorkerRecord to a path the
+    // daemon never reads, the daemon's `reap_user_stopped`
+    // observes the registry as missing on the next tick, emits
+    // `Stopped { user_stopped }`, and respawns, turning a fine
+    // worker into a respawn loop. See #1383 (CI Linux live
+    // specs under an isolated $XDG_CONFIG_HOME).
+    "XDG_CONFIG_HOME",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "USER",
+    // Path to the operator's ssh-agent socket. Forwarding it lets the
+    // agent's git subprocess authenticate over SSH; without it, git SSH
+    // has no agent to connect to (most visible on Linux, where the socket
+    // lives in the environment). The value is a socket path, not a secret;
+    // the security lives in the ssh-agent behind it. See #2691.
+    "SSH_AUTH_SOCK",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CONFIG_DIR",
+];
+
 /// Apply the env_clear + allowlist + provider_env filtering used by both
 /// the detached-runner path and the in-proc stdio path. Pulled out so
 /// the two spawn sites share the same security posture.
 fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
-    const ALWAYS_FORWARD: &[&str] = &[
-        "PATH",
-        "HOME",
-        // XDG_CONFIG_HOME drives `get_app_dir()` on Linux (see
-        // src/session/mod.rs). Without forwarding, the runner falls
-        // back to `$HOME/.config/agent-of-empires[-dev]`, which
-        // diverges from the daemon when the operator (or live test
-        // harness) has set XDG_CONFIG_HOME to a non-default value.
-        // The runner then writes its WorkerRecord to a path the
-        // daemon never reads, the daemon's `reap_user_stopped`
-        // observes the registry as missing on the next tick, emits
-        // `Stopped { user_stopped }`, and respawns, turning a fine
-        // worker into a respawn loop. See #1383 (CI Linux live
-        // specs under an isolated $XDG_CONFIG_HOME).
-        "XDG_CONFIG_HOME",
-        "LANG",
-        "LC_ALL",
-        "TERM",
-        "USER",
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "CLAUDE_CONFIG_DIR",
-    ];
-    for name in ALWAYS_FORWARD {
+    for name in ALWAYS_FORWARD_ENV {
         if let Ok(value) = std::env::var(name) {
             cmd.env(name, value);
         }
@@ -2998,32 +3086,14 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Env: clear, then forward an explicit allowlist + provider-specific
-    // creds. AOE_TOKEN must NEVER reach the agent.
+    // Env: clear, then forward the shared allowlist + provider-specific
+    // creds. AOE_TOKEN must NEVER reach the agent. Uses the same
+    // `ALWAYS_FORWARD_ENV` const as the runner path so the two spawn
+    // sites cannot drift; provider auth (`ANTHROPIC_API_KEY`, etc.) and
+    // `SSH_AUTH_SOCK` for git-over-SSH ride along in that list.
     cmd.env_clear();
-    let always_forward = [
-        "PATH",
-        "HOME",
-        // Mirror the runner-mode ALWAYS_FORWARD: XDG_CONFIG_HOME drives
-        // `get_app_dir()` on Linux, so the stdio agent must see the
-        // same value the daemon resolved against (otherwise a custom
-        // XDG_CONFIG_HOME diverges between daemon and agent).
-        "XDG_CONFIG_HOME",
-        "LANG",
-        "LC_ALL",
-        "TERM",
-        "USER",
-        // Provider auth: forwarded by default so users who already have
-        // `ANTHROPIC_API_KEY` (or have run `claude /login` so their
-        // ~/.claude credentials sit under HOME) get a working agent
-        // without manual env_allowlist plumbing.
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "CLAUDE_CONFIG_DIR",
-    ];
     let mut forwarded_keys: Vec<&str> = Vec::new();
-    for name in always_forward {
+    for &name in ALWAYS_FORWARD_ENV {
         if let Ok(mut value) = std::env::var(name) {
             // Prepend the resolved bin dir to PATH so the adapter's own
             // `node`/`npx` lookups land in the same node install as the
@@ -3176,9 +3246,9 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
 /// list the agent offered. Falls back gracefully if the agent didn't
 /// offer the preferred kind.
 fn pick_option_id(
-    options: &[agent_client_protocol::schema::PermissionOption],
+    options: &[agent_client_protocol::schema::v1::PermissionOption],
     decision: ApprovalDecision,
-) -> Option<agent_client_protocol::schema::PermissionOptionId> {
+) -> Option<agent_client_protocol::schema::v1::PermissionOptionId> {
     let preferred_kinds = match decision {
         ApprovalDecision::Allow => &[
             PermissionOptionKind::AllowOnce,
@@ -3358,10 +3428,10 @@ fn monitor_event_from_raw(raw_input: &serde_json::Value) -> Option<Event> {
 /// behavior so the sidebar countdown lights up immediately. See
 /// CodeRabbit review on PR #1406.
 fn wakeup_lifecycle_signal_from_update(
-    update: &agent_client_protocol::schema::SessionUpdate,
+    update: &agent_client_protocol::schema::v1::SessionUpdate,
     profile: &agent_profiles::AgentProfile,
 ) -> Option<LifecycleSignal> {
-    use agent_client_protocol::schema::{SessionUpdate, ToolCallStatus};
+    use agent_client_protocol::schema::v1::{SessionUpdate, ToolCallStatus};
     if !profile.supports_wakeup_tools {
         return None;
     }
@@ -3388,7 +3458,7 @@ fn wakeup_lifecycle_signal_from_update(
 /// signal, so stale replay frames cannot suppress or disarm watchdogs for a
 /// new prompt epoch.
 fn classify_watchdog_notification_signals(
-    update: &agent_client_protocol::schema::SessionUpdate,
+    update: &agent_client_protocol::schema::v1::SessionUpdate,
     profile: &agent_profiles::AgentProfile,
     suppressing_history_replay: bool,
 ) -> (Option<LifecycleSignal>, Option<LifecycleSignal>) {
@@ -3697,7 +3767,10 @@ fn map_update_to_events(
             // #1059. Gated on the agent's profile so codex / opencode /
             // gemini mode switches don't spuriously emit empty Plans.
             if profile.supports_exit_plan_mode
-                && matches!(tc.kind, agent_client_protocol::schema::ToolKind::SwitchMode)
+                && matches!(
+                    tc.kind,
+                    agent_client_protocol::schema::v1::ToolKind::SwitchMode
+                )
             {
                 if let Some(plan) = extract_plan_from_switch_mode(&raw_args) {
                     events.push(Event::PlanUpdated { plan });
@@ -3722,12 +3795,12 @@ fn map_update_to_events(
             let id = update.tool_call_id.0.to_string();
             let is_error = matches!(
                 update.fields.status,
-                Some(agent_client_protocol::schema::ToolCallStatus::Failed)
+                Some(agent_client_protocol::schema::v1::ToolCallStatus::Failed)
             );
             let completed = matches!(
                 update.fields.status,
-                Some(agent_client_protocol::schema::ToolCallStatus::Completed)
-                    | Some(agent_client_protocol::schema::ToolCallStatus::Failed)
+                Some(agent_client_protocol::schema::v1::ToolCallStatus::Completed)
+                    | Some(agent_client_protocol::schema::v1::ToolCallStatus::Failed)
             );
             // claude-agent-acp emits the initial `tool_call` frame
             // eagerly, often well before the underlying bash / read /
@@ -3738,7 +3811,7 @@ fn map_update_to_events(
             // See #1060.
             let in_progress = matches!(
                 update.fields.status,
-                Some(agent_client_protocol::schema::ToolCallStatus::InProgress)
+                Some(agent_client_protocol::schema::v1::ToolCallStatus::InProgress)
             );
             let content_text = update
                 .fields
@@ -3989,7 +4062,7 @@ fn map_update_to_events(
             vec![Event::UsageUpdated { usage }]
         }
         SessionUpdate::AvailableCommandsUpdate(u) => {
-            use agent_client_protocol::schema::AvailableCommandInput;
+            use agent_client_protocol::schema::v1::AvailableCommandInput;
             let commands: Vec<AvailableCommand> = u
                 .available_commands
                 .into_iter()
@@ -4080,7 +4153,7 @@ fn background_agent_launched_from_value(v: &serde_json::Value) -> Option<Event> 
 /// favor of session config options, so there is no longer a second
 /// channel to normalize. See #1403, #1820.
 fn config_options_event(
-    raw: Option<Vec<agent_client_protocol::schema::SessionConfigOption>>,
+    raw: Option<Vec<agent_client_protocol::schema::v1::SessionConfigOption>>,
 ) -> Option<Event> {
     raw.map(|raw| Event::ConfigOptionsUpdated {
         options: raw.into_iter().filter_map(map_acp_config_option).collect(),
@@ -4137,9 +4210,9 @@ fn dispatch_set_config_option(
 }
 
 fn thought_level_config_id(
-    options: &[agent_client_protocol::schema::SessionConfigOption],
-) -> Option<agent_client_protocol::schema::SessionConfigId> {
-    use agent_client_protocol::schema::{SessionConfigKind, SessionConfigOptionCategory};
+    options: &[agent_client_protocol::schema::v1::SessionConfigOption],
+) -> Option<agent_client_protocol::schema::v1::SessionConfigId> {
+    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigOptionCategory};
 
     options.iter().find_map(|option| {
         if !matches!(
@@ -4155,14 +4228,42 @@ fn thought_level_config_id(
     })
 }
 
+/// Id of the first `Select` config option in the `mode` category, or `None`.
+/// Mirrors `thought_level_config_id`; non-`Select` kinds are skipped because
+/// they carry no selectable value the default-application path can set.
+fn mode_config_id(
+    options: &[agent_client_protocol::schema::v1::SessionConfigOption],
+) -> Option<agent_client_protocol::schema::v1::SessionConfigId> {
+    use agent_client_protocol::schema::v1::{SessionConfigKind, SessionConfigOptionCategory};
+
+    options.iter().find_map(|option| {
+        if !matches!(option.category, Some(SessionConfigOptionCategory::Mode)) {
+            return None;
+        }
+        if !matches!(option.kind, SessionConfigKind::Select(_)) {
+            return None;
+        }
+        Some(option.id.clone())
+    })
+}
+
+/// Whether to issue ACP `session/fork` on this connect: only when a fork was
+/// requested AND the agent advertised the (unstable) fork capability. Falls
+/// back to the normal new/load handshake otherwise (which, for a fork that
+/// can't run, surfaces as an empty new session rather than corrupting the
+/// parent).
+pub(crate) fn should_fork(fork_from: Option<&str>, agent_advertises_fork: bool) -> bool {
+    fork_from.is_some_and(|s| !s.is_empty()) && agent_advertises_fork
+}
+
 /// Build a structured view `ConfigOptionDescriptor` from an ACP
 /// `SessionConfigOption`. Returns `None` when the option has a kind
 /// the structured view does not yet render (today everything except `Select`).
 /// See #1403.
 fn map_acp_config_option(
-    option: agent_client_protocol::schema::SessionConfigOption,
+    option: agent_client_protocol::schema::v1::SessionConfigOption,
 ) -> Option<ConfigOptionDescriptor> {
-    use agent_client_protocol::schema::{
+    use agent_client_protocol::schema::v1::{
         SessionConfigKind, SessionConfigOptionCategory, SessionConfigSelectOptions,
     };
 
@@ -4230,8 +4331,8 @@ fn map_acp_config_option(
     })
 }
 
-fn map_plan_status(status: agent_client_protocol::schema::PlanEntryStatus) -> PlanStepStatus {
-    use agent_client_protocol::schema::PlanEntryStatus;
+fn map_plan_status(status: agent_client_protocol::schema::v1::PlanEntryStatus) -> PlanStepStatus {
+    use agent_client_protocol::schema::v1::PlanEntryStatus;
     match status {
         PlanEntryStatus::Pending => PlanStepStatus::Pending,
         PlanEntryStatus::InProgress => PlanStepStatus::InProgress,
@@ -4245,8 +4346,8 @@ fn map_plan_status(status: agent_client_protocol::schema::PlanEntryStatus) -> Pl
 /// TodoWrite args payload. Matches the values
 /// `web/src/components/acp/ToolCards.tsx::normaliseTodoStatus`
 /// accepts so the TodoUpdateCard renders the right glyph.
-fn plan_status_to_str(status: &agent_client_protocol::schema::PlanEntryStatus) -> &'static str {
-    use agent_client_protocol::schema::PlanEntryStatus;
+fn plan_status_to_str(status: &agent_client_protocol::schema::v1::PlanEntryStatus) -> &'static str {
+    use agent_client_protocol::schema::v1::PlanEntryStatus;
     match status {
         PlanEntryStatus::Pending => "pending",
         PlanEntryStatus::InProgress => "in_progress",
@@ -4263,8 +4364,8 @@ fn raw_event<T: serde::Serialize>(value: &T) -> Event {
 
 /// Stable lowercased string form of an ACP `ToolKind`. Used to drive the
 /// per-tool renderer dispatch on the web side.
-fn tool_kind_str(kind: &agent_client_protocol::schema::ToolKind) -> String {
-    use agent_client_protocol::schema::ToolKind;
+fn tool_kind_str(kind: &agent_client_protocol::schema::v1::ToolKind) -> String {
+    use agent_client_protocol::schema::v1::ToolKind;
     match kind {
         ToolKind::Read => "read",
         ToolKind::Edit => "edit",
@@ -4331,8 +4432,10 @@ async fn emit_permission_denied(event_tx: &mpsc::Sender<Event>, tool_call_id: &s
 /// non-text content blocks (images, resources, embedded terminals); the
 /// per-tool renderer fall-back path only knows how to display text. Diff
 /// blocks are bridged separately by `extract_diffs_from_content`.
-fn extract_tool_content_text(blocks: &[agent_client_protocol::schema::ToolCallContent]) -> String {
-    use agent_client_protocol::schema::ToolCallContent;
+fn extract_tool_content_text(
+    blocks: &[agent_client_protocol::schema::v1::ToolCallContent],
+) -> String {
+    use agent_client_protocol::schema::v1::ToolCallContent;
     let mut out = String::new();
     for block in blocks {
         if let ToolCallContent::Content(c) = block {
@@ -4364,9 +4467,9 @@ const MAX_INLINE_MEDIA_B64: usize = 4 * 1024 * 1024;
 /// so the structured list only carries weight when real media is present.
 /// See #1818.
 fn extract_tool_output_blocks(
-    blocks: &[agent_client_protocol::schema::ToolCallContent],
+    blocks: &[agent_client_protocol::schema::v1::ToolCallContent],
 ) -> Vec<ToolOutputBlock> {
-    use agent_client_protocol::schema::{EmbeddedResourceResource, ToolCallContent};
+    use agent_client_protocol::schema::v1::{EmbeddedResourceResource, ToolCallContent};
     let mut out: Vec<ToolOutputBlock> = Vec::new();
     let mut has_media = false;
     let cap =
@@ -4457,8 +4560,8 @@ fn extract_tool_output_blocks(
 /// the classifier.
 fn extract_memory_recall(
     meta: &Option<serde_json::Map<String, serde_json::Value>>,
-    locations: &[agent_client_protocol::schema::ToolCallLocation],
-    content: &[agent_client_protocol::schema::ToolCallContent],
+    locations: &[agent_client_protocol::schema::v1::ToolCallLocation],
+    content: &[agent_client_protocol::schema::v1::ToolCallContent],
 ) -> Option<MemoryRecall> {
     let map = meta.as_ref()?;
     let claude_code = map.get("claudeCode")?;
@@ -4529,9 +4632,9 @@ fn cap_diff_text(text: &str) -> String {
 /// is `#[non_exhaustive]`, so the wildcard arm keeps this compiling as the
 /// schema grows. Per-side text is capped and the list bounded. See #1721.
 fn extract_diffs_from_content(
-    blocks: &[agent_client_protocol::schema::ToolCallContent],
+    blocks: &[agent_client_protocol::schema::v1::ToolCallContent],
 ) -> Vec<DiffPreview> {
-    use agent_client_protocol::schema::ToolCallContent;
+    use agent_client_protocol::schema::v1::ToolCallContent;
     let created_at = chrono::Utc::now();
     blocks
         .iter()
@@ -4560,7 +4663,7 @@ fn handle_delete_session_cmd(
     acp_session_id: String,
     respond_to: oneshot::Sender<DeleteSessionOutcome>,
 ) {
-    let target = agent_client_protocol::schema::SessionId::from(acp_session_id);
+    let target = agent_client_protocol::schema::v1::SessionId::from(acp_session_id);
     // `block_task()` is documented as safe to await from a spawned
     // task: it waits on the per-request oneshot the main connection
     // task feeds via its inbound pump, so the dispatch loop keeps
@@ -4660,6 +4763,7 @@ async fn run_connection_task<W, R>(
     expected_agent: ExpectedAgent,
     source_profile: Option<String>,
     default_effort: Option<String>,
+    default_mode: Option<String>,
     mcp_servers: Vec<McpServer>,
 ) where
     W: futures_util::AsyncWrite + Send + 'static,
@@ -4772,6 +4876,16 @@ async fn run_connection_task<W, R>(
     // marker OR its launch set `run_in_background`: the work keeps running
     // after the ToolCall completes, so the watchdog holds the floor.
     let between_prompt_off_protocol = Arc::new(AtomicBool::new(false));
+    // Async background agents (claude `Agent` tool with `isAsync`) currently
+    // tracked by a live tailer, keyed by agent_id. Non-empty means
+    // agent-initiated work is still running off-protocol WITH a precise
+    // terminal event (the tailer removes the id on completion / stall /
+    // error), so the between-prompt idle watchdog must not fire while any is
+    // in flight. Distinct from the 30-min off-protocol floor, which governs
+    // untracked backgrounded Bash that has no completion signal. See #2573.
+    let between_prompt_bg_agents = Arc::new(std::sync::Mutex::new(std::collections::HashSet::<
+        String,
+    >::new()));
     let prompt_in_flight = Arc::new(AtomicBool::new(false));
     let last_event_at_for_notif = last_event_at.clone();
     let first_event_after_attach_for_notif = first_event_after_attach.clone();
@@ -4781,6 +4895,7 @@ async fn run_connection_task<W, R>(
     let between_prompt_wake_at_for_notif = between_prompt_wake_at.clone();
     let between_prompt_tools_for_notif = between_prompt_tools.clone();
     let between_prompt_off_protocol_for_notif = between_prompt_off_protocol.clone();
+    let between_prompt_bg_agents_for_notif = between_prompt_bg_agents.clone();
     let prompt_in_flight_for_notif = prompt_in_flight.clone();
 
     // Per-session tracker that drops claude-agent-acp's leaked consolidated
@@ -4819,6 +4934,8 @@ async fn run_connection_task<W, R>(
                 let between_prompt_tools = between_prompt_tools_for_notif.clone();
                 let between_prompt_off_protocol =
                     between_prompt_off_protocol_for_notif.clone();
+                let between_prompt_bg_agents =
+                    between_prompt_bg_agents_for_notif.clone();
                 let prompt_in_flight = prompt_in_flight_for_notif.clone();
                 let tool_context_cache = tool_context_cache_for_notif.clone();
                 async move {
@@ -4927,7 +5044,19 @@ async fn run_connection_task<W, R>(
                                     .unwrap_or(false);
                                 // A failed launch keeps no background work
                                 // running, so it must not pin the floor.
+                                // Async sub-agents are tracked precisely in
+                                // between_prompt_bg_agents (a tailer removes
+                                // them on their terminal event), so they must
+                                // NOT also latch the 30-min off-protocol floor;
+                                // that floor is only for untracked backgrounded
+                                // work (Bash) with no completion signal. See
+                                // #2573.
+                                let is_tracked_async = matches!(
+                                    off_protocol_work,
+                                    Some(OffProtocolWorkKind::AsyncAgent)
+                                );
                                 if *succeeded
+                                    && !is_tracked_async
                                     && (off_protocol_work.is_some() || was_background)
                                 {
                                     between_prompt_off_protocol
@@ -4993,6 +5122,7 @@ async fn run_connection_task<W, R>(
                                     agent_id.clone(),
                                     output_file.clone(),
                                     event_tx.clone(),
+                                    between_prompt_bg_agents.clone(),
                                 );
                             }
                         }
@@ -5297,6 +5427,7 @@ async fn run_connection_task<W, R>(
                 ConnectMode::Fresh {
                     stored_acp_session_id,
                     seed_history_replay,
+                    fork_from,
                 } => {
                     // Decide whether to resume the prior agent session or create
                     // a fresh one. session/load is only attempted when the agent
@@ -5305,7 +5436,137 @@ async fn run_connection_task<W, R>(
                     // through to session/new and emit SessionContextReset so the
                     // UI can show a notice and clear stale token-usage hints.
                     let mut acp_session_id: Option<SessionId> = None;
-                    if load_session_capable {
+
+                    // Structured fork (when fork_pending is set and the agent
+                    // advertises the capability): send session/fork against the
+                    // parent id; the adapter mints a new child id we capture and
+                    // persist via AcpSessionAssigned. Tried before the load/new
+                    // decision so a fork never falls through to session/new
+                    // (which would hand the user an empty session they believe
+                    // is a fork). On fork failure we emit SessionContextReset
+                    // (which clears the one-shot fork marker so the reconciler
+                    // and supervisor stop re-forking) and then return Err to
+                    // fail the spawn rather than silently masking it.
+                    let fork_capable = init.agent_capabilities.session_capabilities.fork.is_some();
+                    if should_fork(fork_from.as_deref(), fork_capable) {
+                        let parent = fork_from.clone().unwrap();
+                        info!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            parent_acp_id = %parent,
+                            "structured fork via session/fork"
+                        );
+                        let req = ForkSessionRequest::new(parent.clone(), cwd.clone())
+                            .mcp_servers(mcp_servers.clone());
+                        match connection.send_request(req).block_task().await {
+                            Ok(resp) => {
+                                let new_id = resp.session_id.clone();
+                                info!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    parent_acp_id = %parent,
+                                    new_id = %new_id.0,
+                                    "session/fork succeeded, captured forked acp_session_id"
+                                );
+                                // Capture available mode info and config-option
+                                // mode category from the fork response (it carries
+                                // the same modes/config_options as session/new), so
+                                // the SetMode handlers below skip modes the agent
+                                // has not advertised and the pickers hydrate.
+                                if let Some(modes) = resp.modes.as_ref() {
+                                    available_mode_ids = Some(
+                                        modes
+                                            .available_modes
+                                            .iter()
+                                            .map(|m| m.id.0.to_string())
+                                            .collect(),
+                                    );
+                                }
+                                if resp.config_options.as_ref().is_some_and(|opts| {
+                                    opts.iter().any(|o| {
+                                        o.category
+                                            == Some(
+                                                agent_client_protocol::schema::v1::
+                                                    SessionConfigOptionCategory::Mode,
+                                            )
+                                    })
+                                }) {
+                                    has_config_option_mode = true;
+                                }
+                                // Surface agent-advertised modes (when carried in
+                                // the ACP `modes` field rather than the `mode`
+                                // config option), mirroring session/new so a fork
+                                // hydrates the mode picker too. See #1403.
+                                if let Some(modes) = resp.modes.as_ref() {
+                                    let infos: Vec<ModeInfo> = modes
+                                        .available_modes
+                                        .iter()
+                                        .map(|m| ModeInfo {
+                                            id: m.id.0.to_string(),
+                                            name: m.name.clone(),
+                                            description: m.description.clone(),
+                                        })
+                                        .collect();
+                                    let _ = event_tx_for_block
+                                        .send(Event::ModesAvailable {
+                                            current_mode_id: modes.current_mode_id.0.to_string(),
+                                            modes: infos,
+                                        })
+                                        .await;
+                                }
+                                let _ = event_tx_for_block
+                                    .send(Event::AcpSessionAssigned {
+                                        acp_session_id: new_id.0.to_string(),
+                                    })
+                                    .await;
+                                if let Some(event) = config_options_event(resp.config_options) {
+                                    let _ = event_tx_for_block.send(event).await;
+                                }
+                                acp_session_id = Some(new_id);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    parent_acp_id = %parent,
+                                    "session/fork failed; failing spawn (no session/new fallback): {e}"
+                                );
+                                // Clear the one-shot fork marker via a reset
+                                // event before failing: without it the reconciler
+                                // re-reads fork_pending and re-issues the same
+                                // failing session/fork on every reattach, wedging
+                                // the instance in a retry loop. The reset also
+                                // gives the dashboard a user-visible reason.
+                                let _ = event_tx_for_block
+                                    .send(Event::SessionContextReset {
+                                        reason: format!("fork_failed: {e}"),
+                                    })
+                                    .await;
+                                return Err(e);
+                            }
+                        }
+                    } else if fork_from.as_deref().is_some_and(|s| !s.is_empty()) {
+                        // A fork was requested but the connected agent does not
+                        // advertise the fork capability (e.g. a resume-only
+                        // adapter, or a claude-agent-acp build without fork).
+                        // The create-time surfaces gate on this, but a runtime
+                        // agent swap can still land here. Rather than silently
+                        // presenting an empty session/new that the user believes
+                        // is a fork, emit a reset so the marker clears (no retry
+                        // loop) and the dashboard can explain the downgrade.
+                        warn!(
+                            target: "acp.protocol",
+                            session = %session_label,
+                            "fork requested but agent does not advertise fork; falling back to session/new"
+                        );
+                        let _ = event_tx_for_block
+                            .send(Event::SessionContextReset {
+                                reason: "fork_unsupported_by_agent".to_string(),
+                            })
+                            .await;
+                    }
+
+                    if acp_session_id.is_none() && load_session_capable {
                         if let Some(stored) = stored_acp_session_id.clone() {
                             info!(
                                 target: "acp.protocol",
@@ -5360,7 +5621,7 @@ async fn run_connection_task<W, R>(
                                             opts.iter().any(|o| {
                                                 o.category
                                                     == Some(
-                                                        agent_client_protocol::schema::
+                                                        agent_client_protocol::schema::v1::
                                                             SessionConfigOptionCategory::Mode,
                                                     )
                                             })
@@ -5468,7 +5729,7 @@ async fn run_connection_task<W, R>(
                                 opts.iter().any(|o| {
                                     o.category
                                         == Some(
-                                            agent_client_protocol::schema::
+                                            agent_client_protocol::schema::v1::
                                                 SessionConfigOptionCategory::Mode,
                                         )
                                 })
@@ -5549,6 +5810,56 @@ async fn run_connection_task<W, R>(
                                     target: "acp.protocol",
                                     session = %session_label,
                                     "default structured view effort skipped; no thought_level option"
+                                );
+                            }
+                        }
+
+                        // Mode default mirrors the effort block above. Strict:
+                        // apply only when the agent advertises a live
+                        // `category:"mode"` option; a stale/unknown value is
+                        // rejected by the adapter and warned (no-op), never
+                        // failing the spawn. Legacy set_mode / Claude hardcoded
+                        // mode channels are intentionally not driven from
+                        // defaults here (see #2631).
+                        if let (Some(mode_value), Some(options)) =
+                            (default_mode.as_deref(), config_options.as_deref())
+                        {
+                            if let Some(config_id) = mode_config_id(options) {
+                                info!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    mode = mode_value,
+                                    "applying default structured view mode"
+                                );
+                                match connection
+                                    .send_request(SetSessionConfigOptionRequest::new(
+                                        id.clone(),
+                                        config_id,
+                                        SessionConfigValueId::new(mode_value.to_string()),
+                                    ))
+                                    .block_task()
+                                    .await
+                                {
+                                    Ok(resp) => {
+                                        if let Some(event) =
+                                            config_options_event(Some(resp.config_options))
+                                        {
+                                            let _ = event_tx_for_block.send(event).await;
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            target: "acp.protocol",
+                                            session = %session_label,
+                                            "default structured view mode failed: {e}"
+                                        );
+                                    }
+                                }
+                            } else {
+                                debug!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    "default structured view mode skipped; no mode option"
                                 );
                             }
                         }
@@ -5655,13 +5966,21 @@ async fn run_connection_task<W, R>(
                             .lock()
                             .expect("between-prompt tools mutex poisoned")
                             .is_empty();
+                        // A tracked async background agent still running is
+                        // work in flight just like an open tool: suppress the
+                        // idle watchdog until its tailer reports terminal and
+                        // removes it from the set. See #2573.
+                        let bg_agents_in_flight = !between_prompt_bg_agents
+                            .lock()
+                            .expect("between-prompt bg-agents mutex poisoned")
+                            .is_empty();
                         if between_prompt_should_fire(
                             between_prompt_active.load(Ordering::Relaxed),
                             now,
                             last_lifecycle_at.load(Ordering::Relaxed),
                             wake_at,
                             between_prompt_cost_seen.load(Ordering::Relaxed),
-                            tools_in_flight,
+                            tools_in_flight || bg_agents_in_flight,
                             between_prompt_off_protocol.load(Ordering::Relaxed),
                             BETWEEN_PROMPT_IDLE_GRACE,
                             OFF_PROTOCOL_WORK_GRACE_FLOOR,
@@ -5676,6 +5995,10 @@ async fn run_connection_task<W, R>(
                             between_prompt_tools
                                 .lock()
                                 .expect("between-prompt tools mutex poisoned")
+                                .clear();
+                            between_prompt_bg_agents
+                                .lock()
+                                .expect("between-prompt bg-agents mutex poisoned")
                                 .clear();
                             info!(
                                 target: "acp.protocol",
@@ -6809,8 +7132,10 @@ async fn handle_create_terminal(
     result
 }
 
-fn build_exit_status(exit_code: Option<i32>) -> agent_client_protocol::schema::TerminalExitStatus {
-    use agent_client_protocol::schema::TerminalExitStatus;
+fn build_exit_status(
+    exit_code: Option<i32>,
+) -> agent_client_protocol::schema::v1::TerminalExitStatus {
+    use agent_client_protocol::schema::v1::TerminalExitStatus;
     let cast = exit_code.and_then(|c| u32::try_from(c).ok());
     TerminalExitStatus::new().exit_code(cast)
 }
@@ -7209,6 +7534,48 @@ mod tests {
         assert!(matches!(event, Event::ThinkingStarted));
     }
 
+    #[test]
+    fn should_fork_requires_capability_and_parent() {
+        assert!(should_fork(Some("parent"), true));
+        assert!(!should_fork(Some("parent"), false)); // adapter can't fork (e.g. aoe-agent)
+        assert!(!should_fork(None, true));
+        assert!(!should_fork(Some(""), true));
+    }
+
+    /// Pin the ACP fork wire shape our production path reads, against the
+    /// `agent_client_protocol` serde derives. `should_fork` keys off
+    /// `agent_capabilities.session_capabilities.fork.is_some()`, and the fork
+    /// response is read via `resp.session_id`. If upstream renames either key
+    /// (e.g. `fork` -> `session_fork`, or `sessionId` casing), these
+    /// deserializations flip: the capability would read absent (silent
+    /// `session/new` downgrade in production) or the response would fail to
+    /// parse. The fake agent (`web/tests/helpers/fakeAcpAgent.mjs`) sends these
+    /// exact keys, so pinning them here catches an upstream drift that the fake
+    /// would otherwise mask. See PR review.
+    #[test]
+    fn acp_fork_capability_and_response_wire_keys_are_stable() {
+        use agent_client_protocol::schema::v1::{ForkSessionResponse, SessionCapabilities};
+
+        // The fork capability is advertised as a `"fork": {}` object nested in
+        // the session capabilities the agent returns from `initialize`.
+        let caps: SessionCapabilities =
+            serde_json::from_value(serde_json::json!({ "fork": {} })).expect("caps parse");
+        assert!(
+            caps.fork.is_some(),
+            "the `fork` capability key must deserialize into SessionCapabilities.fork"
+        );
+        // Absent/`null` fork must read as not-forkable (the resume-only shape).
+        let no_fork: SessionCapabilities =
+            serde_json::from_value(serde_json::json!({})).expect("empty caps parse");
+        assert!(no_fork.fork.is_none());
+
+        // The fork response identifies the child session under `sessionId`.
+        let resp: ForkSessionResponse =
+            serde_json::from_value(serde_json::json!({ "sessionId": "child-123" }))
+                .expect("fork response parse");
+        assert_eq!(resp.session_id.0.as_ref(), "child-123");
+    }
+
     // truncate_for_log is the adapter-error sanitizer in the
     // session/delete path: it caps a third-party-controlled string so
     // a chatty adapter can't bloat debug.log, and must never panic on
@@ -7479,6 +7846,7 @@ mod tests {
     // Bind to the production constants so the test tracks the real grace.
     const FAST: std::time::Duration = BETWEEN_PROMPT_IDLE_GRACE;
     const FLOOR: std::time::Duration = OFF_PROTOCOL_WORK_GRACE_FLOOR;
+    const STALL: std::time::Duration = BETWEEN_PROMPT_STALL_GRACE;
 
     #[test]
     fn between_prompt_inactive_never_fires() {
@@ -7519,13 +7887,35 @@ mod tests {
     }
 
     #[test]
-    fn between_prompt_uses_floor_without_cost() {
+    fn between_prompt_suppressed_while_work_in_flight() {
+        // #2573: a tracked async background agent is folded into the
+        // work_in_flight input, so it must suppress the idle watchdog even
+        // when the grace has long elapsed and a cost frame was seen. Before
+        // the fix the call site passed only ACP tools, so a running bg agent
+        // left this false and the watchdog fired mid-work.
         let last = 1_000_000;
-        // 21s idle but no cost marker and no expired wake: the generous floor
-        // governs (a turn doing silent background work, #1858), no fire.
+        let well_past = last + FLOOR.as_millis() as i64 + 10_000;
+        assert!(!between_prompt_should_fire(
+            true, well_past, last, None, true, true, false, FAST, FLOOR
+        ));
+        // Once the work drains (set empty -> work_in_flight false), the
+        // already-elapsed grace lets the completed turn end on the next tick.
+        assert!(between_prompt_should_fire(
+            true, well_past, last, None, true, false, false, FAST, FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_stalled_stream_fires_on_stall_grace() {
+        // #2573: a turn that streamed but never reported a cost marker, never
+        // scheduled a wake, and is not off-protocol is a stalled stream. It
+        // must recover on the stall grace (minutes), not the 30-minute floor.
+        let last = 1_000_000;
+        let stall_ms = STALL.as_millis() as i64;
+        // Under the stall grace: normal inter-chunk gap, no fire.
         assert!(!between_prompt_should_fire(
             true,
-            last + 21_000,
+            last + stall_ms - 1000,
             last,
             None,
             false,
@@ -7534,15 +7924,46 @@ mod tests {
             FAST,
             FLOOR
         ));
-        // Past the 30-minute floor: fire even without a cost marker.
+        // Past the stall grace: recover. Before the fix this waited the full
+        // 30-minute floor, so the session sat "running" for half an hour.
         assert!(between_prompt_should_fire(
             true,
-            last + 30 * 60 * 1000 + 1,
+            last + stall_ms + 1000,
             last,
             None,
             false,
             false,
             false,
+            FAST,
+            FLOOR
+        ));
+    }
+
+    #[test]
+    fn between_prompt_off_protocol_still_uses_floor() {
+        // Untracked backgrounded Bash (off_protocol_work_seen) has no
+        // completion signal, so it keeps the conservative 30-minute floor
+        // even well past the stall grace. See #1401, #1858, #2573.
+        let last = 1_000_000;
+        assert!(!between_prompt_should_fire(
+            true,
+            last + STALL.as_millis() as i64 + 60_000,
+            last,
+            None,
+            false,
+            false,
+            true, // off_protocol_work_seen
+            FAST,
+            FLOOR
+        ));
+        assert!(between_prompt_should_fire(
+            true,
+            last + FLOOR.as_millis() as i64 + 1,
+            last,
+            None,
+            false,
+            false,
+            true,
             FAST,
             FLOOR
         ));
@@ -8008,6 +8429,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watchdog_background_then_stream_stall_recovers_on_base_grace() {
+        // #2645: a per-prompt turn launched a backgrounded Bash (latches the
+        // 30-min floor) and then streamed a partial message before the model
+        // stream died mid-chunk. Because the last timer refresh was a
+        // `Progress` (not a `BashOutput` poll), the watchdog must recover on
+        // the normal per-prompt grace (~120s), not ride the 30-min floor.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-stall".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::BackgroundCommand),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Model resumes streaming a partial message, then the stream dies.
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::BackgroundCommand),
+            "the backgrounded Bash is still latched",
+        );
+        // Before the base grace lapses: still suppressed.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60), cfg));
+        // Past the base grace (120s from the last chunk at +2s): fires,
+        // instead of waiting the 30-min floor.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(125), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_background_still_polling_rides_floor() {
+        // #2645 guard: a backgrounded Bash that is genuinely still producing
+        // output is polled via `BashOutput`, which surfaces as tool activity
+        // (ToolStarted / ToolCompleted) and clears `last_refresh_was_progress`.
+        // The watchdog must keep the 30-min floor so a live bash is not cut
+        // short even though a stream chunk preceded the last poll.
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bg-live".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::BackgroundCommand),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        // Agent narrates ("still running..."), then polls the bash.
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::ToolStarted {
+                id: "tc-bashoutput".into(),
+                is_background_task: false,
+            },
+            t0 + std::time::Duration::from_secs(3),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-bashoutput".into(),
+                succeeded: true,
+                off_protocol_work: None,
+            },
+            t0 + std::time::Duration::from_secs(4),
+            wall,
+            cfg,
+        );
+        // Last refresh was tool activity: the floor holds, no early fire.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 20), cfg));
+    }
+
+    #[tokio::test]
+    async fn watchdog_async_agent_stream_stall_still_rides_floor() {
+        // #2645 scope lock: the mid-stream-stall bypass is BackgroundCommand
+        // only. An AsyncAgent await is a genuinely invisible off-protocol
+        // wait, so even a stream chunk followed by silence must keep the
+        // 30-min floor (preserves #1360 and the monitor-kill fix).
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::Progress, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::ToolCompleted {
+                id: "tc-async".into(),
+                succeeded: true,
+                off_protocol_work: Some(OffProtocolWorkKind::AsyncAgent),
+            },
+            t0 + std::time::Duration::from_secs(1),
+            wall,
+            cfg,
+        );
+        w.apply_signal(
+            LifecycleSignal::Progress,
+            t0 + std::time::Duration::from_secs(2),
+            wall,
+            cfg,
+        );
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::AsyncAgent),
+        );
+        // Well past the base grace: still suppressed on the 30-min floor.
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(200), cfg));
+        assert!(!w.should_fire(t0 + std::time::Duration::from_secs(60 * 25), cfg));
+    }
+
+    #[tokio::test]
     async fn watchdog_wakeup_suppresses_until_at_plus_off_protocol_floor() {
         let cfg = watchdog_test_cfg();
         let t0 = tokio::time::Instant::now();
@@ -8331,8 +8881,10 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
             sandbox_info: Some(sandbox.clone()),
@@ -8402,8 +8954,10 @@ mod tests {
             // Per-spawn provider_env entry: must end up Inherit-style.
             provider_env: vec![("ANTHROPIC_API_KEY".into(), "sk-test-value".into())],
             default_effort: None,
+            default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
             sandbox_info: Some(sandbox.clone()),
@@ -8475,8 +9029,10 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
             sandbox_info: Some(sandbox.clone()),
@@ -8523,8 +9079,10 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
             sandbox_info: None,
@@ -8557,8 +9115,10 @@ mod tests {
             additional_dirs: vec![],
             provider_env: vec![],
             default_effort: None,
+            default_mode: None,
             socket_path: None,
             stored_acp_session_id: None,
+            fork_from: None,
             seed_history_replay: false,
             artifact_dir: None,
             sandbox_info: None,
@@ -8648,7 +9208,7 @@ mod tests {
 
     #[test]
     fn map_update_to_events_threads_parent_tool_call_id() {
-        use agent_client_protocol::schema::{SessionUpdate, ToolCall as AcpToolCall};
+        use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall as AcpToolCall};
         let mut meta = serde_json::Map::new();
         meta.insert(
             "claudeCode".to_string(),
@@ -8668,7 +9228,7 @@ mod tests {
 
     #[test]
     fn map_update_to_events_leaves_parent_none_when_meta_missing() {
-        use agent_client_protocol::schema::{SessionUpdate, ToolCall as AcpToolCall};
+        use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall as AcpToolCall};
         let mut tc = AcpToolCall::new("tc-1", "Read");
         tc.raw_input = Some(serde_json::json!({"path": "x"}));
         let events = map_update_to_events(SessionUpdate::ToolCall(tc), &agent_profiles::CLAUDE);
@@ -8680,7 +9240,7 @@ mod tests {
     }
 
     fn text_chunk(text: &str, id: Option<&str>) -> SessionUpdate {
-        use agent_client_protocol::schema::{ContentBlock, ContentChunk, TextContent};
+        use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
         let mut chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
         if let Some(id) = id {
             chunk = chunk.message_id(id);
@@ -8689,7 +9249,7 @@ mod tests {
     }
 
     fn tool_update() -> SessionUpdate {
-        use agent_client_protocol::schema::ToolCall as AcpToolCall;
+        use agent_client_protocol::schema::v1::ToolCall as AcpToolCall;
         SessionUpdate::ToolCall(AcpToolCall::new("t-dedup", "Read"))
     }
 
@@ -8783,7 +9343,7 @@ mod tests {
 
     #[test]
     fn map_update_to_events_does_not_link_parent_for_unverified_agents() {
-        use agent_client_protocol::schema::{SessionUpdate, ToolCall as AcpToolCall};
+        use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall as AcpToolCall};
         let mut meta = serde_json::Map::new();
         meta.insert(
             "claudeCode".to_string(),
@@ -8921,7 +9481,7 @@ mod tests {
 
     #[test]
     fn pick_option_id_finds_allow_once() {
-        use agent_client_protocol::schema::{PermissionOption, PermissionOptionId};
+        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
         let options = vec![
             PermissionOption::new(
                 PermissionOptionId::new("yes"),
@@ -8940,7 +9500,7 @@ mod tests {
 
     #[test]
     fn pick_option_id_falls_back() {
-        use agent_client_protocol::schema::{PermissionOption, PermissionOptionId};
+        use agent_client_protocol::schema::v1::{PermissionOption, PermissionOptionId};
         let options = vec![PermissionOption::new(
             PermissionOptionId::new("always"),
             "Always",
@@ -9059,7 +9619,7 @@ mod tests {
 
     #[test]
     fn extract_tool_content_text_concats_text_blocks() {
-        use agent_client_protocol::schema::{Content, ToolCallContent};
+        use agent_client_protocol::schema::v1::{Content, ToolCallContent};
         let blocks = vec![
             ToolCallContent::Content(Content::new("stdout line 1")),
             ToolCallContent::Content(Content::new("stdout line 2")),
@@ -9078,7 +9638,7 @@ mod tests {
 
     #[test]
     fn detect_off_protocol_work_completed_matches_async_agent_prefix() {
-        use agent_client_protocol::schema::{Content, ToolCallContent};
+        use agent_client_protocol::schema::v1::{Content, ToolCallContent};
         let blocks = vec![ToolCallContent::Content(Content::new(
             "Async agent launched successfully.\nagentId: af2a6a5d46bc21f91 (internal ID)",
         ))];
@@ -9090,7 +9650,7 @@ mod tests {
 
     #[test]
     fn detect_off_protocol_work_completed_matches_background_command_prefix() {
-        use agent_client_protocol::schema::{Content, ToolCallContent};
+        use agent_client_protocol::schema::v1::{Content, ToolCallContent};
         let blocks = vec![ToolCallContent::Content(Content::new(
             "Command running in background with ID: bgxe33hwb. Output is being written to: /tmp/x",
         ))];
@@ -9102,7 +9662,7 @@ mod tests {
 
     #[test]
     fn detect_off_protocol_work_completed_none_on_regular_completion() {
-        use agent_client_protocol::schema::{Content, ToolCallContent};
+        use agent_client_protocol::schema::v1::{Content, ToolCallContent};
         let blocks = vec![ToolCallContent::Content(Content::new(
             "abc1234 first commit\nabc1235 second commit",
         ))];
@@ -9126,7 +9686,7 @@ mod tests {
         // an echo or grep that includes the phrase) must NOT trip
         // off-protocol suppression. Match anchors at the start of a
         // line, not anywhere in the content.
-        use agent_client_protocol::schema::{Content, ToolCallContent};
+        use agent_client_protocol::schema::v1::{Content, ToolCallContent};
         let blocks = vec![ToolCallContent::Content(Content::new(
             "user typed: Command running in background with ID: pretend\nbye",
         ))];
@@ -9143,7 +9703,7 @@ mod tests {
         // The marker may not be the first character of the block;
         // a leading newline or whitespace must not break detection
         // as long as the marker starts the (trimmed) line.
-        use agent_client_protocol::schema::{Content, ToolCallContent};
+        use agent_client_protocol::schema::v1::{Content, ToolCallContent};
         let blocks = vec![ToolCallContent::Content(Content::new(
             "\n  Command running in background with ID: btest. log: /tmp/x",
         ))];
@@ -9155,7 +9715,9 @@ mod tests {
 
     #[test]
     fn wakeup_lifecycle_signal_from_completed_tool_call_update() {
-        use agent_client_protocol::schema::{ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields};
+        use agent_client_protocol::schema::v1::{
+            ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
         let fields = ToolCallUpdateFields::new()
             .status(ToolCallStatus::Completed)
             .title("ScheduleWakeup".to_string())
@@ -9174,7 +9736,7 @@ mod tests {
         // tool could still fail. Watchdog suppression must wait until
         // a successful ToolCallUpdate { Completed }. See CodeRabbit
         // review on PR #1406.
-        use agent_client_protocol::schema::ToolCall;
+        use agent_client_protocol::schema::v1::ToolCall;
         let mut tc = ToolCall::new("tc-wake-2", "ScheduleWakeup");
         tc.raw_input = Some(serde_json::json!({ "delaySeconds": 60 }));
         let sig = wakeup_lifecycle_signal_from_update(
@@ -9189,7 +9751,9 @@ mod tests {
         // A failed ScheduleWakeup means no wakeup was actually
         // registered; suppressing for `delay + base_grace` would
         // hide a real adapter wedge.
-        use agent_client_protocol::schema::{ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields};
+        use agent_client_protocol::schema::v1::{
+            ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
         let fields = ToolCallUpdateFields::new()
             .status(ToolCallStatus::Failed)
             .title("ScheduleWakeup".to_string())
@@ -9209,7 +9773,9 @@ mod tests {
         // it from the final `Completed` frame. Requiring strictly
         // Completed status would lose the wakeup; we gate only on
         // not-Failed.
-        use agent_client_protocol::schema::{ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields};
+        use agent_client_protocol::schema::v1::{
+            ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
         let fields = ToolCallUpdateFields::new()
             .status(ToolCallStatus::InProgress)
             .title("ScheduleWakeup".to_string())
@@ -9224,7 +9790,7 @@ mod tests {
 
     #[test]
     fn classify_watchdog_notification_signals_ignores_ambient_updates() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             AvailableCommand as AcpAvailableCommand, AvailableCommandsUpdate,
         };
         let update = SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
@@ -9240,7 +9806,7 @@ mod tests {
 
     #[test]
     fn classify_watchdog_notification_signals_marks_lifecycle_updates() {
-        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields};
         let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
             "tc-lifecycle-1",
             ToolCallUpdateFields::new(),
@@ -9255,7 +9821,7 @@ mod tests {
 
     #[test]
     fn classify_watchdog_notification_signals_suppresses_during_history_replay() {
-        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields};
         let update = SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
             "tc-suppressed-1",
             ToolCallUpdateFields::new(),
@@ -9270,7 +9836,7 @@ mod tests {
 
     #[test]
     fn classify_lifecycle_signal_marks_async_agent_completion() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
         };
         let fields = ToolCallUpdateFields::new()
@@ -9297,7 +9863,7 @@ mod tests {
 
     #[test]
     fn classify_lifecycle_signal_marks_background_command_completion() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
         };
         let fields = ToolCallUpdateFields::new()
@@ -9327,7 +9893,7 @@ mod tests {
 
     #[test]
     fn classify_lifecycle_signal_clears_off_protocol_on_regular_completion() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
         };
         let fields = ToolCallUpdateFields::new()
@@ -9352,7 +9918,7 @@ mod tests {
 
     #[test]
     fn classify_lifecycle_signal_failed_ignores_off_protocol_marker() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
         };
         let fields = ToolCallUpdateFields::new()
@@ -9486,7 +10052,7 @@ mod tests {
 
     #[test]
     fn classify_lifecycle_signal_tool_call_carries_run_in_background_flag() {
-        use agent_client_protocol::schema::ToolCall;
+        use agent_client_protocol::schema::v1::ToolCall;
         let mut tc = ToolCall::new("tc-bg-2", "Bash");
         tc.raw_input = Some(serde_json::json!({
             "command": "npm install",
@@ -9549,7 +10115,9 @@ mod tests {
         // payload under `_meta.claudeCode`. It must map to a typed
         // BackgroundAgentLaunched, not a raw passthrough. This is the
         // path the unit test on the helper alone did not cover.
-        use agent_client_protocol::schema::{SessionUpdate, ToolCallUpdate, ToolCallUpdateFields};
+        use agent_client_protocol::schema::v1::{
+            SessionUpdate, ToolCallUpdate, ToolCallUpdateFields,
+        };
         let mut meta = serde_json::Map::new();
         meta.insert(
             "claudeCode".to_string(),
@@ -9615,7 +10183,7 @@ mod tests {
 
     #[test]
     fn classify_lifecycle_signal_tool_call_defaults_run_in_background_false() {
-        use agent_client_protocol::schema::ToolCall;
+        use agent_client_protocol::schema::v1::ToolCall;
         let mut tc = ToolCall::new("tc-fg-1", "Bash");
         tc.raw_input = Some(serde_json::json!({ "command": "ls" }));
         match classify_lifecycle_signal(&SessionUpdate::ToolCall(tc)) {
@@ -9628,7 +10196,7 @@ mod tests {
 
     #[test]
     fn map_tool_call_update_completed_carries_content() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
         };
         let fields = ToolCallUpdateFields::new()
@@ -9664,7 +10232,7 @@ mod tests {
         // marker while the sub-agent runs off-protocol. The completion
         // event must carry async_subagent so renderers draw a background
         // card and drop the marker body (it leaks an internal agent id).
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
         };
         let fields = ToolCallUpdateFields::new()
@@ -9688,7 +10256,7 @@ mod tests {
 
     #[test]
     fn map_tool_call_update_normal_completion_is_not_async_subagent() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
         };
         let fields = ToolCallUpdateFields::new()
@@ -9713,7 +10281,7 @@ mod tests {
         // Imported sessions replay prior user turns as user_message_chunk
         // (#2276); they must map to UserPromptSent so the user's bubbles
         // render, not get dropped to a raw event.
-        use agent_client_protocol::schema::{ContentBlock, ContentChunk, TextContent};
+        use agent_client_protocol::schema::v1::{ContentBlock, ContentChunk, TextContent};
         let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new("hello from the past")));
         let events = map_update_to_events(
             SessionUpdate::UserMessageChunk(chunk),
@@ -9730,7 +10298,7 @@ mod tests {
     }
 
     fn mode_from_current_mode_update(id: &str) -> SessionMode {
-        use agent_client_protocol::schema::CurrentModeUpdate;
+        use agent_client_protocol::schema::v1::CurrentModeUpdate;
         let events = map_update_to_events(
             SessionUpdate::CurrentModeUpdate(CurrentModeUpdate::new(id.to_string())),
             &agent_profiles::CLAUDE,
@@ -9852,7 +10420,7 @@ mod tests {
 
     #[test]
     fn map_tool_call_update_in_progress_with_content_emits_streaming_event() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
         };
         let fields = ToolCallUpdateFields::new()
@@ -9893,7 +10461,9 @@ mod tests {
 
     #[test]
     fn map_tool_call_update_in_progress_restamps_started_at() {
-        use agent_client_protocol::schema::{ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields};
+        use agent_client_protocol::schema::v1::{
+            ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+        };
         let fields = ToolCallUpdateFields::new().status(ToolCallStatus::InProgress);
         let update = ToolCallUpdate::new("tc-3", fields);
         let events = map_update_to_events(
@@ -9924,7 +10494,7 @@ mod tests {
 
     #[test]
     fn extract_diffs_from_content_bridges_diff_blocks_and_ignores_others() {
-        use agent_client_protocol::schema::{Content, Diff, ToolCallContent};
+        use agent_client_protocol::schema::v1::{Content, Diff, ToolCallContent};
         let blocks = vec![
             ToolCallContent::Content(Content::new("some text")),
             ToolCallContent::Diff(Diff::new("src/foo.rs", "new body").old_text("old body")),
@@ -9943,7 +10513,7 @@ mod tests {
 
     #[test]
     fn extract_diffs_from_content_caps_per_side_text() {
-        use agent_client_protocol::schema::{Diff, ToolCallContent};
+        use agent_client_protocol::schema::v1::{Diff, ToolCallContent};
         let huge = "x".repeat(MAX_DIFF_TEXT_BYTES + 4096);
         let blocks = vec![ToolCallContent::Diff(
             Diff::new("src/big.rs", huge.clone()).old_text(huge),
@@ -9969,7 +10539,7 @@ mod tests {
 
     #[test]
     fn extract_tool_output_blocks_empty_for_text_only() {
-        use agent_client_protocol::schema::{Content, ToolCallContent};
+        use agent_client_protocol::schema::v1::{Content, ToolCallContent};
         // Pure text completion: the `content` string path renders it, so the
         // structured list stays empty and the existing path is untouched.
         let blocks = vec![ToolCallContent::Content(Content::new("just text"))];
@@ -9978,7 +10548,7 @@ mod tests {
 
     #[test]
     fn extract_tool_output_blocks_preserves_media_and_resources() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             AudioContent, Content, ContentBlock, EmbeddedResource, EmbeddedResourceResource,
             ImageContent, ResourceLink, TextResourceContents, ToolCallContent,
         };
@@ -10031,7 +10601,7 @@ mod tests {
     fn extract_tool_output_blocks_keeps_blob_resource_payload() {
         // #1818 review: a binary (blob) embedded resource must keep its
         // inline bytes so it stays recoverable as a download.
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             BlobResourceContents, Content, ContentBlock, EmbeddedResource,
             EmbeddedResourceResource, ToolCallContent,
         };
@@ -10063,7 +10633,9 @@ mod tests {
 
     #[test]
     fn extract_tool_output_blocks_drops_oversized_inline_media() {
-        use agent_client_protocol::schema::{Content, ContentBlock, ImageContent, ToolCallContent};
+        use agent_client_protocol::schema::v1::{
+            Content, ContentBlock, ImageContent, ToolCallContent,
+        };
         let huge = "A".repeat(MAX_INLINE_MEDIA_B64 + 1);
         let blocks = vec![ToolCallContent::Content(Content::new(ContentBlock::Image(
             ImageContent::new(huge, "image/png"),
@@ -10084,7 +10656,7 @@ mod tests {
 
     #[test]
     fn extract_diffs_from_content_caps_diff_count() {
-        use agent_client_protocol::schema::{Diff, ToolCallContent};
+        use agent_client_protocol::schema::v1::{Diff, ToolCallContent};
         let blocks: Vec<ToolCallContent> = (0..MAX_TOOL_DIFFS + 8)
             .map(|i| ToolCallContent::Diff(Diff::new(format!("f{i}.rs"), "x")))
             .collect();
@@ -10097,7 +10669,7 @@ mod tests {
         // Codex attaches the apply_patch diff to the initial `tool_call`
         // frame as ToolCallContent::Diff. The edit card reads path + preview
         // from ToolCall.diffs, so it must survive ingest. See #1721.
-        use agent_client_protocol::schema::{Diff, ToolCall, ToolCallContent, ToolKind};
+        use agent_client_protocol::schema::v1::{Diff, ToolCall, ToolCallContent, ToolKind};
         let mut tc = ToolCall::new("tc-edit-1", "Edit src/foo.rs");
         tc.kind = ToolKind::Edit;
         tc.content = vec![ToolCallContent::Diff(
@@ -10119,7 +10691,7 @@ mod tests {
         // Codex also re-sends the diff on the in-progress and completion
         // updates; those must reach the reducer via ToolCallUpdated.diffs so
         // a late-arriving diff still lands on the card. See #1721.
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             Diff, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
         };
         let fields = ToolCallUpdateFields::new()
@@ -10148,7 +10720,7 @@ mod tests {
     fn map_tool_call_update_text_only_leaves_diffs_none() {
         // A text-only update must not carry Some([]) (which would wipe an
         // earlier frame's diffs in the reducer). See #1721.
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             Content, ToolCallContent, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
         };
         let fields = ToolCallUpdateFields::new()
@@ -10176,7 +10748,7 @@ mod tests {
         // the slack so `Event::WakeupScheduled` lands in the store
         // (sidebar `⏰ in Nm` chip + structured view "Asleep until…" banner
         // depend on it). Regression for #1091.
-        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields};
         let fields = ToolCallUpdateFields::new()
             .title("ScheduleWakeup".to_string())
             .raw_input(serde_json::json!({
@@ -10216,7 +10788,7 @@ mod tests {
         // Title-only update (the initial frame's mirror, before
         // raw_input arrives) must NOT emit a WakeupScheduled, otherwise
         // we'd publish a "wakeup at epoch zero" placeholder.
-        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields};
         let fields = ToolCallUpdateFields::new().title("ScheduleWakeup".to_string());
         let update = ToolCallUpdate::new("toolu_test", fields);
         let events = map_update_to_events(
@@ -10238,7 +10810,7 @@ mod tests {
         // `description` arrive on a follow-up `ToolCallUpdate`. That update
         // must emit MonitorArmed so the sidebar shows a "monitoring" badge
         // instead of a plain grey idle dot.
-        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields};
         let fields = ToolCallUpdateFields::new()
             .title("Monitor".to_string())
             .raw_input(serde_json::json!({
@@ -10268,7 +10840,7 @@ mod tests {
     fn map_tool_call_update_skips_monitor_when_args_empty() {
         // The initial title-only / empty-args frame must NOT arm the badge;
         // only the populated follow-up update does.
-        use agent_client_protocol::schema::{ToolCallUpdate, ToolCallUpdateFields};
+        use agent_client_protocol::schema::v1::{ToolCallUpdate, ToolCallUpdateFields};
         let fields = ToolCallUpdateFields::new()
             .title("Monitor".to_string())
             .raw_input(serde_json::json!({}));
@@ -10287,7 +10859,7 @@ mod tests {
 
     #[test]
     fn map_session_info_update_ignores_pushed_title() {
-        use agent_client_protocol::schema::SessionInfoUpdate;
+        use agent_client_protocol::schema::v1::SessionInfoUpdate;
         let info = SessionInfoUpdate::new().title("Fix the flaky test".to_string());
         let events = map_update_to_events(
             SessionUpdate::SessionInfoUpdate(info),
@@ -10298,7 +10870,7 @@ mod tests {
 
     #[test]
     fn map_session_info_update_without_title_emits_nothing() {
-        use agent_client_protocol::schema::SessionInfoUpdate;
+        use agent_client_protocol::schema::v1::SessionInfoUpdate;
         // Null/undefined title (e.g. a timestamp-only update) yields no event.
         let info = SessionInfoUpdate::new().updated_at("2026-06-25T00:00:00Z".to_string());
         let events = map_update_to_events(
@@ -10310,7 +10882,7 @@ mod tests {
 
     #[test]
     fn map_usage_update_emits_typed_usage_event() {
-        use agent_client_protocol::schema::{Cost, UsageUpdate};
+        use agent_client_protocol::schema::v1::{Cost, UsageUpdate};
         let u = UsageUpdate::new(12_345, 200_000).cost(Cost::new(0.42, "USD"));
         let events = map_update_to_events(SessionUpdate::UsageUpdate(u), &agent_profiles::CLAUDE);
         assert_eq!(events.len(), 1);
@@ -10328,7 +10900,7 @@ mod tests {
 
     #[test]
     fn map_available_commands_update_emits_typed_event() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             AvailableCommand as AcpAvailableCommand, AvailableCommandInput,
             AvailableCommandsUpdate, UnstructuredCommandInput,
         };
@@ -10358,7 +10930,7 @@ mod tests {
 
     #[test]
     fn map_config_option_update_emits_typed_event_with_categories() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             ConfigOptionUpdate, SessionConfigKind, SessionConfigOption,
             SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption,
             SessionConfigSelectOptions,
@@ -10431,7 +11003,7 @@ mod tests {
         // upstream variant, which cannot be constructed against the
         // current `#[non_exhaustive]` schema, so it is verified by
         // inspection rather than a unit test.)
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             ConfigOptionUpdate, SessionConfigKind, SessionConfigOption,
             SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption,
             SessionConfigSelectOptions,
@@ -10535,6 +11107,16 @@ mod tests {
         assert!(provider_env_denyreason("AOE_AGENT_MODEL").is_none());
         // Custom provider keys should pass through.
         assert!(provider_env_denyreason("MY_CUSTOM_VAR").is_none());
+    }
+
+    #[test]
+    fn always_forward_env_includes_ssh_auth_sock() {
+        // Regression guard for #2691: without SSH_AUTH_SOCK in the shared
+        // forward list, git-over-SSH has no ssh-agent socket to reach.
+        // Both spawn paths (`apply_env_filter`, `spawn_subprocess`) read
+        // this one const, so its membership is also the parity guarantee
+        // between the runner path and the in-proc stdio path.
+        assert!(ALWAYS_FORWARD_ENV.contains(&"SSH_AUTH_SOCK"));
     }
 
     #[test]

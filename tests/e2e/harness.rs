@@ -202,6 +202,11 @@ pub struct TuiTestHarness {
     /// before killing the tmux session, so a panicking assertion can't
     /// leak a daemon between serial tests.
     stop_daemon_on_drop: bool,
+    /// When true, `install_acp_shim` bakes `FAKE_ACP_FORK_FAIL=1` into the shim
+    /// so the fake agent rejects `session/fork`. Baked into the shim (not the
+    /// daemon env) because the daemon `env_clear`s and allowlists env before
+    /// spawning the worker, so a `set_env` knob would never reach the fake.
+    acp_fork_fail: bool,
 }
 
 #[allow(dead_code)]
@@ -280,6 +285,8 @@ last_seen_version = "{}"
             eprintln!("RECORD_E2E is set but asciinema is not installed -- recording disabled");
         }
 
+        let tmux_socket_env = socket_path.display().to_string();
+
         Self {
             session_name,
             test_name: test_name.to_string(),
@@ -291,9 +298,15 @@ last_seen_version = "{}"
             spawned: false,
             recording,
             cast_path: None,
-            extra_env: Vec::new(),
+            // Pin the spawned aoe to the same tmux socket the harness drives
+            // and inspects. aoe now routes every tmux call through an explicit
+            // `-S <socket>` (#2608) instead of inheriting `$TMUX`, so without
+            // this it would land on its own app-dir socket and the harness
+            // would see none of its sessions.
+            extra_env: vec![("AOE_TMUX_SOCKET".to_string(), tmux_socket_env)],
             extra_path_dirs: Vec::new(),
             stop_daemon_on_drop: false,
+            acp_fork_fail: false,
         }
     }
 
@@ -318,6 +331,14 @@ last_seen_version = "{}"
         self.extra_env.push((key.to_string(), value.to_string()));
     }
 
+    /// Make the fake ACP agent reject `session/fork` (for fork-failure tests).
+    /// Must be called BEFORE `install_acp_shim` so the knob is baked into the
+    /// shim: the daemon strips arbitrary env before spawning the worker, so a
+    /// `set_env` knob would never reach the fake.
+    pub fn set_acp_fork_fail(&mut self) {
+        self.acp_fork_fail = true;
+    }
+
     /// Install the shared Node fake-ACP agent as the `claude`,
     /// `claude-agent-acp`, and `aoe-agent` commands on PATH. The structured view
     /// supervisor resolves the `claude` tool key to the `claude-agent-acp`
@@ -337,10 +358,18 @@ last_seen_version = "{}"
             fake_agent.display()
         );
         let debug_log = app_dir_in(self.home_dir.path()).join("fake-acp.log");
+        // Bake the fork-fail knob into the shim (not the daemon env) so it
+        // survives the daemon's env_clear + allowlist when spawning the worker.
+        let fork_fail_line = if self.acp_fork_fail {
+            "export FAKE_ACP_FORK_FAIL=\"1\"\n"
+        } else {
+            ""
+        };
         let script = format!(
-            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\nexec node \"{}\" \"$@\"\n",
+            "#!/bin/sh\nexport FAKE_ACP_SCRIPT=\"{}\"\nexport FAKE_ACP_DEBUG_LOG=\"{}\"\n{}exec node \"{}\" \"$@\"\n",
             fake_acp_script.display(),
             debug_log.display(),
+            fork_fail_line,
             fake_agent.display(),
         );
         for name in ["claude", "claude-agent-acp", "aoe-agent"] {

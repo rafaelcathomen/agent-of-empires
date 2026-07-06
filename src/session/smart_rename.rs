@@ -17,6 +17,12 @@ use crate::agents;
 use crate::session::civilizations::is_default_civ_name;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::path::Path;
+
+/// Cap on concurrent smart-rename one-shots across the process. Two slots keep
+/// steady-state throughput on multi-core hosts without letting N stuck
+/// sessions each hold a slot for up to `ONESHOT_TIMEOUT`. See #2348.
+pub const MAX_CONCURRENT: usize = 2;
 
 /// Per-session smart-rename state surfaced to the dashboard so the sidebar can
 /// show that a session will be (or is being) auto-named. `Inactive` for
@@ -150,6 +156,32 @@ pub fn check_eligible_resolved(
     Ok(agent.expect("check_eligible Ok implies a built-in agent"))
 }
 
+/// Config fields the smart-rename indicator and runtime gate both consume.
+/// Named fields (rather than a tuple) prevent the sidebar `cfg_cache` and
+/// `try_smart_rename` from drifting on positional order.
+#[derive(Debug, Clone)]
+pub struct SmartRenameConfig {
+    pub setting_on: bool,
+    pub rename_agent: String,
+    pub overrides: HashMap<String, String>,
+}
+
+/// Resolve smart-rename config for a session, honoring repo-local overrides
+/// in `<project_path>/.agent-of-empires/config.toml`. Shared helper so
+/// `try_smart_rename` and the sidebar indicator overlay in
+/// `src/server/api/sessions.rs` cannot drift. Falls back to the
+/// profile-only config (with a warning) on a missing or malformed repo
+/// config, matching [`crate::session::repo_config::resolve_config_with_repo_or_warn`].
+pub fn resolve_smart_rename_config(profile: &str, project_path: &Path) -> SmartRenameConfig {
+    let cfg = crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
+        .session;
+    SmartRenameConfig {
+        setting_on: cfg.smart_rename,
+        rename_agent: cfg.smart_rename_agent,
+        overrides: cfg.agent_command_override,
+    }
+}
+
 /// Hard cap on how much of the user's first message is handed to the one-shot
 /// call. A title needs only the opening intent, and very large argv values can
 /// trip some shells/agents.
@@ -179,17 +211,24 @@ pub fn build_prompt(user_message: &str) -> String {
 }
 
 /// Build the argv for a one-shot title call, or `None` when the agent has no
-/// known one-shot mode. Always `[binary, oneshot_token, prompt]`: the prompt is
-/// a single argv element passed straight to the process, never interpolated
-/// into a shell string, so untrusted user text cannot inject arguments.
+/// known one-shot mode. Shape is `[binary, oneshot_token, extra.., prompt,
+/// trailing..]`: the prompt is a single argv element passed straight to the
+/// process, never interpolated into a shell string, so untrusted user text
+/// cannot inject arguments. `oneshot_trailing_args` is only populated for
+/// flag-value one-shots (e.g. copilot `-p`), where the CLI binds the prompt to
+/// the flag, so trailing flags after it stay unambiguous.
 pub fn build_oneshot_argv(agent: &agents::AgentDef, prompt: &str) -> Option<Vec<String>> {
     let token = agent.oneshot_flag?;
     let mut argv = vec![agent.binary.to_string(), token.to_string()];
     // Static per-agent flags (e.g. codex `--skip-git-repo-check`) go between the
-    // one-shot token and the prompt; the prompt stays the final argv element so
+    // one-shot token and the prompt; the prompt stays directly after them so
     // untrusted user text can never be read as an argument.
     argv.extend(agent.oneshot_extra_args().iter().map(|s| s.to_string()));
     argv.push(prompt.to_string());
+    // Static trailing flags (e.g. copilot `-s --allow-all-tools --no-ask-user`)
+    // follow the prompt for flag-value one-shots; the CLI has already bound the
+    // prompt to the one-shot flag, so these parse as options, not the prompt.
+    argv.extend(agent.oneshot_trailing_args().iter().map(|s| s.to_string()));
     Some(argv)
 }
 
@@ -297,7 +336,7 @@ fn truncate_bytes(s: &str, max: usize) -> &str {
 }
 
 #[cfg(feature = "serve")]
-pub use serve::try_smart_rename;
+pub use serve::{should_trigger_smart_rename, try_smart_rename};
 
 #[cfg(feature = "serve")]
 mod serve {
@@ -307,14 +346,33 @@ mod serve {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    // The one-shot is spawned from the prompt handler at the same instant the
-    // session's own worker starts its first heavy turn, so the two contend for
-    // CPU and the same provider API. Standalone the call finishes well under
-    // 12s; under that contention it can run far longer. 120s absorbs the
-    // contention without a deeper scheduling change (deferring the one-shot
-    // until the live turn settles is tracked as a follow-up). The child is
-    // killed on drop, so a timed-out call leaves no orphan.
-    const ONESHOT_TIMEOUT: Duration = Duration::from_secs(120);
+    // Since #2348 the one-shot is deferred to the first `prompt_complete`
+    // `Event::Stopped`, so it no longer races the live worker for the same
+    // provider API. Standalone the call finishes well under 12s; 60s is a
+    // conservative ceiling that leaves headroom for cold agent starts without
+    // holding a global-semaphore slot as long as #2347's 120s band-aid did.
+    // The child is killed on drop, so a timed-out call leaves no orphan.
+    const ONESHOT_TIMEOUT: Duration = Duration::from_secs(60);
+
+    /// Should this ACP broadcast event trigger a smart-rename one-shot for its
+    /// session? Cheap sync predicate: reason-allowlists `prompt_complete` (all
+    /// other `Stopped` reasons like `user_stopped`, `rate_limited`,
+    /// `agent_unresponsive`, `reattach_idle` are either not turn boundaries or
+    /// states where auto-renaming would be intrusive), and short-circuits on
+    /// the two per-session gates so the listener drops non-matching events
+    /// before touching the event store or spawning a task. See #2348.
+    pub fn should_trigger_smart_rename(
+        event: &crate::acp::state::Event,
+        session_id: &str,
+        attempted: &HashSet<String>,
+        inflight: &HashSet<String>,
+    ) -> bool {
+        let is_clean_stop = matches!(
+            event,
+            crate::acp::state::Event::Stopped { reason } if reason == "prompt_complete"
+        );
+        is_clean_stop && !attempted.contains(session_id) && !inflight.contains(session_id)
+    }
 
     /// Marks a session as having an in-flight one-shot rename so a burst of
     /// rapid first prompts cannot spawn concurrent title generators. Removed on
@@ -327,13 +385,11 @@ mod serve {
     impl<'a> InflightGuard<'a> {
         fn acquire(set: &'a Mutex<HashSet<String>>, id: &str) -> Option<Self> {
             let mut guard = set.lock().expect("smart_rename_inflight poisoned");
-            if !guard.insert(id.to_string()) {
+            let id = id.to_string();
+            if !guard.insert(id.clone()) {
                 return None;
             }
-            Some(Self {
-                set,
-                id: id.to_string(),
-            })
+            Some(Self { set, id })
         }
     }
 
@@ -372,16 +428,16 @@ mod serve {
             return;
         };
 
-        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        let cfg = resolve_smart_rename_config(&profile, Path::new(&project_path));
         let agent = match check_eligible_resolved(
             structured,
-            config.session.smart_rename,
+            cfg.setting_on,
             &title,
             &tool,
-            &config.session.smart_rename_agent,
+            &cfg.rename_agent,
             sandboxed,
             &command,
-            &config.session.agent_command_override,
+            &cfg.overrides,
         ) {
             Ok(agent) => agent,
             Err(reason) => {
@@ -403,7 +459,18 @@ mod serve {
         // session attempted in that case: a transient slow first prompt (cold
         // agent start) must not permanently disable naming. A later prompt
         // retries. The inflight guard above already prevents concurrent spawns.
-        let Some(raw) = run_oneshot(&argv, &project_path).await else {
+        //
+        // The permit is scoped tightly around `run_oneshot` so ineligible /
+        // early-return paths above never consume a slot. Same-session duplicates
+        // are already rejected by the InflightGuard, so this permit only gates
+        // cross-session concurrency (#2348).
+        let raw = {
+            let Ok(_permit) = state.smart_rename_semaphore.acquire().await else {
+                return;
+            };
+            run_oneshot(&session_id, &argv, &project_path).await
+        };
+        let Some(raw) = raw else {
             return;
         };
 
@@ -432,7 +499,7 @@ mod serve {
     /// Run the agent one-shot in the session's working directory, capturing
     /// stdout. Returns `None` on spawn error, non-zero exit, or timeout. The
     /// child is killed on drop, so a timed-out call leaves no orphan.
-    async fn run_oneshot(argv: &[String], cwd: &str) -> Option<String> {
+    async fn run_oneshot(session_id: &str, argv: &[String], cwd: &str) -> Option<String> {
         use tokio::process::Command;
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..])
@@ -449,7 +516,7 @@ mod serve {
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                tracing::debug!(target: "smart_rename", "one-shot spawn failed: {e}");
+                tracing::debug!(target: "smart_rename", session = %session_id, "one-shot spawn failed: {e}");
                 return None;
             }
         };
@@ -468,15 +535,15 @@ mod serve {
                     .into_iter()
                     .rev()
                     .collect();
-                tracing::debug!(target: "smart_rename", code = ?out.status.code(), stderr = %tail, "one-shot exited non-zero");
+                tracing::debug!(target: "smart_rename", session = %session_id, code = ?out.status.code(), stderr = %tail, "one-shot exited non-zero");
                 None
             }
             Ok(Err(e)) => {
-                tracing::debug!(target: "smart_rename", "one-shot io error: {e}");
+                tracing::debug!(target: "smart_rename", session = %session_id, "one-shot io error: {e}");
                 None
             }
             Err(_) => {
-                tracing::debug!(target: "smart_rename", "one-shot timed out");
+                tracing::debug!(target: "smart_rename", session = %session_id, "one-shot timed out");
                 None
             }
         }
@@ -570,7 +637,7 @@ mod serve {
                 "-p".to_string(),
                 "title this".to_string(),
             ];
-            assert!(run_oneshot(&argv, "").await.is_none());
+            assert!(run_oneshot("test-session", &argv, "").await.is_none());
         }
 
         #[test]
@@ -593,6 +660,133 @@ mod serve {
             legacy.title = "Hand-picked name".to_string();
             legacy.last_auto_title = None;
             assert!(!title_is_auto_overwritable(&legacy));
+        }
+
+        #[test]
+        fn oneshot_timeout_is_60s() {
+            // Drift-guard against future bump-back: #2347 raised this to 120s
+            // to absorb the prompt-handler race; #2348 removed the race at
+            // source, so this should stay at the deferred-trigger ceiling.
+            assert_eq!(ONESHOT_TIMEOUT, Duration::from_secs(60));
+        }
+
+        #[test]
+        fn should_trigger_smart_rename_only_on_clean_prompt_complete_stop() {
+            use crate::acp::state::Event;
+            let id = "s-1";
+            let empty: HashSet<String> = HashSet::new();
+
+            let clean = Event::Stopped {
+                reason: "prompt_complete".into(),
+            };
+            assert!(should_trigger_smart_rename(&clean, id, &empty, &empty));
+
+            for reason in [
+                "rate_limited",
+                "user_stopped",
+                "user_forced",
+                "agent_unresponsive",
+                "prompt_orphaned",
+                "reattach_idle",
+                "approval_cancelled_on_restart",
+                "restart_pending",
+            ] {
+                let ev = Event::Stopped {
+                    reason: reason.into(),
+                };
+                assert!(
+                    !should_trigger_smart_rename(&ev, id, &empty, &empty),
+                    "reason={reason} should not fire smart-rename"
+                );
+            }
+
+            let non_stop = Event::UserPromptSent {
+                text: "hi".into(),
+                attachments: vec![],
+            };
+            assert!(!should_trigger_smart_rename(&non_stop, id, &empty, &empty));
+
+            let mut attempted = HashSet::new();
+            attempted.insert(id.to_string());
+            assert!(
+                !should_trigger_smart_rename(&clean, id, &attempted, &empty),
+                "attempted-gate must short-circuit even for prompt_complete"
+            );
+
+            let mut inflight = HashSet::new();
+            inflight.insert(id.to_string());
+            assert!(
+                !should_trigger_smart_rename(&clean, id, &empty, &inflight),
+                "inflight-gate must short-circuit even for prompt_complete"
+            );
+
+            assert!(
+                should_trigger_smart_rename(&clean, "other-session", &attempted, &empty),
+                "gates must be per-session, not global"
+            );
+        }
+
+        #[tokio::test]
+        async fn smart_rename_semaphore_bounds_concurrent_permits_to_max() {
+            // A burst of would-be one-shots must see peak concurrency capped
+            // at MAX_CONCURRENT, so N stuck sessions cannot fan out into N
+            // host processes each holding a slot for `ONESHOT_TIMEOUT`.
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            use tokio::sync::Semaphore;
+
+            let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
+            let live = Arc::new(AtomicUsize::new(0));
+            let peak = Arc::new(AtomicUsize::new(0));
+
+            let mut handles = Vec::new();
+            for _ in 0..5 {
+                let sem = sem.clone();
+                let live = live.clone();
+                let peak = peak.clone();
+                handles.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await.expect("semaphore closed");
+                    let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    live.fetch_sub(1, Ordering::SeqCst);
+                }));
+            }
+            for h in handles {
+                h.await.expect("permit task panicked");
+            }
+
+            let seen = peak.load(Ordering::SeqCst);
+            assert!(
+                seen <= MAX_CONCURRENT,
+                "peak concurrency {seen} exceeded cap {MAX_CONCURRENT}"
+            );
+            assert!(
+                seen >= 2,
+                "expected the burst to actually saturate the pool (seen={seen})"
+            );
+        }
+
+        #[test]
+        fn force_smart_rename_attempted_clear_re_enables_retry() {
+            // `force_smart_rename` at sessions.rs:2582-2587 clears the
+            // attempted gate before spawning `try_smart_rename`, and does NOT
+            // wait for an `Event::Stopped`: the manual retry path stays
+            // on-demand. The bounding is delegated to the shared semaphore
+            // acquired inside `try_smart_rename`. This test emulates the
+            // clear step and asserts the predicate would fire again for the
+            // same session (which the listener uses; force_smart_rename itself
+            // skips the predicate and spawns directly).
+            use crate::acp::state::Event;
+            let id = "s-1";
+            let mut attempted = HashSet::new();
+            attempted.insert(id.to_string());
+            let inflight = HashSet::new();
+            let ev = Event::Stopped {
+                reason: "prompt_complete".into(),
+            };
+            assert!(!should_trigger_smart_rename(&ev, id, &attempted, &inflight));
+            attempted.remove(id);
+            assert!(should_trigger_smart_rename(&ev, id, &attempted, &inflight));
         }
     }
 }
@@ -682,6 +876,27 @@ mod tests {
         assert_eq!(
             build_oneshot_argv(claude(), "name this").unwrap(),
             vec!["claude", "-p", "name this"]
+        );
+    }
+
+    #[test]
+    fn argv_copilot_appends_silent_autoapprove_flags_after_prompt() {
+        // Copilot's `-p` binds the prompt as its value, so the auto-approve and
+        // silent flags follow the prompt. Without them a non-interactive title
+        // call can block on a permission prompt or print stats that pollute the
+        // title; with them stdout is just the final answer.
+        let argv = build_oneshot_argv(agents::get_agent("copilot").unwrap(), "name this")
+            .expect("copilot one-shot");
+        assert_eq!(
+            argv,
+            vec![
+                "copilot",
+                "-p",
+                "name this",
+                "-s",
+                "--allow-all-tools",
+                "--no-ask-user"
+            ]
         );
     }
 
@@ -873,5 +1088,57 @@ mod tests {
         assert!(sanitize_title(&"z".repeat(80), "x").is_none());
         // Numeric-only is not a title.
         assert!(sanitize_title("12345", "x").is_none());
+    }
+
+    // Regression for #2351: pins the shared helper that both `try_smart_rename`
+    // and the sidebar indicator overlay in `src/server/api/sessions.rs` route
+    // through. The helper is verified in isolation here; call-site coverage is
+    // design-level (reverting either site to bypass the helper is visible in
+    // review because both explicitly name `resolve_smart_rename_config`).
+    #[test]
+    #[serial_test::serial]
+    fn resolve_smart_rename_config_honors_repo_local_overrides() {
+        let home = tempfile::tempdir().expect("tempdir HOME");
+        // SAFETY: serialized by `#[serial]`; matches `set_tmp_home` in
+        // `src/session/mcp_state.rs`.
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
+        }
+
+        let repo = tempfile::tempdir().expect("tempdir repo");
+        let cfg_dir = repo.path().join(".agent-of-empires");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            r#"
+[session]
+smart_rename_agent = "opencode"
+
+[session.agent_command_override]
+claude = "my-wrapper"
+"#,
+        )
+        .unwrap();
+
+        let cfg = resolve_smart_rename_config("default", repo.path());
+        assert_eq!(cfg.rename_agent, "opencode");
+        assert_eq!(
+            cfg.overrides.get("claude").map(String::as_str),
+            Some("my-wrapper"),
+        );
+
+        let agent = check_eligible_resolved(
+            true,
+            cfg.setting_on,
+            "Vikings",
+            "claude",
+            &cfg.rename_agent,
+            false,
+            "",
+            &cfg.overrides,
+        )
+        .expect("eligible");
+        assert_eq!(agent.binary, "opencode");
     }
 }

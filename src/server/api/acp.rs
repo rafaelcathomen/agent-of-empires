@@ -1698,7 +1698,9 @@ pub async fn acp_enable(
         let tool = instance.tool.clone();
         let found = tokio::task::spawn_blocking(move || match tool.as_str() {
             "codex" => crate::acp::codex_import::find_rollout_for_cwd(&cwd).map(|r| r.session_id),
-            "claude" => crate::acp::claude_import::find_session_for_cwd(&cwd).map(|s| s.session_id),
+            "claude" => {
+                crate::session::claude_import::find_session_for_cwd(&cwd).map(|s| s.session_id)
+            }
             _ => None,
         })
         .await

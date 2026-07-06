@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::acp::claude_import::{
+use crate::session::claude_import::{
     cwd_is_aoe_scratch, cwd_under_worktree, normalize_cwd, worktree_dir_markers,
 };
 

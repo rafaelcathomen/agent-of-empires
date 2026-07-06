@@ -293,15 +293,31 @@ pub fn tmux_prefix_display() -> &'static str {
 }
 
 /// True when a tmux failure's stderr indicates there is no reachable server
-/// at all (as opposed to some other real failure), in the C locale: either a
-/// clean "never started" (`no server running`) or a stale/dead socket left
-/// behind by a crashed server (`error connecting`, e.g. after an unclean
-/// shutdown that didn't remove its socket file). Distinct from a
-/// session-specific "not found" message (see [`kill_session_if_present`]),
-/// which callers check separately since it doesn't apply to server-wide
-/// probes like `list-panes -a` / `list-sessions`.
+/// at all (as opposed to some other real failure), in the C locale.
+///
+/// tmux's `client_connect()` (verified against its 3.4 source) reports
+/// `no server running on %s` only for `ECONNREFUSED` (a dead/stale socket
+/// left behind by a crashed server); every *other* connect-time errno
+/// produces `error connecting to %s (%s)` with `strerror(errno)` filled in,
+/// including ones that do NOT mean "no server" -- `EACCES` ("Permission
+/// denied") if the socket exists but this process can't reach it, or
+/// `EMFILE`/`ENFILE` ("Too many open files[...]") under fd pressure, both of
+/// which can happen against a perfectly live server. So `error connecting`
+/// only counts here when paired with `No such file or directory` (`ENOENT`:
+/// the socket path is genuinely absent, e.g. before tmux has ever started on
+/// a fresh boot). Matching the whole `error connecting` family regardless of
+/// reason previously let a transient EACCES/EMFILE hiccup on a live server
+/// get misclassified the same as "zero sessions exist", which is exactly the
+/// false-positive class the batch_pane_metadata caller must not produce
+/// (see its doc comment).
+///
+/// Distinct from a session-specific "not found" message (see
+/// [`kill_session_if_present`]), which callers check separately since it
+/// doesn't apply to server-wide probes like `list-panes -a` /
+/// `list-sessions`.
 pub(crate) fn stderr_indicates_no_tmux_server(stderr: &str) -> bool {
-    stderr.contains("no server running") || stderr.contains("error connecting")
+    stderr.contains("no server running")
+        || (stderr.contains("error connecting") && stderr.contains("No such file or directory"))
 }
 
 /// Run `tmux kill-session -t <name>`. A missing session is treated as
@@ -348,19 +364,17 @@ mod tests {
 
     #[test]
     fn test_stderr_indicates_no_tmux_server_matches_known_messages() {
+        // ECONNREFUSED: a stale socket left by a crashed server. This is the
+        // exact case that regressed `batch_pane_metadata` into aborting
+        // startup recovery on a cold boot (the socket file can survive a
+        // reboot even though nothing is listening on it).
         assert!(stderr_indicates_no_tmux_server(
             "no server running on /tmp/tmux-1000/default\n"
         ));
+        // ENOENT: the socket path doesn't exist at all yet (before tmux has
+        // ever started on a fresh boot).
         assert!(stderr_indicates_no_tmux_server(
             "error connecting to /tmp/tmux-1000/default (No such file or directory)\n"
-        ));
-        // A stale socket left by a crashed server reports connection refused,
-        // not "no server running"; this is the exact case that regressed
-        // `batch_pane_metadata` into aborting startup recovery on a cold
-        // boot (the socket file can survive a reboot even though nothing is
-        // listening on it).
-        assert!(stderr_indicates_no_tmux_server(
-            "error connecting to /tmp/tmux-1000/default (Connection refused)\n"
         ));
     }
 
@@ -370,7 +384,24 @@ mod tests {
             "can't find session: aoe_franka_cde819a1\n"
         ));
         assert!(!stderr_indicates_no_tmux_server(""));
-        assert!(!stderr_indicates_no_tmux_server("permission denied\n"));
+        // EACCES on a socket that may well belong to a live server: this
+        // must NOT be folded into "no server" (which means "zero sessions
+        // exist, safe to proceed"). A misclassification here previously let
+        // batch_pane_metadata report an empty pane map for a server that is
+        // actually up, which downstream recovery logic could act on as "all
+        // sessions are dead" instead of the intended "unknown, skip this
+        // pass". This is real tmux 3.4 output, verified against a live
+        // server on a chmod-000'd socket, not a synthetic string.
+        assert!(!stderr_indicates_no_tmux_server(
+            "error connecting to /tmp/tmux-1000/default (Permission denied)\n"
+        ));
+        // EMFILE/ENFILE-style resource exhaustion: also a transient,
+        // ambiguous failure a live server can produce under fd pressure
+        // (plausible during a boot-storm recovery of many sessions at
+        // once), not "zero sessions exist".
+        assert!(!stderr_indicates_no_tmux_server(
+            "error connecting to /tmp/tmux-1000/default (Too many open files)\n"
+        ));
     }
 
     #[test]

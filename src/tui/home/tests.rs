@@ -6667,6 +6667,7 @@ fn apply_status_update_preserves_idle_entered_at_on_keep() {
         idle_entered_at: IdleIntent::Keep,
         last_accessed_at: None,
         pane_dead: false,
+        subagent_active: false,
         live_status_baseline: None,
     });
 
@@ -6703,6 +6704,7 @@ fn apply_status_update_persists_genuine_transition_to_disk() {
         idle_entered_at: IdleIntent::Clear,
         last_accessed_at: Some(now),
         pane_dead: false,
+        subagent_active: false,
         live_status_baseline: None,
     });
 
@@ -6720,7 +6722,7 @@ fn apply_status_update_persists_genuine_transition_to_disk() {
 #[serial]
 fn apply_status_update_tracks_subagent_active_while_running() {
     use crate::session::Status;
-    use crate::tui::status_poller::StatusUpdate;
+    use crate::tui::status_poller::{IdleIntent, StatusUpdate};
 
     let mut env = create_test_env_with_sessions(1);
     let id = match env.view.flat_items.first() {
@@ -6733,10 +6735,11 @@ fn apply_status_update_tracks_subagent_active_while_running() {
         id: id.clone(),
         status: Status::Running,
         last_error: None,
-        idle_entered_at: None,
+        idle_entered_at: IdleIntent::Clear,
         last_accessed_at: None,
         pane_dead: false,
         subagent_active: true,
+        live_status_baseline: None,
     });
     assert!(env.view.get_instance(&id).unwrap().subagent_active);
 
@@ -6747,10 +6750,11 @@ fn apply_status_update_tracks_subagent_active_while_running() {
         id: id.clone(),
         status: Status::Running,
         last_error: None,
-        idle_entered_at: None,
+        idle_entered_at: IdleIntent::Clear,
         last_accessed_at: None,
         pane_dead: false,
         subagent_active: false,
+        live_status_baseline: None,
     });
     assert!(!env.view.get_instance(&id).unwrap().subagent_active);
 }

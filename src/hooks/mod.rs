@@ -2078,7 +2078,10 @@ mod tests {
 
         let content: Value =
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        let cmd = content["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        // PreToolUse also carries the subagent counter command (stdin-first,
+        // so it precedes the status writer; see `build_aoe_hooks`'s doc
+        // comment), so the status writer is the second entry, not the first.
+        let cmd = content["hooks"]["PreToolUse"][0]["hooks"][1]["command"]
             .as_str()
             .unwrap();
         assert!(cmd.contains("printf waiting"), "got command: {cmd}");
@@ -4017,7 +4020,7 @@ hooks_auto_accept: false
     #[test]
     fn test_build_aoe_hooks_emits_session_id_capture_for_session_start() {
         let events = claude_events();
-        let hooks = build_aoe_hooks(events, HookInstallTarget::Sandbox);
+        let hooks = build_aoe_hooks(&events, HookInstallTarget::Sandbox);
         let session_start = hooks
             .get("SessionStart")
             .expect("SessionStart matcher block")
@@ -4034,7 +4037,7 @@ hooks_auto_accept: false
     #[test]
     fn test_build_aoe_hooks_emits_both_for_user_prompt_submit() {
         let events = claude_events();
-        let hooks = build_aoe_hooks(events, HookInstallTarget::Sandbox);
+        let hooks = build_aoe_hooks(&events, HookInstallTarget::Sandbox);
         let user_prompt = hooks
             .get("UserPromptSubmit")
             .expect("UserPromptSubmit matcher block")
@@ -4060,7 +4063,7 @@ hooks_auto_accept: false
     #[test]
     fn test_build_aoe_hooks_status_only_events_unchanged() {
         let events = claude_events();
-        let hooks = build_aoe_hooks(events, HookInstallTarget::Sandbox);
+        let hooks = build_aoe_hooks(&events, HookInstallTarget::Sandbox);
         // PreToolUse is no longer status-only: it also carries the subagent
         // counter command (asserted separately below), so it is excluded here.
         for event_name in &["Stop", "Notification", "ElicitationResult"] {

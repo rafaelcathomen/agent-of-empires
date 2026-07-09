@@ -126,6 +126,15 @@ pub struct ResolvedHookEvent {
     pub matcher: Option<String>,
     pub status: Option<HookStatus>,
     pub session_id_capture: bool,
+    /// Carried through from the source `HookEvent`. See its docs. `None` for
+    /// a status-map-override-only event synthesized by
+    /// `append_configured_status_events` (no source `HookEvent` to carry it
+    /// from) and for sidecar-hook agents (no subagent-counter support).
+    pub subagent_delta: Option<i64>,
+    /// Carried through from the source `HookEvent`. See its docs. `false`
+    /// for a status-map-override-only or sidecar-hook event; see
+    /// `subagent_delta` above for why.
+    pub heat: bool,
 }
 
 /// Sidecar hook defaults for agents whose config format is not the generic
@@ -1158,6 +1167,8 @@ fn append_configured_status_events(
                 matcher: None,
                 status: Some(*status),
                 session_id_capture: false,
+                subagent_delta: None,
+                heat: false,
             });
         }
     }
@@ -1181,6 +1192,8 @@ pub fn resolved_hook_events(
                 .and_then(|map| map.get(event.name).copied())
                 .or(event.status),
             session_id_capture: event.session_id_capture,
+            subagent_delta: event.subagent_delta,
+            heat: event.heat,
         })
         .collect();
     append_configured_status_events(&mut events, overrides);
@@ -1207,6 +1220,11 @@ pub fn resolved_sidecar_hook_events(
                     .unwrap_or(event.status),
             ),
             session_id_capture: false,
+            // Sidecar-hook agents (non-JSON-settings config format) have no
+            // subagent-counter or heat support: `SidecarHookEvent` carries
+            // no such fields to source these from.
+            subagent_delta: None,
+            heat: false,
         })
         .collect();
     append_configured_status_events(&mut events, overrides);

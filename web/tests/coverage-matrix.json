@@ -652,6 +652,21 @@
       ]
     },
     {
+      "id": "wizard.worktree-title-derived-branch",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/wizard-form-ui.spec.ts",
+        "tests/wizard-session-step.spec.ts",
+        "tests/wizard-single-screen.spec.ts"
+      ],
+      "components": [
+        "web/src/components/session-wizard/SessionWizard.tsx",
+        "web/src/components/session-wizard/sessionNames.ts",
+        "web/src/lib/types.ts"
+      ]
+    },
+    {
       "id": "wizard.recent-projects",
       "kind": "live-playwright",
       "risk": "medium",
@@ -1109,6 +1124,17 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.row-tag",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/__tests__/SessionRowTriage.test.tsx",
+        "src/components/__tests__/SettingsView.session.test.tsx",
+        "src/lib/sessionRowTag.test.ts"
+      ],
+      "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/components/SettingsView.tsx"]
+    },
+    {
       "id": "sidebar.sort-pure",
       "kind": "vitest",
       "risk": "medium",
@@ -1553,7 +1579,7 @@
       "id": "acp.attachments",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/acp-attachment.spec.ts"],
+      "specs": ["tests/live/acp-attachment.spec.ts", "src/components/acp/Composer.paste.test.tsx"],
       "components": [
         "web/src/components/acp/Composer.tsx",
         "web/src/components/acp/AcpRuntime.tsx",
@@ -1739,7 +1765,11 @@
         "tests/live/acp-cancel.spec.ts",
         "tests/live/acp-lagged-ws.spec.ts"
       ],
-      "components": ["web/src/components/acp/ContextPrimerBanner.tsx", "web/src/components/acp/useFilesIndex.ts"]
+      "components": [
+        "src/server/api/acp.rs",
+        "web/src/components/acp/ContextPrimerBanner.tsx",
+        "web/src/components/acp/useFilesIndex.ts"
+      ]
     },
     {
       "id": "acp.tool-output-media",

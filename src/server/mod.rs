@@ -2317,6 +2317,7 @@ impl PriorById {
 pub(crate) async fn reload_state_instances_from_disk(
     state: &Arc<AppState>,
     fresh: Vec<Instance>,
+    #[cfg(feature = "serve")] live_worker_records: Vec<LiveStructuredWorkerRecord>,
     status_source: StatusSource,
 ) {
     // Snapshot suppression here so a worker that unmarks between the
@@ -2359,9 +2360,16 @@ pub(crate) async fn reload_state_instances_from_disk(
     }
 
     #[cfg(feature = "serve")]
+    let repairs = repair_structured_rows_from_live_workers(&mut merged, live_worker_records);
+
+    #[cfg(feature = "serve")]
     apply_acp_overlay_inplace(&prior_by_id, &mut merged);
 
     *current = merged;
+    drop(current);
+
+    #[cfg(feature = "serve")]
+    persist_structured_row_repairs(state, repairs);
 }
 
 /// Apply the acp status / timestamps overlay to `merged`, sourcing
@@ -2370,6 +2378,20 @@ pub(crate) async fn reload_state_instances_from_disk(
 /// `inst.is_structured()` per the invariant above; filtering on
 /// the lazy session id would silently drop overlay coverage for
 /// pre-handshake rows.
+///
+/// ## Durability contract (#2690 follow-up)
+///
+/// Structured rows accept a soft reset of `status` / `last_accessed_at` /
+/// `idle_entered_at` on daemon restart, by contract. The values written
+/// here come from `prior_by_id`, an in-memory snapshot that the daemon
+/// rebuilds each tick from live worker state, and never flow through
+/// [`crate::session::PassiveStatusPatch`] (`decide_passive_transition`
+/// returns `patch: None` for `is_structured()` rows). After a daemon
+/// restart, disk-loaded structured rows read whatever was durably
+/// persisted last (initial creation, or an explicit user action). ACP
+/// event handlers are responsible for any post-restart re-emission that
+/// updates these fields for structured sessions; the passive-status
+/// writer at `status_poll_loop` deliberately does not.
 #[cfg(feature = "serve")]
 fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
     for inst in merged.iter_mut() {
@@ -2382,6 +2404,188 @@ fn apply_acp_overlay_inplace(prior_by_id: &PriorById, merged: &mut [Instance]) {
         inst.status = prior.status;
         inst.last_accessed_at = prior.last_accessed_at;
         inst.idle_entered_at = prior.idle_entered_at;
+    }
+}
+
+#[cfg(feature = "serve")]
+struct StructuredRowRepair {
+    session_id: String,
+    source_profile: String,
+    agent_name: Option<String>,
+    agent_model: Option<String>,
+    acp_session_id: String,
+}
+
+#[cfg(feature = "serve")]
+type LiveStructuredWorkerRecord = (crate::acp::worker_registry::WorkerRecord, String);
+
+#[cfg(feature = "serve")]
+fn live_structured_worker_records() -> Vec<LiveStructuredWorkerRecord> {
+    use crate::acp::worker_registry::{self, is_record_live};
+
+    let records = match worker_registry::list() {
+        Ok(records) => records,
+        Err(e) => {
+            tracing::warn!(
+                target: "server.file_watch",
+                error = %e,
+                "worker registry list failed; structured row repair disabled this tick"
+            );
+            return Vec::new();
+        }
+    };
+    records
+        .into_iter()
+        .filter(is_record_live)
+        .filter_map(|record| {
+            let acp_session_id = record
+                .stored_acp_session_id
+                .as_deref()
+                .filter(|id| !id.is_empty())?
+                .to_string();
+            Some((record, acp_session_id))
+        })
+        .collect()
+}
+
+/// Runs before the ACP overlay so freshly repaired rows pass the
+/// `is_structured()` gate and keep their live worker status.
+#[cfg(feature = "serve")]
+fn repair_structured_rows_from_live_workers(
+    merged: &mut [Instance],
+    records: Vec<LiveStructuredWorkerRecord>,
+) -> Vec<StructuredRowRepair> {
+    let live_by_id: std::collections::HashMap<String, LiveStructuredWorkerRecord> = records
+        .into_iter()
+        .map(|(record, acp_session_id)| (record.session_id.clone(), (record, acp_session_id)))
+        .collect();
+
+    let mut repairs = Vec::new();
+    for inst in merged.iter_mut() {
+        if inst.is_structured() {
+            continue;
+        }
+        let Some((record, acp_session_id)) = live_by_id.get(&inst.id) else {
+            continue;
+        };
+        if inst.acp_session_id.is_some()
+            && inst.acp_session_id.as_deref() != Some(acp_session_id.as_str())
+        {
+            tracing::warn!(
+                target: "server.file_watch",
+                session = %inst.id,
+                disk = ?inst.acp_session_id,
+                registry = %acp_session_id,
+                "repairing structured session row with mismatched ACP session id"
+            );
+        }
+        inst.view = crate::session::View::Structured;
+        if inst.agent_name.is_none() && !record.agent_key.is_empty() {
+            inst.agent_name = Some(record.agent_key.clone());
+        }
+        if inst.agent_model.is_none() {
+            inst.agent_model = record.model.clone();
+        }
+        inst.acp_session_id = Some(acp_session_id.clone());
+        tracing::warn!(
+            target: "server.file_watch",
+            session = %inst.id,
+            pid = record.pid,
+            "repaired structured session row from live ACP worker registry"
+        );
+        repairs.push(StructuredRowRepair {
+            session_id: inst.id.clone(),
+            source_profile: inst.source_profile.clone(),
+            agent_name: inst.agent_name.clone(),
+            agent_model: inst.agent_model.clone(),
+            acp_session_id: acp_session_id.clone(),
+        });
+    }
+    repairs
+}
+
+#[cfg(feature = "serve")]
+fn persist_structured_row_repairs(state: &Arc<AppState>, repairs: Vec<StructuredRowRepair>) {
+    if repairs.is_empty() {
+        return;
+    }
+    let state = state.clone();
+    let file_watch = state.file_watch.clone();
+    let shutdown = state.shutdown.clone();
+    crate::task_util::spawn_supervised(
+        "server.reload.persist_repairs",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            let mut by_profile: std::collections::HashMap<String, Vec<StructuredRowRepair>> =
+                std::collections::HashMap::new();
+            for repair in repairs {
+                by_profile
+                    .entry(repair.source_profile.clone())
+                    .or_default()
+                    .push(repair);
+            }
+            for (profile, repairs) in by_profile {
+                if shutdown.is_cancelled() {
+                    break;
+                }
+                let file_watch = file_watch.clone();
+                let failed_ids: Vec<String> = repairs
+                    .iter()
+                    .map(|repair| repair.session_id.clone())
+                    .collect();
+                let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let storage = crate::session::Storage::new(&profile, file_watch)?;
+                    storage.update(|all, _groups| {
+                        for repair in repairs {
+                            if let Some(inst) = all.iter_mut().find(|i| i.id == repair.session_id) {
+                                inst.view = crate::session::View::Structured;
+                                if inst.agent_name.is_none() {
+                                    inst.agent_name = repair.agent_name;
+                                }
+                                if inst.agent_model.is_none() {
+                                    inst.agent_model = repair.agent_model;
+                                }
+                                inst.acp_session_id = Some(repair.acp_session_id);
+                            } else {
+                                tracing::debug!(
+                                    target: "server.file_watch",
+                                    session = %repair.session_id,
+                                    "repair target not found on disk; skipping"
+                                );
+                            }
+                        }
+                        Ok(())
+                    })?;
+                    Ok(())
+                })
+                .await;
+                match save_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        rollback_structured_row_repairs(&state, &failed_ids).await;
+                        tracing::warn!(target: "server.file_watch", "save after structured row repair: {e}");
+                    }
+                    Err(join_err) => {
+                        rollback_structured_row_repairs(&state, &failed_ids).await;
+                        tracing::warn!(
+                            target: "server.file_watch",
+                            "structured row repair save task panicked: {join_err}"
+                        );
+                    }
+                }
+            }
+        },
+    );
+}
+
+#[cfg(feature = "serve")]
+async fn rollback_structured_row_repairs(state: &Arc<AppState>, failed_ids: &[String]) {
+    let mut instances = state.instances.write().await;
+    for inst in instances.iter_mut() {
+        if failed_ids.iter().any(|id| id == &inst.id) {
+            inst.view = crate::session::View::Terminal;
+            inst.acp_session_id = None;
+        }
     }
 }
 
@@ -2642,30 +2846,39 @@ async fn disk_watcher_consumer(state: Arc<AppState>) {
         }
         let started = std::time::Instant::now();
         let file_watch_for_load = state.file_watch.clone();
-        let fresh =
-            match tokio::task::spawn_blocking(move || load_all_instances(&file_watch_for_load))
-                .await
-            {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        target: "server.file_watch",
-                        error = %e,
-                        "disk reload failed"
-                    );
-                    continue;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "server.file_watch",
-                        error = %e,
-                        "spawn_blocking joined with error"
-                    );
-                    continue;
-                }
-            };
+        let loaded = match tokio::task::spawn_blocking(move || {
+            load_all_instances(&file_watch_for_load)
+                .map(|fresh| (fresh, live_structured_worker_records()))
+        })
+        .await
+        {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "server.file_watch",
+                    error = %e,
+                    "disk reload failed"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "server.file_watch",
+                    error = %e,
+                    "spawn_blocking joined with error"
+                );
+                continue;
+            }
+        };
+        let (fresh, live_worker_records) = loaded;
         let count = fresh.len();
-        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(
+            &state,
+            fresh,
+            live_worker_records,
+            StatusSource::DiskOnly,
+        )
+        .await;
         tracing::trace!(
             target: "server.file_watch",
             latency_us = started.elapsed().as_micros() as u64,
@@ -3004,6 +3217,84 @@ fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, reported: u3
     });
 }
 
+/// What to do with one instance's status_poll_loop diff, once a genuine
+/// `old != inst.status` transition (against the tick's `prev` snapshot) has
+/// already been established by the caller.
+struct PassiveTransitionDecision {
+    /// `None` for structured (ACP) sessions: their `status` isn't
+    /// poller-authoritative (see the `is_structured()` guard in
+    /// `update_status_with_metadata_inner`, and `apply_acp_overlay_inplace`,
+    /// which is the sole authority for their status/timestamps). Persisting
+    /// a patch here would write a bogus tmux-derived status to disk for a
+    /// session the poller never actually controls. Locked by
+    /// `decide_passive_transition_skips_patch_for_structured_session`
+    /// (a `#[cfg(test)]` item; kept as a code-span rather than an
+    /// intra-doc link that would degrade to literal text under
+    /// `cargo doc`).
+    patch: Option<crate::session::PassiveStatusPatch>,
+    mark_unread: bool,
+}
+
+/// Compute the passive-status write decision for one instance whose
+/// `status` differs from the tick's `prev` snapshot. The full
+/// contract lives on the return type at [`PassiveTransitionDecision`]:
+/// `patch: None` for structured / ACP sessions (the ACP overlay is the
+/// sole authority), and `mark_unread: true` only on genuine
+/// Running -> Idle when unread is enabled and the row is not already
+/// unread.
+fn decide_passive_transition(
+    inst: &Instance,
+    old_status: Status,
+    unread_enabled: bool,
+) -> PassiveTransitionDecision {
+    let patch =
+        (!inst.is_structured()).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
+    let mark_unread = unread_enabled
+        && old_status == Status::Running
+        && inst.status == Status::Idle
+        && !inst.unread;
+    PassiveTransitionDecision { patch, mark_unread }
+}
+
+/// Per-profile bundle of passive-status writes accumulated in one
+/// `status_poll_loop` tick. `patches` is keyed by instance id so the
+/// persistence closure resolves each row in O(1); `unread_ids` stays a
+/// small `Vec` because per-tick cardinality is low and `Vec::contains`
+/// beats `HashSet` at that N.
+///
+/// ## Persistence divergence between daemon and TUI (#2690 follow-up)
+///
+/// The daemon batches transitions here (one `Storage::update` per profile
+/// per tick, via `persist_session_update`). The TUI's
+/// [`crate::tui::home::HomeView::persist_passive_status_transition`]
+/// writes one transition at a time. Both funnel through
+/// [`crate::session::Instance::merge_passive_status_patch`], whose field
+/// semantics are: `last_accessed_at` is monotone non-decreasing (guarded
+/// by `>=`, so an older-or-equal incoming value is dropped);
+/// `status` and `idle_entered_at` are unconditional writes
+/// (last-writer-wins). The two paths are safe to interleave today because
+/// the poller is the sole authority on those two fields and both writers
+/// read the same live source, so they converge within one poll interval
+/// of the slower cadence (daemon at 2s, TUI at ~500ms) even when their
+/// observations disagree mid-cadence.
+///
+/// A future field added to [`crate::session::PassiveStatusPatch`] that is
+/// neither monotone (like `last_accessed_at`) nor single-authority (like
+/// the current `status`/`idle_entered_at`) would diverge silently
+/// between the daemon's batched replay and the TUI's per-transition
+/// writes. Any such addition must either unify the two paths first, or
+/// explicitly document why the two-writer shape stays safe.
+#[derive(Default)]
+struct PassiveTransitionWrites {
+    /// Keyed by instance id for O(1) lookup inside the persist closure.
+    /// [`crate::session::PassiveStatusPatch::from_instance`] keeps
+    /// `patch.id == inst.id`, so the map key and the value's `id` field
+    /// stay in sync by construction; the redundancy is intentional and
+    /// used by the closure's `.get(&inst.id)` at the flush site below.
+    patches: std::collections::HashMap<String, crate::session::PassiveStatusPatch>,
+    unread_ids: Vec<String>,
+}
+
 /// Background task that periodically refreshes session statuses. On each
 /// tick, diffs pre- and post-refresh statuses and emits a `StatusChange`
 /// on `state.status_tx` for every transition. Keeping the diff here,
@@ -3051,6 +3342,15 @@ async fn status_poll_loop(state: Arc<AppState>) {
         let suppressed_ids =
             crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
         let file_watch_for_poll = state.file_watch.clone();
+        // Seed each freshly-disk-loaded instance's live status baseline from
+        // `prev` (the true previous-tick live status) rather than letting
+        // `update_status_with_metadata` fall back to comparing against its
+        // own possibly-stale disk-loaded `status`. Without this, every tick
+        // that finds disk out of sync with live reality (the common case,
+        // since nothing persists a passive transition until the patch below
+        // lands) misreads that mismatch as a brand new transition and
+        // restamps idle_entered_at/last_accessed_at. See #2690.
+        let prev_for_poll = prev.clone();
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
             crate::tmux::refresh_session_cache();
@@ -3060,73 +3360,95 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     inst.status = Status::Starting;
                     continue;
                 }
+                inst.live_status_baseline = prev_for_poll.get(&inst.id).copied();
                 let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
                 let metadata = pane_metadata.get(&session_name);
                 inst.update_status_with_metadata(metadata);
             }
-            instances
+            (instances, live_structured_worker_records())
         })
         .await;
 
-        if let Ok(mut instances) = updated {
+        if let Ok((mut instances, live_worker_records)) = updated {
             // Diff BEFORE the helper: status_tx must observe the raw
             // post-suppression, post-tmux-scrape values, never the acp
             // overlay applied by the helper.
             let now = chrono::Utc::now();
-            for inst in &instances {
-                if let Some(old) = prev.get(&inst.id) {
-                    if *old != inst.status {
-                        let _ = state.status_tx.send(StatusChange {
-                            instance_id: inst.id.clone(),
-                            instance_title: inst.title.clone(),
-                            old: *old,
-                            new: inst.status,
-                            at: now,
-                        });
-                    }
+            let unread_enabled = crate::session::unread_enabled();
+            // Passive status transitions observed this tick, batched per
+            // profile so one `Storage::update` flock covers every
+            // transitioned session on that profile (plus its unread mark
+            // when applicable). Persisting promptly is what keeps the next
+            // reload (this loop's next tick, or a TUI relaunch) from
+            // comparing against a stale snapshot and restamping again. See
+            // #2690.
+            let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
+                std::collections::HashMap::new();
+            for inst in &mut instances {
+                let Some(old) = prev.get(&inst.id) else {
+                    continue;
+                };
+                if *old == inst.status {
+                    continue;
+                }
+                let _ = state.status_tx.send(StatusChange {
+                    instance_id: inst.id.clone(),
+                    instance_title: inst.title.clone(),
+                    old: *old,
+                    new: inst.status,
+                    at: now,
+                });
+                let decision = decide_passive_transition(inst, *old, unread_enabled);
+                if decision.patch.is_none() && !decision.mark_unread {
+                    continue;
+                }
+                let bundle = bundles.entry(inst.source_profile.clone()).or_default();
+                if let Some(patch) = decision.patch {
+                    bundle.patches.insert(patch.id.clone(), patch);
+                }
+                if decision.mark_unread {
+                    inst.mark_unread();
+                    bundle.unread_ids.push(inst.id.clone());
                 }
             }
-
-            // Auto-mark unread on a finished turn (Running -> Idle), the same
-            // transition the TUI marks on. This is what lets a web-only user
-            // (no TUI process polling) accrue the indicator. There's no
-            // server-side "is being viewed" exemption: the client suppresses
-            // the chip on the session it is actively viewing and clears the
-            // auto marker on open. Mutate the in-memory rows we're about to
-            // install AND persist per profile so the next disk reload keeps it.
-            if crate::session::unread_enabled() {
-                let mut newly_idle: std::collections::HashMap<String, Vec<String>> =
-                    std::collections::HashMap::new();
-                for inst in &mut instances {
-                    let finished_turn = prev.get(&inst.id) == Some(&Status::Running)
-                        && inst.status == Status::Idle
-                        && !inst.unread;
-                    if finished_turn {
-                        inst.mark_unread();
-                        newly_idle
-                            .entry(inst.source_profile.clone())
-                            .or_default()
-                            .push(inst.id.clone());
-                    }
-                }
-                for (profile, ids) in newly_idle {
-                    let _ = api::persist_session_update(
-                        profile,
-                        "auto-unread",
-                        state.file_watch.clone(),
-                        move |insts| {
-                            for inst in insts.iter_mut() {
-                                if ids.contains(&inst.id) {
-                                    inst.mark_unread();
-                                }
+            for (
+                profile,
+                PassiveTransitionWrites {
+                    patches,
+                    unread_ids,
+                },
+            ) in bundles
+            {
+                let _ = api::persist_session_update(
+                    profile,
+                    "passive-status",
+                    state.file_watch.clone(),
+                    move |insts| {
+                        for inst in insts.iter_mut() {
+                            if let Some(patch) = patches.get(&inst.id) {
+                                debug_assert_eq!(
+                                    patch.id, inst.id,
+                                    "PassiveStatusPatch::from_instance keeps `patch.id == inst.id`; \
+                                     if this fires, the map key or the patch's `id` field has drifted"
+                                );
+                                inst.merge_passive_status_patch(patch);
                             }
-                        },
-                    )
-                    .await;
-                }
+                            if unread_ids.contains(&inst.id) {
+                                inst.mark_unread();
+                            }
+                        }
+                    },
+                )
+                .await;
             }
 
-            reload_state_instances_from_disk(&state, instances, StatusSource::TmuxApplied).await;
+            reload_state_instances_from_disk(
+                &state,
+                instances,
+                live_worker_records,
+                StatusSource::TmuxApplied,
+            )
+            .await;
 
             // Drain poller observations into sessions.json so daemon-only
             // sessions (no attached TUI) persist post-`/clear` sids (#2291).
@@ -4470,19 +4792,111 @@ pub mod test_support {
         state.file_watch.clone()
     }
 
-    pub async fn reload_disk_only_for_test(state: &Arc<AppState>, fresh: Vec<Instance>) {
-        super::reload_state_instances_from_disk(state, fresh, super::StatusSource::DiskOnly).await
+    pub async fn reload_disk_only_for_test(
+        state: &Arc<AppState>,
+        fresh: Vec<Instance>,
+        live_worker_records: Vec<(crate::acp::worker_registry::WorkerRecord, String)>,
+    ) {
+        super::reload_state_instances_from_disk(
+            state,
+            fresh,
+            live_worker_records,
+            super::StatusSource::DiskOnly,
+        )
+        .await
     }
 
-    pub async fn reload_tmux_applied_for_test(state: &Arc<AppState>, fresh: Vec<Instance>) {
-        super::reload_state_instances_from_disk(state, fresh, super::StatusSource::TmuxApplied)
-            .await
+    pub async fn reload_tmux_applied_for_test(
+        state: &Arc<AppState>,
+        fresh: Vec<Instance>,
+        live_worker_records: Vec<(crate::acp::worker_registry::WorkerRecord, String)>,
+    ) {
+        super::reload_state_instances_from_disk(
+            state,
+            fresh,
+            live_worker_records,
+            super::StatusSource::TmuxApplied,
+        )
+        .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decide_passive_transition_skips_patch_for_structured_session() {
+        // Locks the CI regression from #2697: structured/ACP sessions
+        // have no tmux pane for the poller to probe; their `status` is not
+        // poller-authoritative (the ACP overlay is), so a disk/detected
+        // mismatch must not be persisted as a passive status patch.
+        let mut inst = Instance::new("acp-session", "/tmp/test");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Idle;
+
+        let decision = decide_passive_transition(&inst, Status::Starting, false);
+
+        assert!(
+            decision.patch.is_none(),
+            "structured sessions must never get a passive status patch"
+        );
+    }
+
+    #[test]
+    fn decide_passive_transition_patches_plain_tmux_session() {
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.idle_entered_at = Some(chrono::Utc::now());
+        inst.last_accessed_at = Some(chrono::Utc::now());
+
+        let decision = decide_passive_transition(&inst, Status::Running, false);
+
+        let patch = decision.patch.expect("plain tmux session must get a patch");
+        assert_eq!(patch.id, inst.id);
+        assert_eq!(patch.status, Status::Idle);
+        assert_eq!(patch.idle_entered_at, inst.idle_entered_at);
+        assert_eq!(patch.last_accessed_at, inst.last_accessed_at);
+    }
+
+    #[test]
+    fn decide_passive_transition_never_fabricates_last_accessed_at() {
+        // A session that transitions status before any user touch has
+        // last_accessed_at == None on disk; the patch must preserve that,
+        // not fabricate a stamp, or a brand-new session gains a spurious
+        // "touched" signal that idle-reap and the freshness sort rely on
+        // being absent.
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+        inst.last_accessed_at = None;
+
+        let decision = decide_passive_transition(&inst, Status::Running, false);
+
+        let patch = decision.patch.expect("plain tmux session must get a patch");
+        assert_eq!(patch.last_accessed_at, None);
+    }
+
+    #[test]
+    fn decide_passive_transition_marks_unread_only_on_running_to_idle() {
+        let mut inst = Instance::new("tmux-session", "/tmp/test");
+        inst.status = Status::Idle;
+
+        let decision = decide_passive_transition(&inst, Status::Running, true);
+        assert!(decision.mark_unread);
+
+        let decision = decide_passive_transition(&inst, Status::Waiting, true);
+        assert!(
+            !decision.mark_unread,
+            "only a Running -> Idle transition marks unread"
+        );
+
+        inst.unread = true;
+        let decision = decide_passive_transition(&inst, Status::Running, true);
+        assert!(
+            !decision.mark_unread,
+            "already-unread sessions must not re-mark"
+        );
+    }
 
     #[test]
     fn extract_web_build_id_finds_entry_bundle() {
@@ -4744,6 +5158,127 @@ mod tests {
 
         let merged = merge_runtime_fields(prior, fresh);
         assert_eq!(merged.last_error, None);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial_test::serial]
+    fn repair_structured_rows_from_live_workers_restores_structured_session_rows() {
+        let temp = tempfile::TempDir::with_prefix_in("aoe-repair-", "/tmp").expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let socket_path = crate::acp::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-live.sock");
+        std::fs::write(&socket_path, b"").expect("socket sentinel");
+        let live_record = crate::acp::worker_registry::WorkerRecord::new(
+            "repair-live".to_string(),
+            std::process::id(),
+            socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            Some("gpt-5".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some("acp-session-1".to_string()),
+            Some("default".to_string()),
+        );
+        crate::acp::worker_registry::save(&live_record).expect("save live worker record");
+
+        let existing_socket_path = crate::acp::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-existing.sock");
+        std::fs::write(&existing_socket_path, b"").expect("socket sentinel");
+        let existing_record = crate::acp::worker_registry::WorkerRecord::new(
+            "repair-existing".to_string(),
+            std::process::id(),
+            existing_socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            Some("gpt-5".to_string()),
+            Vec::new(),
+            Vec::new(),
+            Some("acp-session-2".to_string()),
+            Some("default".to_string()),
+        );
+        crate::acp::worker_registry::save(&existing_record)
+            .expect("save existing-field worker record");
+
+        let stale_socket_path = crate::acp::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-no-id.sock");
+        std::fs::write(&stale_socket_path, b"").expect("socket sentinel");
+        let no_id_record = crate::acp::worker_registry::WorkerRecord::new(
+            "repair-no-id".to_string(),
+            std::process::id(),
+            stale_socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some("default".to_string()),
+        );
+        crate::acp::worker_registry::save(&no_id_record).expect("save no-id worker record");
+
+        let empty_socket_path = crate::acp::worker_registry::workers_dir()
+            .expect("workers dir")
+            .join("repair-empty-id.sock");
+        std::fs::write(&empty_socket_path, b"").expect("socket sentinel");
+        let empty_id_record = crate::acp::worker_registry::WorkerRecord::new(
+            "repair-empty-id".to_string(),
+            std::process::id(),
+            empty_socket_path,
+            "codex-acp".to_string(),
+            "codex".to_string(),
+            std::path::PathBuf::from("/tmp/repo"),
+            None,
+            Vec::new(),
+            Vec::new(),
+            Some(String::new()),
+            Some("default".to_string()),
+        );
+        crate::acp::worker_registry::save(&empty_id_record).expect("save empty-id worker record");
+
+        let mut rows = vec![
+            Instance::new("repair-live", "/tmp/repo"),
+            Instance::new("repair-existing", "/tmp/repo"),
+            Instance::new("repair-no-id", "/tmp/repo"),
+            Instance::new("repair-empty-id", "/tmp/repo"),
+        ];
+        rows[0].id = "repair-live".to_string();
+        rows[1].id = "repair-existing".to_string();
+        rows[1].agent_name = Some("custom-agent".to_string());
+        rows[1].agent_model = Some("custom-model".to_string());
+        rows[2].id = "repair-no-id".to_string();
+        rows[3].id = "repair-empty-id".to_string();
+
+        let live_records = live_structured_worker_records();
+        let repairs = repair_structured_rows_from_live_workers(&mut rows, live_records);
+
+        assert_eq!(repairs.len(), 2);
+        assert_eq!(repairs[0].session_id, "repair-live");
+        assert_eq!(repairs[0].acp_session_id, "acp-session-1");
+        assert_eq!(rows[0].view, crate::session::View::Structured);
+        assert_eq!(rows[0].agent_name.as_deref(), Some("codex"));
+        assert_eq!(rows[0].agent_model.as_deref(), Some("gpt-5"));
+        assert_eq!(rows[0].acp_session_id.as_deref(), Some("acp-session-1"));
+        assert_eq!(rows[1].view, crate::session::View::Structured);
+        assert_eq!(rows[1].agent_name.as_deref(), Some("custom-agent"));
+        assert_eq!(rows[1].agent_model.as_deref(), Some("custom-model"));
+        assert_eq!(rows[1].acp_session_id.as_deref(), Some("acp-session-2"));
+        assert_eq!(rows[2].view, crate::session::View::Terminal);
+        assert_eq!(rows[2].acp_session_id, None);
+        assert_eq!(rows[3].view, crate::session::View::Terminal);
+        assert_eq!(rows[3].acp_session_id, None);
     }
 
     #[tokio::test]
@@ -5013,7 +5548,7 @@ mod tests {
             .await
             .expect("join")
             .expect("load");
-        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(&state, fresh, Vec::new(), StatusSource::DiskOnly).await;
 
         let instances = state.instances.read().await;
         let titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
@@ -5073,7 +5608,7 @@ mod tests {
             .await
             .expect("join")
             .expect("load");
-        reload_state_instances_from_disk(&state, fresh, StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(&state, fresh, Vec::new(), StatusSource::DiskOnly).await;
 
         let instances = state.instances.read().await;
         assert!(

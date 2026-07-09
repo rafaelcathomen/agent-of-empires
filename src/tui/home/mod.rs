@@ -2453,7 +2453,7 @@ impl HomeView {
         let prev_selected_session = self.selected_session.clone();
         let prev_selected_group = self.selected_group.clone();
 
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
 
         // Try to restore cursor to the same session/group after rebuild
         let mut restored = false;
@@ -2793,18 +2793,38 @@ impl HomeView {
         let new_subagent_active = update.subagent_active;
 
         if should_update {
+            use crate::tui::status_poller::IdleIntent;
+
             let new_status = update.status;
             let new_error = update.last_error;
             let new_idle_entered_at = update.idle_entered_at;
+            let new_live_status_baseline = update.live_status_baseline;
             self.mutate_instance(&update.id, |inst| {
                 inst.status = new_status;
                 inst.last_error = new_error;
-                // Propagate the timestamp the polling clone wrote;
-                // see StatusPoller for why this isn't a simple
-                // `inst.idle_entered_at = …` from inside the poll.
-                inst.idle_entered_at = new_idle_entered_at;
+                // Match on the producer's stated intent for `idle_entered_at`
+                // instead of overloading `None`. See `IdleIntent` in
+                // `status_poller` for the three-variant contract that
+                // replaces the pre-fix `Option<DateTime<Utc>>` (which
+                // conflated "producer observed a transition out of Idle" with
+                // "producer has no observation"). See #2690.
+                match new_idle_entered_at {
+                    IdleIntent::Set(ts) => inst.idle_entered_at = Some(ts),
+                    IdleIntent::Clear => inst.idle_entered_at = None,
+                    IdleIntent::Keep => {}
+                }
                 if new_last_accessed.is_some() {
                     inst.last_accessed_at = new_last_accessed;
+                }
+                // A producer that has no baseline yet (`None`) must not
+                // clear one the real instance already has, or every
+                // subsequent poll of that instance re-seeds from `None`
+                // and silently disables restamping on real transitions.
+                // Locked by
+                // [`apply_status_update_propagates_live_status_baseline_from_poller`]
+                // in `src/tui/home/tests.rs`. See #2690.
+                if let Some(baseline) = new_live_status_baseline {
+                    inst.live_status_baseline = Some(baseline);
                 }
                 inst.pane_dead_observed = new_pane_dead;
                 // Written in all three branches: subagent_active flips while
@@ -2815,11 +2835,6 @@ impl HomeView {
 
             if let Some(old) = old_status {
                 if old != new_status {
-                    if let Some(inst) = self.get_instance(&update.id).cloned() {
-                        self.handle_status_transition(
-                            &inst, old, new_status, play_sound, run_hooks,
-                        );
-                    }
                     // Auto-mark unread when a turn finishes (Running ->
                     // Idle), unless the user is currently viewing this
                     // session in live-send. This runs in both the with-
@@ -2828,22 +2843,34 @@ impl HomeView {
                     // elsewhere still gets marked. The attached session
                     // itself is cleared on attach-return, so a turn that
                     // finishes during an attach nets to read.
-                    if crate::session::unread_enabled()
+                    let is_live_target = self
+                        .live_send
+                        .as_ref()
+                        .is_some_and(|s| s.session_id == update.id);
+                    // Skip when already unread (the mark is a no-op) so a
+                    // re-finishing session doesn't churn the flock once
+                    // per turn.
+                    let already_unread =
+                        self.get_instance(&update.id).is_some_and(|i| i.is_unread());
+                    let should_mark_unread = crate::session::unread_enabled()
                         && old == Status::Running
                         && new_status == Status::Idle
-                    {
-                        let is_live_target = self
-                            .live_send
-                            .as_ref()
-                            .is_some_and(|s| s.session_id == update.id);
-                        // Skip the disk write when already unread (the mark
-                        // is a no-op) so a re-finishing session doesn't churn
-                        // the flock once per turn.
-                        let already_unread =
-                            self.get_instance(&update.id).is_some_and(|i| i.is_unread());
-                        if !is_live_target && !already_unread {
-                            let _ = self.apply_user_action(&update.id, |inst| inst.mark_unread());
-                        }
+                        && !is_live_target
+                        && !already_unread;
+
+                    // One flock for both the status/timestamp patch and the
+                    // unread mark, matching the daemon's per-tick batching
+                    // shape (server/mod.rs's status_poll_loop) instead of
+                    // two separate Storage::update calls on the same row.
+                    self.persist_passive_status_transition(&update.id, should_mark_unread);
+                    if should_mark_unread {
+                        self.mutate_instance(&update.id, |inst| inst.mark_unread());
+                    }
+
+                    if let Some(inst) = self.get_instance(&update.id).cloned() {
+                        self.handle_status_transition(
+                            &inst, old, new_status, play_sound, run_hooks,
+                        );
                     }
                 }
             }
@@ -3092,7 +3119,7 @@ impl HomeView {
         let prev_selected_session = self.selected_session.clone();
         let prev_selected_group = self.selected_group.clone();
 
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
 
         let mut restored = false;
         if let Some(ref sid) = prev_selected_session {
@@ -3523,7 +3550,7 @@ impl HomeView {
             },
         );
         self.creating_stub_id = Some(stub_id.clone());
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
 
         // Move cursor to the new stub
         if let Some(pos) = self
@@ -3579,7 +3606,7 @@ impl HomeView {
             self.remove_instance(&stub_id);
             self.creating_hook_progress.remove(&stub_id);
             self.rebuild_group_trees();
-            self.flat_items = self.build_flat_items();
+            self.rebuild_flat_items();
             self.update_selected();
         }
         self.new_dialog = None;
@@ -3619,7 +3646,7 @@ impl HomeView {
                 builder::cleanup_instance(instance, worktree.as_ref(), &[]);
             }
             self.rebuild_group_trees();
-            self.flat_items = self.build_flat_items();
+            self.rebuild_flat_items();
             self.update_selected();
             return None;
         }
@@ -3728,7 +3755,7 @@ impl HomeView {
                 if let Some(id) = &stub_id {
                     self.remove_instance(id);
                     self.rebuild_group_trees();
-                    self.flat_items = self.build_flat_items();
+                    self.rebuild_flat_items();
                     self.update_selected();
                     // Hook failures carry multi-line output; size to fit so
                     // the actual error isn't clipped at the default 50x9.
@@ -4211,15 +4238,9 @@ impl HomeView {
         });
     }
 
-    /// Expand the synthetic Trash section if collapsed. Used when trashing a
-    /// session so the user sees where the row went. No-op when already open.
-    pub(super) fn reveal_trashed_section(&mut self) {
-        self.trashed_section_collapsed = false;
-    }
-
     pub fn toggle_trashed_section(&mut self) {
         self.trashed_section_collapsed = !self.trashed_section_collapsed;
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
         if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
             self.cursor = self.flat_items.len() - 1;
         }
@@ -4232,7 +4253,7 @@ impl HomeView {
         Self::persist_app_state("archived section", |s| {
             s.archived_section_collapsed = Some(collapsed)
         });
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
         // Defensive cursor clamp + selection refresh. Today the only
         // call site routes through `toggle_group_collapsed` after the
         // cursor lands on the section header, and the header survives
@@ -4548,18 +4569,24 @@ impl HomeView {
     }
 
     /// Open the saved-project picker that starts a new session pre-filled with
-    /// the chosen project's path. Shows an info dialog when no projects exist.
+    /// the chosen project's path. Opens the add-project form when none exist.
     pub(super) fn open_project_session_picker(&mut self) {
         let profile = self.config_profile();
-        let projects = crate::session::projects::load_merged(&profile).unwrap_or_default();
-        if projects.is_empty() {
-            self.info_dialog = Some(InfoDialog::new(
-                "No Projects",
-                "No registered projects available. Add one with `aoe project add <path>`.",
-            ));
-            return;
+        match crate::session::projects::load_merged(&profile) {
+            Ok(projects) if projects.is_empty() => {
+                self.projects_dialog = Some(ProjectsDialog::new_adding(&profile));
+            }
+            Ok(projects) => {
+                self.project_session_picker_dialog =
+                    Some(ProjectSessionPickerDialog::new(projects));
+            }
+            Err(e) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Projects Failed",
+                    &format!("Failed to load projects: {e}"),
+                ));
+            }
         }
-        self.project_session_picker_dialog = Some(ProjectSessionPickerDialog::new(projects));
     }
 
     /// Show the sort-order picker dialog seeded with the current order.
@@ -4603,7 +4630,7 @@ impl HomeView {
                     "stamp_last_accessed: failed to persist auto-unsink"
                 );
             }
-            self.flat_items = self.build_flat_items();
+            self.rebuild_flat_items();
         } else {
             self.mutate_instance(id, |inst| inst.touch_last_accessed());
         }
@@ -5140,7 +5167,7 @@ impl HomeView {
             self.selected_session = None;
         }
         self.rebuild_group_trees();
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
         if self.cursor >= self.flat_items.len() {
             self.cursor = self.flat_items.len().saturating_sub(1);
         }
@@ -5367,6 +5394,52 @@ impl HomeView {
             self.instance_map.insert(id.to_string(), inst.clone());
         }
         Ok(())
+    }
+
+    /// Persist a passively-detected status transition for one instance so
+    /// the next disk reload (a TUI relaunch, or a peer like `aoe serve`)
+    /// finds disk already caught up instead of comparing against a stale
+    /// snapshot and misreading it as a fresh transition. See #2690. Best
+    /// effort: unlike `apply_user_action`, a write failure here does not
+    /// roll back the in-memory status update, since the poller is the sole
+    /// authority on live status regardless of whether disk persistence
+    /// succeeds.
+    ///
+    /// `mark_unread` folds the Running -> Idle unread mark into the same
+    /// `Storage::update` call instead of a second flock round-trip on the
+    /// same row in the same tick, matching the daemon's per-tick batching
+    /// shape in `status_poll_loop`.
+    pub(super) fn persist_passive_status_transition(&self, id: &str, mark_unread: bool) {
+        let Some(inst) = self.instance_map.get(id) else {
+            return;
+        };
+        let Some(storage) = self.storages.get(&inst.source_profile) else {
+            return;
+        };
+        let patch = crate::session::PassiveStatusPatch::from_instance(inst);
+        if let Err(e) = storage.update(|insts, _groups| {
+            if let Some(disk) = insts.iter_mut().find(|i| i.id == patch.id) {
+                disk.merge_passive_status_patch(&patch);
+                if mark_unread {
+                    disk.mark_unread();
+                }
+            }
+            Ok(())
+        }) {
+            // Best-effort persistence (see method docstring): a write
+            // failure here does not roll back the in-memory update, but
+            // silence would obscure a persistent flock timeout or EIO
+            // loop. The daemon's sibling path in
+            // `api::persist_session_update` logs the same class of
+            // failure at `target: "http.api.sessions"`; log here so a
+            // TUI-only user has parity visibility under
+            // `AOE_LOG_LEVEL=debug`.
+            tracing::warn!(
+                target: "session.store",
+                session_id = %patch.id,
+                "persist_passive_status_transition failed: {e}"
+            );
+        }
     }
 
     /// Atomic per-action mutate: in-memory once, disk via
@@ -5975,7 +6048,7 @@ impl HomeView {
                     }
                 }
             }
-            self.flat_items = self.build_flat_items();
+            self.rebuild_flat_items();
         }
         if let Some(pos) = self
             .flat_items

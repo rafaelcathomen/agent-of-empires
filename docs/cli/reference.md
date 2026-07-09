@@ -77,6 +77,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe profile delete`↴](#aoe-profile-delete)
 * [`aoe profile rename`↴](#aoe-profile-rename)
 * [`aoe profile default`↴](#aoe-profile-default)
+* [`aoe profile show`↴](#aoe-profile-show)
 * [`aoe project`↴](#aoe-project)
 * [`aoe project list`↴](#aoe-project-list)
 * [`aoe project add`↴](#aoe-project-add)
@@ -1147,6 +1148,7 @@ Manage profiles (separate workspaces)
 * `delete` — Delete a profile
 * `rename` — Rename a profile
 * `default` — Show or set default profile
+* `show` — Show profile-derived values for scripts
 
 
 
@@ -1204,6 +1206,19 @@ Show or set default profile
 ###### **Arguments:**
 
 * `<NAME>` — Profile name (optional, shows current if not provided)
+
+
+
+## `aoe profile show`
+
+Show profile-derived values for scripts
+
+**Usage:** `aoe profile show [OPTIONS]`
+
+###### **Options:**
+
+* `--status-map <AGENT>` — Print the resolved status map for an agent
+* `--json` — Emit JSON output
 
 
 

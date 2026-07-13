@@ -24,6 +24,11 @@ pub fn instance_from_spec(automation: &Automation, profile: &str) -> Instance {
     inst.group_path = spec.group_path.clone();
     if let Some(tool) = &spec.tool {
         inst.tool = tool.clone();
+    } else if spec.command.is_some() {
+        // A command-only automation is not an override for the default agent.
+        // Keep it agent-neutral so auto-approve cannot append an agent-specific
+        // permission flag to an arbitrary executable.
+        inst.tool.clear();
     }
     if let Some(cmd) = &spec.command {
         inst.command = cmd.clone();
@@ -197,5 +202,24 @@ mod tests {
         assert!(inst.title.contains("slack"));
         assert_eq!(inst.source_profile, "default");
         assert_eq!(inst.automation_id.as_deref(), Some(a.id.as_str()));
+    }
+
+    #[test]
+    fn command_only_spec_does_not_inherit_default_agent() {
+        let mut spec = spec();
+        spec.tool = None;
+        spec.command = Some("bash".into());
+        let a = Automation::new(
+            "shell command",
+            spec,
+            Trigger::Cron {
+                expr: "* * * * *".into(),
+            },
+        );
+
+        let inst = instance_from_spec(&a, "default");
+
+        assert_eq!(inst.command, "bash");
+        assert!(inst.tool.is_empty());
     }
 }

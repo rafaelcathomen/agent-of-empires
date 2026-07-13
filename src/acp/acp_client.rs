@@ -3734,8 +3734,8 @@ fn map_update_to_events(
         SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
         SessionUpdate::ToolCall(tc) => {
             let terminal_status = match tc.status {
-                agent_client_protocol::schema::ToolCallStatus::Completed => Some(false),
-                agent_client_protocol::schema::ToolCallStatus::Failed => Some(true),
+                agent_client_protocol::schema::v1::ToolCallStatus::Completed => Some(false),
+                agent_client_protocol::schema::v1::ToolCallStatus::Failed => Some(true),
                 _ => None,
             };
             let completion_content = terminal_status
@@ -10290,7 +10290,7 @@ mod tests {
 
     #[test]
     fn classify_lifecycle_signal_terminal_initial_tool_call_is_completed() {
-        use agent_client_protocol::schema::{SessionUpdate, ToolCall, ToolCallStatus};
+        use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall, ToolCallStatus};
 
         for (status, succeeded) in [
             (ToolCallStatus::Completed, true),
@@ -10314,7 +10314,7 @@ mod tests {
 
     #[test]
     fn map_terminal_initial_tool_call_emits_start_and_completion() {
-        use agent_client_protocol::schema::{
+        use agent_client_protocol::schema::v1::{
             Content, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
         };
 

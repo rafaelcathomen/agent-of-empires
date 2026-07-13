@@ -2373,10 +2373,12 @@ impl HomeView {
                     self.search_match_index = 0;
                 }
                 KeyCode::Enter => {
+                    // vim-parity: Enter commits but keeps search_matches
+                    // and search_query so `n`/`N` cycle survives reloads
+                    // (`refresh_search_matches` re-scores against the same
+                    // query). Esc above remains the cancel-and-clear path.
+                    // See #2676.
                     self.search_active = false;
-                    self.search_query = Input::default();
-                    self.search_matches.clear();
-                    self.search_match_index = 0;
                 }
                 _ => {
                     self.search_query
@@ -2583,6 +2585,11 @@ impl HomeView {
             ActionId::SearchStart => {
                 self.search_active = true;
                 self.search_query = Input::default();
+                // Post-#2676: committed matches from a prior `/`-search
+                // persist across `Enter`; clear them here so `[i/N]` does
+                // not briefly render over an empty input on reopen.
+                self.search_matches.clear();
+                self.search_match_index = 0;
             }
             ActionId::SearchNext => {
                 if self.search_matches.is_empty() {
@@ -2796,8 +2803,9 @@ impl HomeView {
         // Pull the few parent fields we need into owned locals so the
         // immutable borrow of `self` is dropped before the mutable `self.`
         // calls below (dialog construction, info_dialog assignment). A
-        // structured (ACP) parent forks structured, so its captured ACP
-        // session id rides along; the field only exists under `serve`.
+        // structured view parent forks through ACP. The captured ACP session
+        // id is read into a local only under `serve`, since only that fork
+        // branch consumes it.
         let Some(parent) = self
             .selected_session
             .as_ref()
@@ -2837,7 +2845,7 @@ impl HomeView {
                     self.info_dialog = Some(InfoDialog::new(
                         "Fork not supported",
                         &format!(
-                            "The '{}' agent cannot fork a structured session. Fork is available for agents that support the ACP fork capability, such as Claude.",
+                            "The '{}' agent cannot fork a structured view session. Fork is available for agents that support the ACP fork capability, such as Claude.",
                             tool
                         ),
                     ));
@@ -2854,11 +2862,20 @@ impl HomeView {
                     parent_acp_session_id: acp_id,
                 }
             }
-            // Without `serve` a session can never be structured (the field
-            // doesn't exist and `is_structured()` is hard-coded false), so this
-            // branch is unreachable; keep the compiler happy on bare-core.
             #[cfg(not(feature = "serve"))]
-            unreachable!("is_structured() is always false without the serve feature")
+            {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Fork not available in this build",
+                    "This `aoe` binary was built without the web dashboard \
+                     (a `--no-default-features` source build), so structured \
+                     view session forking is not included.\n\n\
+                     To fork this session:\n\
+                       \u{2022} Install a release build from GitHub Releases, or\n\
+                       \u{2022} Build from source with default features:\n\
+                         cargo build --release",
+                ));
+                return;
+            }
         } else {
             let child_id = crate::session::capture::generate_claude_session_id();
             match crate::session::fork::terminal_fork_seed(
@@ -2921,7 +2938,7 @@ impl HomeView {
     /// to borrow a path from), leaving the dialog on the default cwd.
     pub(super) fn group_repo_path(&self, group_path: &str) -> Option<String> {
         self.instances
-            .iter()
+            .values()
             .find(|inst| match self.group_by {
                 GroupByMode::Project => super::project_group_name(inst) == group_path,
                 _ => {
@@ -3343,13 +3360,15 @@ impl HomeView {
         match action {
             PaletteAction::Invoke(id) => {
                 // The palette's mental model is "run the named action," so clear
-                // any leftover search-cycle state first: otherwise picking "New
-                // session" while a search is active would route the dual-purpose
-                // `n`/`N` actions into a search-cycle instead.
-                if !self.search_matches.is_empty() {
-                    self.search_matches.clear();
-                    self.search_match_index = 0;
-                }
+                // any leftover search state first: otherwise picking "New
+                // session" while a search is committed would route the
+                // dual-purpose `n`/`N` actions into a search-cycle instead.
+                // Also clear `search_query` (post-#2676) so a subsequent
+                // rebuild path calling `refresh_search_matches` cannot
+                // resurrect phantom matches against the stale query.
+                self.search_matches.clear();
+                self.search_match_index = 0;
+                self.search_query = Input::default();
                 self.run_action(id, update_info)
             }
             PaletteAction::Activate => self.activate_selected_session(),
@@ -3371,11 +3390,40 @@ impl HomeView {
         }
     }
 
+    fn jump_to_session_id(&mut self, id: &str) {
+        if let Some(idx) = self
+            .flat_items
+            .iter()
+            .position(|item| matches!(item, Item::Session { id: sid, .. } if sid == id))
+        {
+            self.cursor = idx;
+            self.update_selected();
+            return;
+        }
+
+        let previous = self.selected_session.clone();
+        self.select_and_reveal_session(id);
+        if self.selected_session != previous {
+            self.preview_scroll_offset = 0;
+            self.manual_unread_hold = None;
+        }
+    }
+
     fn jump_to_next_waiting(&mut self) {
         let len = self.flat_items.len();
         if len == 0 {
             return;
         }
+
+        let visible_sessions: std::collections::HashSet<String> = self
+            .flat_items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Session { id, .. } => Some(id.clone()),
+                Item::Group { .. } => None,
+            })
+            .collect();
+        let current_session = self.selected_session.clone();
 
         // Pass 1: forward-walk from cursor+1, wrapping, for the next Waiting
         // session OR a freshly-stopped Idle session (within
@@ -3391,15 +3439,39 @@ impl HomeView {
                 _ => continue,
             };
             if let Some(inst) = self.get_instance(&id) {
-                let is_actionable = inst.status == Status::Waiting
-                    || matches!(inst.idle_age(), Some(age) if age < window)
-                    || (crate::session::unread_enabled() && inst.is_unread());
+                // Trashed rows are stopped and only surface under the collapsed
+                // Trash section; they never "need attention", so skip them even
+                // when a stale unread flag survived the trash (#2489).
+                let is_actionable = !inst.is_trashed()
+                    && (inst.status == Status::Waiting
+                        || matches!(inst.idle_age(), Some(age) if age < window)
+                        || (crate::session::unread_enabled() && inst.is_unread()));
                 if is_actionable {
-                    self.cursor = idx;
-                    self.update_selected();
+                    self.jump_to_session_id(&id);
                     return;
                 }
             }
+        }
+
+        let hidden_actionable = self
+            .instances
+            .values()
+            .find(|inst| {
+                if visible_sessions.contains(&inst.id)
+                    || current_session.as_deref() == Some(inst.id.as_str())
+                    || inst.is_archived()
+                    || inst.is_trashed()
+                {
+                    return false;
+                }
+                inst.status == Status::Waiting
+                    || matches!(inst.idle_age(), Some(age) if age < window)
+                    || (crate::session::unread_enabled() && inst.is_unread())
+            })
+            .map(|inst| inst.id.clone());
+        if let Some(id) = hidden_actionable {
+            self.jump_to_session_id(&id);
+            return;
         }
 
         // Pass 2: fall back to the most-recently-accessed Idle session, skipping
@@ -3417,6 +3489,9 @@ impl HomeView {
             let Some(inst) = self.get_instance(&id) else {
                 continue;
             };
+            if inst.is_trashed() {
+                continue;
+            }
             if inst.status != Status::Idle {
                 continue;
             }
@@ -3435,8 +3510,40 @@ impl HomeView {
         }
 
         if let Some((idx, _)) = best {
-            self.cursor = idx;
-            self.update_selected();
+            let id = match self.flat_items.get(idx) {
+                Some(Item::Session { id, .. }) => id.clone(),
+                _ => return,
+            };
+            self.jump_to_session_id(&id);
+            return;
+        }
+
+        let mut best_hidden: Option<(String, Option<chrono::DateTime<chrono::Utc>>)> = None;
+        for inst in self.instances.values() {
+            if visible_sessions.contains(&inst.id)
+                || current_session.as_deref() == Some(inst.id.as_str())
+                || inst.is_archived()
+                || inst.is_trashed()
+                || inst.status != Status::Idle
+            {
+                continue;
+            }
+            let ts = inst.last_accessed_at;
+            let beats = match best_hidden {
+                None => true,
+                Some((_, b)) => match (ts, b) {
+                    (Some(a), Some(b)) => a > b,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                },
+            };
+            if beats {
+                best_hidden = Some((inst.id.clone(), ts));
+            }
+        }
+
+        if let Some((id, _)) = best_hidden {
+            self.jump_to_session_id(&id);
             return;
         }
 
@@ -3665,12 +3772,13 @@ impl HomeView {
         self.update_selected();
     }
 
-    fn apply_sort_order(&mut self, new_order: SortOrder) {
+    pub(super) fn apply_sort_order(&mut self, new_order: SortOrder) {
         self.sort_order = new_order;
-        self.flat_items = self.build_flat_items();
         if self.search_active && !self.search_query.value().is_empty() {
+            self.flat_items = self.build_flat_items();
             self.update_search();
         } else {
+            self.rebuild_flat_items();
             self.reseat_cursor_after_rebuild();
         }
         if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
@@ -3683,7 +3791,7 @@ impl HomeView {
 
     fn apply_group_by(&mut self, new_mode: GroupByMode) {
         self.group_by = new_mode;
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
         match load_config().map(|c| c.unwrap_or_default()) {
             Ok(mut config) => {
@@ -3719,7 +3827,7 @@ impl HomeView {
                 .unwrap_or(false);
             self.project_group_collapsed
                 .insert(path.to_string(), !collapsed);
-            self.flat_items = self.build_flat_items();
+            self.rebuild_flat_items();
             self.save_project_group_collapsed();
             return;
         }
@@ -3730,7 +3838,7 @@ impl HomeView {
                 tree.toggle_collapsed(path);
             }
         }
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
         if let Err(e) = self.save() {
             tracing::error!(target: "tui.input", "Failed to save group state: {}", e);
         }
@@ -4695,7 +4803,7 @@ impl HomeView {
             let prefix = format!("{}/", group_path);
             let session_count = self
                 .instances
-                .iter()
+                .values()
                 .filter(|i| {
                     (i.group_path == *group_path || i.group_path.starts_with(&prefix))
                         && owning_profile
@@ -5571,6 +5679,19 @@ impl HomeView {
     /// Re-score matches after a reload without moving the cursor.
     fn search_haystack_for(inst: &crate::session::Instance) -> String {
         format!("{} {}", inst.title, inst.project_path)
+    }
+
+    /// Rebuild `flat_items` and re-score any committed `search_matches`
+    /// against the new indices. Every mutation site that touches
+    /// `self.flat_items` must go through this helper or `search_matches`
+    /// retains stale indices into the old list, and `n`/`N` cycles jump
+    /// to wrong sessions (row highlights follow the stale indices too).
+    /// See #2676.
+    pub(super) fn rebuild_flat_items(&mut self) {
+        self.flat_items = self.build_flat_items();
+        if !self.search_matches.is_empty() {
+            self.refresh_search_matches();
+        }
     }
 
     pub(super) fn refresh_search_matches(&mut self) {

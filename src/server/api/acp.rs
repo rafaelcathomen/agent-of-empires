@@ -59,7 +59,7 @@ fn mime_allowed(kind: PromptAttachmentKind, mime: &str) -> bool {
 /// True if `bytes` start with a magic-number signature for a supported
 /// raster image. Guards against a client mislabeling arbitrary bytes as
 /// `image/png` to smuggle them past the allowlist.
-fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
+pub(crate) fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
         Some("image/png")
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
@@ -267,6 +267,17 @@ pub(crate) fn read_only_block(state: &AppState) -> Option<axum::response::Respon
     None
 }
 
+fn not_structured_response() -> axum::response::Response {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({
+            "error": "not_structured",
+            "message": "Switch the session to structured view before starting an ACP worker",
+        })),
+    )
+        .into_response()
+}
+
 pub async fn spawn_acp(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -279,11 +290,24 @@ pub async fn spawn_acp(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let instances = state.instances.read().await;
-    let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
-        return (StatusCode::NOT_FOUND, "session not found").into_response();
+    {
+        let instances = state.instances.read().await;
+        if !instances.iter().any(|i| i.id == id) {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        }
+    }
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
+    let instance = {
+        let instances = state.instances.read().await;
+        let Some(instance) = instances.iter().find(|i| i.id == id).cloned() else {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        };
+        if !instance.is_structured() {
+            return not_structured_response();
+        }
+        instance
     };
-    drop(instances);
 
     // Pick the structured view agent: explicit request override > stored
     // agent_name on the instance > registry entry keyed on the
@@ -317,10 +341,8 @@ pub async fn spawn_acp(
     // parent id instead of session/new. Cleared once the forked id lands.
     let fork_from = instance.fork_pending.clone();
 
-    let inst_lock = state.instance_lock(&id).await;
-    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
+    let sandbox_info = match crate::acp::sandbox::ensure_container_for_session_locked(
         &state.instances,
-        &inst_lock,
         &id,
         false,
     )
@@ -900,19 +922,28 @@ pub async fn switch_acp_agent(
             }
         }
     }
-    if let Ok(storage) = crate::session::Storage::new(&profile_for_save, state.file_watch.clone()) {
-        if let Err(e) = storage.update(|instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
-                inst.agent_name = Some(target_for_save.clone());
-                inst.acp_session_id = None;
-                inst.import_pending = None;
+    match crate::session::Storage::new(&profile_for_save, state.file_watch.clone()) {
+        Ok(storage) => {
+            if let Err(e) = storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_save) {
+                    inst.agent_name = Some(target_for_save.clone());
+                    inst.acp_session_id = None;
+                    inst.import_pending = None;
+                }
+                Ok(())
+            }) {
+                tracing::error!(
+                    target: "http.api.acp",
+                    session = %id_for_save,
+                    "failed to persist agent_name after switch: {e}"
+                );
             }
-            Ok(())
-        }) {
+        }
+        Err(e) => {
             tracing::error!(
                 target: "http.api.acp",
                 session = %id_for_save,
-                "failed to persist agent_name after switch: {e}"
+                "failed to open storage to persist agent_name after switch: {e}"
             );
         }
     }
@@ -1161,14 +1192,11 @@ pub async fn acp_prompt(
         .acp_supervisor
         .publish_user_prompt_with_attachments(&id, req.text.clone(), &attachments)
         .await;
-    // Best-effort: auto-rename a still-default-named session from this first
-    // message via AoE's one-shot mode. Detached so it never blocks or fails the
-    // prompt; all gating lives inside. See session::smart_rename.
-    tokio::spawn(crate::session::smart_rename::try_smart_rename(
-        state.clone(),
-        id.clone(),
-        req.text.clone(),
-    ));
+    // Smart-rename now fires from `acp_event_listener` on the first clean
+    // `prompt_complete` `Event::Stopped` for this session, so the one-shot
+    // never races this handler's live worker for the same provider API.
+    // The event-store lookup of the first prompt happens in the listener.
+    // See `session::smart_rename` and #2348.
     match state
         .acp_supervisor
         .send_prompt(&id, &req.text, &attachments)
@@ -1740,7 +1768,7 @@ pub async fn acp_enable(
                     crate::acp::codex_import::find_rollout_for_cwd(&cwd).map(|r| r.session_id)
                 }
                 "claude" => {
-                    crate::acp::claude_import::find_session_for_cwd(&cwd).map(|s| s.session_id)
+                    crate::session::claude_import::find_session_for_cwd(&cwd).map(|s| s.session_id)
                 }
                 _ => None,
             })
@@ -1920,6 +1948,14 @@ pub async fn acp_disable(
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
+    {
+        let instances = state.instances.read().await;
+        if !instances.iter().any(|i| i.id == id) {
+            return (StatusCode::NOT_FOUND, "session not found").into_response();
+        }
+    }
+    let inst_lock = state.instance_lock(&id).await;
+    let _guard = inst_lock.lock().await;
     let (mut instance, profile) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id).cloned() else {
@@ -2097,6 +2133,47 @@ pub struct SetConfigOptionRequest {
     pub value: String,
 }
 
+/// Write a picked model back onto the instance, both in the in-memory
+/// registry (what the reconciler reads to respawn a worker this daemon
+/// lifetime) and on disk (what survives a daemon restart). Called from
+/// `acp_set_config_option` after the live pick succeeds; see the comment there
+/// for why the live call alone is not enough.
+async fn persist_agent_model(state: &Arc<AppState>, id: &str, model: &str) {
+    let profile = {
+        let mut instances = state.instances.write().await;
+        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+            return;
+        };
+        inst.agent_model = Some(model.to_string());
+        inst.source_profile.clone()
+    };
+    match crate::session::Storage::new(&profile, state.file_watch.clone()) {
+        Ok(storage) => {
+            let id_owned = id.to_string();
+            let model_owned = model.to_string();
+            if let Err(e) = storage.update(|instances, _groups| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) {
+                    inst.agent_model = Some(model_owned.clone());
+                }
+                Ok(())
+            }) {
+                tracing::error!(
+                    target: "http.api.acp",
+                    session = %id,
+                    "failed to persist agent_model after config-option pick: {e}"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "http.api.acp",
+                session = %id,
+                "failed to open storage to persist agent_model after config-option pick: {e}"
+            );
+        }
+    }
+}
+
 /// Set a per-session selector (model, reasoning effort, etc.) via ACP
 /// `session/set_config_option`. The structured view treats every category
 /// through this one endpoint; rejection surfaces as a non-blocking
@@ -2132,6 +2209,19 @@ pub async fn acp_set_config_option(
                     .telemetry_structured
                     .plan_mode_seen
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // Persist a model pick so it survives a worker respawn. The live
+            // set_config_option above only reconfigures the running process; the
+            // reconciler re-reads `agent_model` on every spawn and injects it as
+            // AOE_AGENT_MODEL, so without this write-back a respawn reverts to
+            // the stale stored model and silently overrides the agent's own
+            // default. Mirrors the persist step of the agent-switch path above.
+            // ponytail: keys on the well-known "model" config id, which every
+            // current adapter and the frontend use; resolve category == Model
+            // from the session's config_options if a future adapter uses another
+            // id.
+            if req.config_id == "model" {
+                persist_agent_model(&state, &id, &req.value).await;
             }
             StatusCode::ACCEPTED.into_response()
         }
@@ -2371,7 +2461,7 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     if let Some(resp) = read_only_block(&state) {
         return resp;
     }
-    let mut sessions = tokio::task::spawn_blocking(crate::acp::claude_import::scan_sessions)
+    let mut sessions = tokio::task::spawn_blocking(crate::session::claude_import::scan_sessions)
         .await
         .unwrap_or_default();
     // Drop sessions AoE owns: importing one is a no-op and they are noise in
@@ -2417,7 +2507,7 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     });
     // Cap AFTER ownership filtering so a burst of AoE-managed sessions can't
     // push real imports off the (newest-first) list. See #2276.
-    sessions.truncate(crate::acp::claude_import::MAX_SESSIONS);
+    sessions.truncate(crate::session::claude_import::MAX_SESSIONS);
     Json(sessions).into_response()
 }
 
@@ -2461,6 +2551,86 @@ mod tests {
         assert!(!is_plan_mode_value("yolo"));
         assert!(!is_plan_mode_value("Plan"));
         assert!(!is_plan_mode_value(""));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_agent_model_updates_memory_and_storage() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        let mut inst = crate::session::Instance::new("t", "/tmp");
+        inst.source_profile = profile.to_string();
+        inst.agent_model = Some("claude-sonnet-4-6".to_string());
+        let id = inst.id.clone();
+
+        // Seed on disk so the storage write-back can find the row to update.
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        persist_agent_model(&state, &id, "claude-sonnet-5").await;
+
+        // In-memory registry updated (what the reconciler reads to respawn).
+        assert_eq!(
+            state.instances.read().await[0].agent_model.as_deref(),
+            Some("claude-sonnet-5")
+        );
+
+        // On disk too (what survives a daemon restart).
+        let reloaded = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(
+            reloaded
+                .iter()
+                .find(|i| i.id == id)
+                .unwrap()
+                .agent_model
+                .as_deref(),
+            Some("claude-sonnet-5")
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_acp_missing_session_does_not_create_instance_lock() {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+
+        let response = spawn_acp(
+            State(state.clone()),
+            Path("missing".to_string()),
+            Ok(Json(SpawnAcpRequest {
+                agent: None,
+                model: None,
+                additional_dirs: Vec::new(),
+                provider_env: Vec::new(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(state.instance_locks.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acp_disable_missing_session_does_not_create_instance_lock() {
+        let state = crate::server::test_support::build_test_app_state(Vec::new());
+
+        let response = acp_disable(State(state.clone()), Path("missing".to_string()))
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(state.instance_locks.read().await.is_empty());
     }
 
     #[test]

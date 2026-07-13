@@ -534,11 +534,16 @@ pub fn build_instance(
             // Single worktree mode (existing logic)
             let path = PathBuf::from(&params.path);
             if !GitWorktree::is_git_repo(&path) {
-                bail!(
+                // Typed error (not a bare `bail!` string) so the web handler's
+                // whitelist forwards an actionable message instead of the
+                // opaque "Failed to create session". The context keeps the
+                // fuller tip for callers that surface the anyhow chain (CLI,
+                // TUI).
+                return Err(anyhow::Error::new(GitError::NotAGitRepo).context(format!(
                     "Worktree mode requires a git repository, but this path is not one: {}\n\
                      Tip: start an in-place session (no worktree) here, or point at a git repository.",
                     path.display()
-                );
+                )));
             }
             let main_repo_path_raw = GitWorktree::find_main_repo(&path)?;
             let main_repo_path = main_repo_path_raw
@@ -946,7 +951,12 @@ pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     // `foo.lock`).
     out = out
         .split('/')
-        .map(|seg| seg.strip_suffix(".lock").unwrap_or(seg))
+        .map(|mut seg| {
+            while let Some(stripped) = seg.strip_suffix(".lock") {
+                seg = stripped;
+            }
+            seg
+        })
         .collect::<Vec<_>>()
         .join("/");
     while matches!(out.chars().last(), Some('-' | '.' | '/')) {
@@ -955,8 +965,9 @@ pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
     while matches!(out.chars().next(), Some('-' | '.' | '/')) {
         out.remove(0);
     }
-    // A lone '@' is also rejected by git as a complete ref name.
-    if out.is_empty() || out == "@" {
+    // A lone '@' and the symbolic ref HEAD are also rejected by git as
+    // complete ref names.
+    if out.is_empty() || out == "@" || out == "HEAD" {
         "session".to_string()
     } else {
         out
@@ -1261,14 +1272,19 @@ mod tests {
             git_sanitize_branch_name("feat/release.lock/v2"),
             "feat/release/v2"
         );
+        assert_eq!(git_sanitize_branch_name("foo.lock.lock"), "foo");
+        assert_eq!(
+            git_sanitize_branch_name("feat/release.lock.lock/v2.lock.lock"),
+            "feat/release/v2"
+        );
     }
 
     #[test]
-    fn test_git_sanitize_branch_name_rejects_bare_at_sign() {
-        // git-check-ref-format also rejects the single character "@" as a
-        // complete ref name; fall back to "session" rather than producing
-        // a name libgit2 will refuse.
+    fn test_git_sanitize_branch_name_rejects_special_complete_refs() {
+        // git-check-ref-format also rejects special complete ref names; fall
+        // back to "session" rather than producing a name libgit2 will refuse.
         assert_eq!(git_sanitize_branch_name("@"), "session");
+        assert_eq!(git_sanitize_branch_name("HEAD"), "session");
     }
 
     #[test]
@@ -1934,6 +1950,38 @@ mod tests {
             err.to_string()
                 .contains("Cannot combine --scratch with worktree mode"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn build_instance_worktree_on_non_git_path_returns_typed_not_a_git_repo() {
+        // A worktree requested on a plain (non-git) folder must fail with the
+        // typed GitError::NotAGitRepo, not a bare `bail!` string. The web
+        // handler only forwards an actionable message for whitelisted typed
+        // GitError variants, so a string bail would surface the opaque
+        // "Failed to create session" instead.
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let app_dir = isolated_app_dir(temp_home.path());
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), "").unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        let mut params = custom_agent_params(project.path(), "claude");
+        params.tool = "claude".to_string();
+        params.worktree_enabled = true;
+        params.worktree_branch = Some("feat".to_string());
+
+        let err = match build_instance(params, &[], &[], "default") {
+            Ok(_) => panic!("worktree on a non-git path must error"),
+            Err(e) => e,
+        };
+        assert!(
+            err.chain()
+                .filter_map(|c| c.downcast_ref::<crate::git::error::GitError>())
+                .any(|g| matches!(g, crate::git::error::GitError::NotAGitRepo)),
+            "expected a typed GitError::NotAGitRepo in the chain, got: {err:#}"
         );
     }
 }

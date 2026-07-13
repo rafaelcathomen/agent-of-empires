@@ -41,6 +41,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session archive`↴](#aoe-session-archive)
 * [`aoe session unarchive`↴](#aoe-session-unarchive)
 * [`aoe session restore`↴](#aoe-session-restore)
+* [`aoe session import`↴](#aoe-session-import)
 * [`aoe session list-trash`↴](#aoe-session-list-trash)
 * [`aoe session empty-trash`↴](#aoe-session-empty-trash)
 * [`aoe group`↴](#aoe-group)
@@ -65,6 +66,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe profile delete`↴](#aoe-profile-delete)
 * [`aoe profile rename`↴](#aoe-profile-rename)
 * [`aoe profile default`↴](#aoe-profile-default)
+* [`aoe profile show`↴](#aoe-profile-show)
 * [`aoe project`↴](#aoe-project)
 * [`aoe project list`↴](#aoe-project-list)
 * [`aoe project add`↴](#aoe-project-add)
@@ -454,6 +456,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 * `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
 * `restore` — Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
+* `import` — Import existing Claude Code sessions from disk. Scans the given path(s) (default: current directory) for Claude Code conversations whose working directory is at or under a path, and creates an AoE session for each: a terminal/tmux session that resumes the conversation with `claude --resume <id>` (default), or a structured-view session with `--structured`
 * `list-trash` — List the sessions currently in the trash
 * `empty-trash` — Permanently purge every trashed session in the profile (irreversible)
 
@@ -720,6 +723,27 @@ Restore a trashed session, returning it to its prior bucket with its transcript 
 
 
 
+## `aoe session import`
+
+Import existing Claude Code sessions from disk. Scans the given path(s) (default: current directory) for Claude Code conversations whose working directory is at or under a path, and creates an AoE session for each: a terminal/tmux session that resumes the conversation with `claude --resume <id>` (default), or a structured-view session with `--structured`
+
+**Usage:** `aoe session import [OPTIONS] [PATHS]...`
+
+###### **Arguments:**
+
+* `<PATHS>` — Directories to scan. Only Claude sessions whose recorded working directory is at or under one of these are imported. Defaults to the current directory. Cannot be combined with `--all`
+
+###### **Options:**
+
+* `--all` — Import every discoverable Claude session, ignoring the path filter
+* `--structured` — Import as structured-view sessions (rendered in the web dashboard and the structured TUI view) instead of terminal/tmux sessions. Structured sessions replay their transcript under `aoe serve`
+* `--group <GROUP>` — Place imported sessions under this session group
+* `--launch` — Start terminal sessions immediately after importing (spawns the tmux pane running `claude --resume <id>`). Ignored for structured imports
+* `--dry-run` — List what would be imported without creating anything
+* `-y`, `--yes` — Skip the confirmation prompt when importing more than one session
+
+
+
 ## `aoe session list-trash`
 
 List the sessions currently in the trash
@@ -958,6 +982,7 @@ Manage profiles (separate workspaces)
 * `delete` — Delete a profile
 * `rename` — Rename a profile
 * `default` — Show or set default profile
+* `show` — Show profile-derived values for scripts
 
 
 
@@ -1015,6 +1040,19 @@ Show or set default profile
 ###### **Arguments:**
 
 * `<NAME>` — Profile name (optional, shows current if not provided)
+
+
+
+## `aoe profile show`
+
+Show profile-derived values for scripts
+
+**Usage:** `aoe profile show [OPTIONS]`
+
+###### **Options:**
+
+* `--status-map <AGENT>` — Print the resolved status map for an agent
+* `--json` — Emit JSON output
 
 
 

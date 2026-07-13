@@ -26,6 +26,29 @@ fn read_config(h: &TuiTestHarness) -> String {
     std::fs::read_to_string(&cfg).unwrap_or_default()
 }
 
+/// Poll `config.toml` until it contains every `needle`, returning the
+/// contents, or panic after a timeout with the last-seen config.
+///
+/// The wizard persists synchronously in the submit handler, but the home
+/// screen's empty-list placeholder ("No sessions yet") renders behind the
+/// wizard overlay, so `wait_for` on it can match before `save_config`
+/// lands. A single `read_config` then races that write. Polling closes the
+/// gap without weakening the check: a value that genuinely never persists
+/// still fails the assertion.
+fn wait_for_config(h: &TuiTestHarness, needles: &[&str]) -> String {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let cfg = read_config(h);
+        if needles.iter().all(|n| cfg.contains(n)) {
+            return cfg;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("config did not contain {needles:?} within timeout; got:\n{cfg}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 #[test]
 #[serial]
 fn intro_walkthrough_appears_on_first_run() {
@@ -126,26 +149,25 @@ fn intro_theme_pick_persists_to_config() {
     // BUILTIN_THEMES (src/tui/styles/mod.rs) is ordered `default, empire, ...`
     // so a single Down from the default-seeded cursor lands on `empire`.
     h.send_keys("Down");
+    // Wait for the selection marker to land on `empire` before advancing, so a
+    // dropped/late Down keystroke can't leave the cursor on the default theme
+    // (render_theme_picker marks the selected row with a leading `▶`).
+    h.wait_for("▶ empire");
     h.send_keys("Enter"); // -> page 6 (done)
     h.wait_for("(6/6)");
     h.send_keys("Enter"); // submit
 
     h.wait_for("No sessions yet");
 
-    let cfg = read_config(&h);
-    assert!(
-        cfg.contains("name = \"empire\""),
-        "expected name = \"empire\" in config, got:\n{cfg}"
-    );
-    // Walking through AttachMode without toggling should persist the
-    // wizard's pre-selected LiveSend on both attach-mode fields.
-    assert!(
-        cfg.contains("new_session_attach_mode = \"live_send\""),
-        "expected new_session_attach_mode = live_send, got:\n{cfg}"
-    );
-    assert!(
-        cfg.contains("default_attach_mode = \"live_send\""),
-        "expected default_attach_mode = live_send, got:\n{cfg}"
+    // Walking through AttachMode without toggling persists the wizard's
+    // pre-selected LiveSend on both attach-mode fields alongside the theme.
+    wait_for_config(
+        &h,
+        &[
+            "name = \"empire\"",
+            "new_session_attach_mode = \"live_send\"",
+            "default_attach_mode = \"live_send\"",
+        ],
     );
 }
 
@@ -167,6 +189,9 @@ fn intro_lets_user_choose_tmux_attach() {
     h.wait_for("(4/6)");
     // Pre-selected LiveSend; flip to Tmux.
     h.send_keys("Down");
+    // Confirm the marker moved to Tmux before advancing, so a dropped Down
+    // can't leave LiveSend selected (render_attach_mode marks the row `▶`).
+    h.wait_for("▶ Tmux mode");
     h.send_keys("Enter"); // -> theme
     h.wait_for("(5/6)");
     h.send_keys("Enter"); // -> done
@@ -175,13 +200,11 @@ fn intro_lets_user_choose_tmux_attach() {
 
     h.wait_for("No sessions yet");
 
-    let cfg = read_config(&h);
-    assert!(
-        cfg.contains("new_session_attach_mode = \"tmux\""),
-        "expected new_session_attach_mode = tmux, got:\n{cfg}"
-    );
-    assert!(
-        cfg.contains("default_attach_mode = \"tmux\""),
-        "expected default_attach_mode = tmux, got:\n{cfg}"
+    wait_for_config(
+        &h,
+        &[
+            "new_session_attach_mode = \"tmux\"",
+            "default_attach_mode = \"tmux\"",
+        ],
     );
 }

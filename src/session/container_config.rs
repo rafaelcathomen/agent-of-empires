@@ -54,8 +54,10 @@ struct AgentConfigMount {
     /// authentication from being overwritten by stale host copies.
     preserve_files: &'static [&'static str],
     /// Files to delete from the sandbox dir before each launch. Prevents stale state
-    /// (e.g. SQLite databases from a previous opencode version) from causing failures
-    /// when the container image is updated.
+    /// (e.g. leftover lock/cache files) from causing failures when the container image
+    /// is updated. Do NOT use this for sandbox-owned session state (e.g. opencode's
+    /// SQLite DB, see #2605): that must survive relaunches, so it is kept out of
+    /// `clean_files` and instead protected from host drift via `skip_entries`.
     clean_files: &'static [&'static str],
 }
 
@@ -92,10 +94,13 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         tool_name: "opencode",
         host_rel: ".local/share/opencode",
         container_suffix: ".local/share/opencode",
-        // Never copy or keep the SQLite database in the sandbox. Opencode must
-        // create its own fresh database on each launch -- a stale db from a
-        // previous opencode version (or copied from the host) causes drizzle
-        // migration failures.
+        // `skip_entries` prevents copying the host DB into the sandbox; a
+        // schema-drifted host DB would trigger drizzle migration failures
+        // against the sandboxed opencode. The sandboxed opencode creates its
+        // own DB in-container on first launch, which is always schema-consistent
+        // with that opencode. Do NOT wipe it on subsequent launches: it
+        // holds `ses_*` session identity and is the resume source of truth.
+        // See #2605.
         skip_entries: &[
             "sandbox",
             "opencode.db",
@@ -107,7 +112,7 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
-        clean_files: &["opencode.db", "opencode.db-wal", "opencode.db-shm"],
+        clean_files: &[],
     },
     AgentConfigMount {
         tool_name: "opencode",
@@ -969,14 +974,13 @@ fn compute_workspace_volume_paths(
 
 /// Re-sync shared sandbox directories from the host so the container picks up
 /// any credential changes (e.g. re-auth) since it was created.
-pub(crate) fn refresh_agent_configs() {
+pub(crate) fn refresh_agent_configs_for_profile(profile: &str) {
     let Some(home) = dirs::home_dir() else {
         return;
     };
 
-    let hooks_enabled = super::config::Config::load()
-        .map(|c| c.session.agent_status_hooks)
-        .unwrap_or(true);
+    let profile_config = super::profile_config::resolve_config_or_warn(profile);
+    let hooks_enabled = profile_config.session.agent_status_hooks;
 
     for mount in AGENT_CONFIG_MOUNTS {
         let refresh_codex_hooks = hooks_enabled && should_refresh_codex_hooks(mount, &home);
@@ -984,7 +988,7 @@ pub(crate) fn refresh_agent_configs() {
         match prepare_sandbox_dir(mount, &home) {
             Ok(sandbox_dir) => {
                 if refresh_codex_hooks {
-                    refresh_codex_sandbox_hooks(mount, &sandbox_dir);
+                    refresh_codex_sandbox_hooks(mount, &sandbox_dir, &profile_config);
                 }
             }
             Err(e) => {
@@ -1021,20 +1025,33 @@ fn should_refresh_codex_hooks(mount: &AgentConfigMount, home: &Path) -> bool {
     host_hooks.exists() || sandbox_hooks.exists()
 }
 
-fn refresh_codex_sandbox_hooks(mount: &AgentConfigMount, sandbox_dir: &Path) {
-    let Some(hook_cfg) =
-        crate::agents::get_agent(mount.tool_name).and_then(|a| a.hook_config.as_ref())
-    else {
+fn refresh_codex_sandbox_hooks(
+    mount: &AgentConfigMount,
+    sandbox_dir: &Path,
+    profile_config: &super::config::Config,
+) {
+    let Some(agent) = crate::agents::get_agent(mount.tool_name) else {
         return;
     };
 
     let hooks_path = sandbox_dir.join("hooks.json");
+    let events = match crate::agents::resolved_hook_events(agent, profile_config) {
+        Ok(events) => events,
+        Err(e) => {
+            tracing::warn!(target: "session.profile",
+                "Failed to resolve Codex hooks while refreshing sandbox config {}: {}",
+                hooks_path.display(),
+                e
+            );
+            return;
+        }
+    };
     if let Err(e) = crate::hooks::install_hooks(
         &hooks_path,
-        hook_cfg.events,
+        &events,
         crate::hooks::HookInstallTarget::Sandbox,
     ) {
-        tracing::warn!(
+        tracing::warn!(target: "session.profile",
             "Failed to refresh Codex hooks in sandbox config {}: {}",
             hooks_path.display(),
             e
@@ -1291,12 +1308,12 @@ pub(crate) fn build_container_config(
 
     let project_path = Path::new(project_path_str);
     let resolved_profile = super::config::effective_profile(profile);
-    let profile_session_config =
-        super::profile_config::resolve_config_or_warn(&resolved_profile).session;
+    let profile_config = super::profile_config::resolve_config_or_warn(&resolved_profile);
+    let profile_session_config = &profile_config.session;
     let active_agent = resolve_active_agent(
         agent_selection.tool,
         agent_selection.detect_as,
-        &profile_session_config,
+        profile_session_config,
     );
     let config_tool = active_agent.map_or(agent_selection.tool, |agent| agent.name);
 
@@ -1501,62 +1518,85 @@ pub(crate) fn build_container_config(
             }
 
             if let Some(sidecar) = &agent.sidecar_hooks {
-                // Default target: the standalone hooks agent's sandbox config.
-                // When the user selected their own agent via the sidecar's
-                // selected-agent flag (e.g. Kiro `--agent NAME`), the container
-                // loads THAT agent's config (these CLIs have no global hooks), so
-                // install into its staged file instead. The selected agent's dir
-                // is copied into the sandbox via AGENT_CONFIG_MOUNTS, so the
-                // staged path is the sandbox config dir plus the selected name's
-                // file (mirrors the host path in
-                // `Instance::install_sidecar_host_hooks`).
-                let config_file = sidecar
-                    .selected_agent_hooks
-                    .as_ref()
-                    .zip(agent_selection.selected_agent)
-                    .and_then(|(sel, name)| {
-                        // The selected agent's dir is staged into the sandbox
-                        // (parent of sandbox_config_subpath, e.g.
-                        // `.kiro/sandbox/agents`) before this install runs, so
-                        // the resolver can match by `name` there as on the host.
-                        let agents_dir =
-                            home.join(Path::new(sidecar.sandbox_config_subpath).parent()?);
-                        Some((sel.resolve_config_file)(&agents_dir, name))
-                    })
-                    .unwrap_or_else(|| home.join(sidecar.sandbox_config_subpath));
-                if let Err(e) =
-                    (sidecar.install)(&config_file, crate::hooks::HookInstallTarget::Sandbox)
-                {
-                    tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e);
+                let events = match crate::agents::resolved_sidecar_hook_events(
+                    agent,
+                    &profile_config,
+                ) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        tracing::warn!(target: "session.profile", "Failed to resolve {} hooks in sandbox: {}", agent.name, e);
+                        Vec::new()
+                    }
+                };
+                if !events.is_empty() {
+                    // Default target: the standalone hooks agent's sandbox config.
+                    // When the user selected their own agent via the sidecar's
+                    // selected-agent flag (e.g. Kiro `--agent NAME`), the container
+                    // loads THAT agent's config (these CLIs have no global hooks), so
+                    // install into its staged file instead. The selected agent's dir
+                    // is copied into the sandbox via AGENT_CONFIG_MOUNTS, so the
+                    // staged path is the sandbox config dir plus the selected name's
+                    // file (mirrors the host path in
+                    // `Instance::install_sidecar_host_hooks`).
+                    let config_file = sidecar
+                        .selected_agent_hooks
+                        .as_ref()
+                        .zip(agent_selection.selected_agent)
+                        .and_then(|(sel, name)| {
+                            // The selected agent's dir is staged into the sandbox
+                            // (parent of sandbox_config_subpath, e.g.
+                            // `.kiro/sandbox/agents`) before this install runs, so
+                            // the resolver can match by `name` there as on the host.
+                            let agents_dir =
+                                home.join(Path::new(sidecar.sandbox_config_subpath).parent()?);
+                            Some((sel.resolve_config_file)(&agents_dir, name))
+                        })
+                        .unwrap_or_else(|| home.join(sidecar.sandbox_config_subpath));
+                    if let Err(e) = (sidecar.install)(
+                        &config_file,
+                        crate::hooks::HookInstallTarget::Sandbox,
+                        &events,
+                    ) {
+                        tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e);
+                    }
                 }
             } else if let Some(hook_cfg) = &agent.hook_config {
-                // Install hooks into the sandbox config file for the containerized agent.
-                // Shell one-liners work inside containers since they only use sh/mkdir/printf.
-                let rel_path = std::path::Path::new(hook_cfg.settings_rel_path);
-                let config_dir_name = rel_path.parent().unwrap_or(std::path::Path::new("."));
-                let config_file_name = rel_path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("settings.json");
-                // Find the matching agent config mount to locate the sandbox dir
-                for mount in AGENT_CONFIG_MOUNTS {
-                    if std::path::Path::new(mount.host_rel) == config_dir_name {
-                        let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
-                        let settings_file = sandbox_dir.join(config_file_name);
-                        let result = match hook_cfg.format {
-                            crate::agents::HookFormat::CodexJson
-                            | crate::agents::HookFormat::JsonSettings => {
-                                crate::hooks::install_hooks(
-                                    &settings_file,
-                                    hook_cfg.events,
-                                    crate::hooks::HookInstallTarget::Sandbox,
-                                )
+                let events = match crate::agents::resolved_hook_events(agent, &profile_config) {
+                    Ok(events) => events,
+                    Err(e) => {
+                        tracing::warn!(target: "session.profile", "Failed to resolve hooks in sandbox config: {}", e);
+                        Vec::new()
+                    }
+                };
+                if !events.is_empty() {
+                    // Install hooks into the sandbox config file for the containerized agent.
+                    // Shell one-liners work inside containers since they only use sh/mkdir/printf.
+                    let rel_path = std::path::Path::new(hook_cfg.settings_rel_path);
+                    let config_dir_name = rel_path.parent().unwrap_or(std::path::Path::new("."));
+                    let config_file_name = rel_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("settings.json");
+                    // Find the matching agent config mount to locate the sandbox dir
+                    for mount in AGENT_CONFIG_MOUNTS {
+                        if std::path::Path::new(mount.host_rel) == config_dir_name {
+                            let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
+                            let settings_file = sandbox_dir.join(config_file_name);
+                            let result = match hook_cfg.format {
+                                crate::agents::HookFormat::CodexJson
+                                | crate::agents::HookFormat::JsonSettings => {
+                                    crate::hooks::install_hooks(
+                                        &settings_file,
+                                        &events,
+                                        crate::hooks::HookInstallTarget::Sandbox,
+                                    )
+                                }
+                            };
+                            if let Err(e) = result {
+                                tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e);
                             }
-                        };
-                        if let Err(e) = result {
-                            tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e);
+                            break;
                         }
-                        break;
                     }
                 }
             }
@@ -2173,6 +2213,88 @@ mod tests {
             );
         }
         assert!(!sandbox.join("state.db").exists());
+    }
+
+    #[test]
+    fn test_opencode_mount_clean_files_does_not_touch_sqlite_db() {
+        // Drift guard for #2605. The opencode data-dir mount's SQLite DB holds
+        // `ses_*` session identity and is the resume source of truth;
+        // `skip_entries` handles host-to-sandbox pollution, so `clean_files`
+        // must not list `opencode.db*` (that regressed resume across every
+        // kill/restart).
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "opencode" && m.host_rel == ".local/share/opencode")
+            .expect("opencode data-dir mount");
+        assert!(
+            !mount
+                .clean_files
+                .iter()
+                .any(|f| f.starts_with("opencode.db")),
+            "opencode.db* must not appear in clean_files (regression of #2605); clean_files = {:?}",
+            mount.clean_files,
+        );
+        assert!(
+            mount.skip_entries.contains(&"opencode.db"),
+            "opencode.db must remain in skip_entries to block host schema drift",
+        );
+        assert!(
+            mount.skip_entries.contains(&"opencode.db-wal"),
+            "opencode.db-wal must remain in skip_entries to block host schema drift",
+        );
+        assert!(
+            mount.skip_entries.contains(&"opencode.db-shm"),
+            "opencode.db-shm must remain in skip_entries to block host schema drift",
+        );
+    }
+
+    #[test]
+    fn test_opencode_mount_preserves_sqlite_db_across_prepares() {
+        // Regression for #2605. Before the fix, `prepare_sandbox_dir` walked
+        // `clean_files` on every invocation and wiped the sandbox-owned
+        // opencode SQLite DB, so `aoe resume` hit "Session not found". This
+        // test plants a DB in the sandbox subdir, invokes `prepare_sandbox_dir`
+        // (which fires at container_config.rs:987 and :1436), and asserts the
+        // DB survives byte-for-byte.
+        let dir = TempDir::new().unwrap();
+        let host = dir.path().join(".local/share/opencode");
+        let sandbox = host.join(SANDBOX_SUBDIR);
+        fs::create_dir_all(&sandbox).unwrap();
+
+        let db_bytes = b"SQLite format 3\0-opencode-session-state";
+        fs::write(sandbox.join("opencode.db"), db_bytes).unwrap();
+        fs::write(sandbox.join("opencode.db-wal"), b"wal-frames").unwrap();
+        fs::write(sandbox.join("opencode.db-shm"), b"shm-index").unwrap();
+
+        // Host config so `sync_agent_config` has real work to do; without a
+        // non-empty host_dir the sync short-circuits and we would not exercise
+        // the code path that used to wipe the DB.
+        fs::write(host.join("config.json"), "{}").unwrap();
+
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "opencode" && m.host_rel == ".local/share/opencode")
+            .expect("opencode data-dir mount");
+        let out = prepare_sandbox_dir(mount, dir.path()).unwrap();
+        assert_eq!(out, sandbox);
+
+        assert!(
+            out.join("opencode.db").exists(),
+            "opencode.db must survive prepare_sandbox_dir (regression of #2605)",
+        );
+        assert_eq!(
+            fs::read(out.join("opencode.db")).unwrap(),
+            db_bytes,
+            "opencode.db content must be untouched",
+        );
+        assert!(
+            out.join("opencode.db-wal").exists(),
+            "opencode.db-wal must survive",
+        );
+        assert!(
+            out.join("opencode.db-shm").exists(),
+            "opencode.db-shm must survive",
+        );
     }
 
     #[test]
@@ -3781,7 +3903,7 @@ trusted_hash = "keep"
         fs::write(&sandbox_config_path, sandbox_config).unwrap();
         fs::write(codex_dir.join("config.toml"), r#"model = "updated""#).unwrap();
 
-        refresh_agent_configs();
+        refresh_agent_configs_for_profile(&crate::session::config::effective_profile(""));
 
         let config_text = fs::read_to_string(&sandbox_config_path).unwrap();
         let config: toml::Value = toml::from_str(&config_text).unwrap();
@@ -3799,6 +3921,68 @@ trusted_hash = "keep"
             "PreToolUse array must be installed in sandbox hooks.json"
         );
         assert!(hooks_text.contains("aoe-hooks"));
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_refresh_agent_configs_uses_profile_status_map_for_codex_hooks() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let codex_dir = temp_home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(codex_dir.join("config.toml"), r#"model = "initial""#).unwrap();
+
+        let mut profile_config = super::super::profile_config::ProfileConfig::default();
+        profile_config.overrides.insert(
+            "agents".to_string(),
+            serde_json::json!({
+                "codex": {
+                    "status_map": {
+                        "PreToolUse": "waiting"
+                    }
+                }
+            }),
+        );
+        super::super::profile_config::save_profile_config("work", &profile_config).unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let instance_id = "codex-profile-status-map-refresh-test";
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "work",
+        )
+        .unwrap();
+
+        refresh_agent_configs_for_profile("work");
+
+        let hooks_path = codex_dir.join(SANDBOX_SUBDIR).join("hooks.json");
+        let hooks: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+        let cmd = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap();
+        assert!(cmd.contains("printf waiting"), "got command: {cmd}");
         crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 

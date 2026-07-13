@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.12.0"
+version = "1.12.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -61,6 +61,9 @@ nucleo-matcher = "0.3"
 
 # Shell-style splitting of custom-agent ACP command strings into argv
 shell-words = "1.1"
+
+# Insertion-ordered id → Instance map for HomeView.instances.
+indexmap = "2"
 
 # Error handling
 thiserror = "2.0"
@@ -141,7 +144,7 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 axum = { version = "0.8", features = ["ws"], optional = true }
 # Cross-platform browser launcher for `aoe serve --open`.
 webbrowser = { version = "1", optional = true }
-tower-http = { version = "0.6", features = ["fs"], optional = true }
+tower-http = { version = "0.7", features = ["fs"], optional = true }
 rust-embed = { version = "8", features = ["debug-embed"], optional = true }
 mime_guess = { version = "2.0", optional = true }
 qrcode = { version = "0.14", optional = true }
@@ -161,7 +164,7 @@ jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"], optional = true }
 getrandom = { version = "0.4", optional = true }
 
 # Agent Client Protocol — drives the structured view surface bundled with `serve`.
-agent-client-protocol = { version = "0.14", optional = true, features = ["unstable_end_turn_token_usage", "unstable_elicitation", "unstable_session_fork"] }
+agent-client-protocol = { version = "0.15", optional = true, features = ["unstable_end_turn_token_usage", "unstable_elicitation", "unstable_session_fork"] }
 
 # Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
 semver = { version = "1", optional = true }
@@ -271,6 +274,12 @@ codegen-units = 16
 # builds. Use the default `dev` profile when you want the isolated
 # `-dev` namespace.
 debug-assertions = false
+
+[[test]]
+# ACP runner is part of the serve / structured-view surface.
+name = "acp_runner_orphan"
+path = "tests/acp_runner_orphan.rs"
+required-features = ["serve"]
 
 [[test]]
 # Explicit target so the `e2e-tests` feature gate applies. Without this entry

@@ -4,6 +4,10 @@ pub mod artifacts;
 pub mod builder;
 pub(crate) mod capture;
 pub mod civilizations;
+// Discovery of on-disk Claude Code sessions. Lives here (not under the
+// serve-gated `acp` module) because terminal/tmux import via the CLI works in
+// every build; only the structured-view import path needs `serve`.
+pub mod claude_import;
 pub mod config;
 pub(crate) mod container_config;
 pub mod deletion;
@@ -29,6 +33,8 @@ pub mod smart_rename;
 pub mod stop;
 mod storage;
 pub(crate) mod sync;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod trash;
 pub mod worktree_edit;
 
@@ -37,10 +43,10 @@ pub use crate::status_hooks::StatusHookConfig;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_telemetry_settings, get_update_settings, load_config, save_config,
-    validate_snooze_duration, CapabilityGrant, ClickAction, Config, ContainerRuntimeName,
-    DefaultTerminalMode, GroupByMode, NewSessionAttachMode, PluginConfig, RowTagMode,
-    SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxClipboardMode, TmuxMouseMode,
-    TmuxStatusBarMode, UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
+    validate_snooze_duration, AgentRuntimeConfig, CapabilityGrant, ClickAction, Config,
+    ContainerRuntimeName, DefaultTerminalMode, GroupByMode, NewSessionAttachMode, PluginConfig,
+    RowTagMode, SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxClipboardMode,
+    TmuxMouseMode, TmuxStatusBarMode, UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
@@ -54,7 +60,7 @@ pub use groups::{
 };
 #[cfg(feature = "serve")]
 pub(crate) use instance::ResumeAttemptPolicy;
-pub(crate) use instance::{persist_session_to_storage, ResumeIntent, SidWrite};
+pub(crate) use instance::{persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite};
 pub use instance::{
     EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, SessionBucket,
     StartOutcome, Status, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
@@ -712,21 +718,15 @@ pub fn is_tui_active(threshold: Duration) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::isolate_app_dir;
     use super::*;
 
-    fn isolate_app_dir() -> tempfile::TempDir {
-        let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
+    fn app_dir(root: impl AsRef<Path>) -> PathBuf {
+        let root = root.as_ref();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
-        temp_home
-    }
-
-    fn app_dir(temp_home: &tempfile::TempDir) -> PathBuf {
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let dir = temp_home.path().join(".config").join(APP_DIR_NAME_XDG);
+        let dir = root.join(".config").join(APP_DIR_NAME_XDG);
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let dir = temp_home.path().join(APP_DIR_NAME_OTHER);
+        let dir = root.join(APP_DIR_NAME_OTHER);
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -885,11 +885,12 @@ mod tests {
         assert!(warning.contains("Failed to load profile config 'default'"));
     }
 
-    fn release_dir_in(temp: &tempfile::TempDir) -> PathBuf {
+    fn release_dir_in(root: impl AsRef<Path>) -> PathBuf {
+        let root = root.as_ref();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let d = temp.path().join(".config").join("agent-of-empires");
+        let d = root.join(".config").join("agent-of-empires");
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        let d = temp.path().join(".agent-of-empires");
+        let d = root.join(".agent-of-empires");
         d
     }
 

@@ -548,6 +548,25 @@ that forks helpers is torn down whole), a per-worker respawn budget so a crash
 loop does not spin, and a concurrency cap. The worker's stderr drains to
 `<app_dir>/plugin-workers/<id>.log`.
 
+### Recovery and observability
+
+Launch runs through one idempotent `PluginHost::reconcile`: it starts a worker
+for every active runtime plugin that has none and tears down any worker whose
+plugin is no longer active. `start()` at daemon boot is that reconcile plus a
+WARN for each load error and each enabled-but-inactive runtime plugin, so a boot
+that launches zero workers names the reason (a stale grant, a host-version
+mismatch) in `debug.log` instead of going silent. The web enable/disable handler
+(`POST /api/plugins/{id}/enabled`) calls reconcile too, so toggling a plugin
+launches or stops its worker live, without a daemon restart.
+
+When a worker exhausts its respawn budget the host records an in-memory crash
+tombstone and surfaces a dashboard notification. A tombstoned plugin is not
+revived by an unrelated plugin's reconcile; disabling it clears the tombstone,
+so a disable then enable is a clean retry. A daemon restart also clears it. The
+CLI `aoe plugin enable|disable` mutates only on-disk config and does not reach a
+running daemon (it is a separate process), so recovering a live daemon needs the
+web toggle or a restart.
+
 ### Capability-gated host API
 
 Each host method maps to a capability the plugin declared and was granted; the
@@ -576,9 +595,18 @@ session reload (eventual consistency, not a live push).
 `sessions.list` returns one entry per session with `id`, `title`,
 `project_path`, `tool`, `status` (the run-state), and two inactivity flags:
 `archived` (the session is archived) and `snoozed` (it has a snooze deadline
-still in the future; a past deadline reports `false`). The call never filters
-server-side, so a worker that should ignore dormant sessions, for example to
-avoid spending API quota on them, checks these flags itself.
+still in the future; a past deadline reports `false`). A worker that should
+ignore dormant sessions, for example to avoid spending API quota on them, can
+check these flags itself.
+
+The call also takes an optional `exclude` param: an array of state names to
+drop server-side, from `archived`, `snoozed`, and `trashed`. A missing or empty
+`exclude` returns every session (so an older worker is unaffected); a value
+outside that set, or a non-string entry, is an `INVALID_PARAMS` error rather
+than a silently ignored filter. This lets a worker skip trashed sessions
+(pending deletion, never surfaced to the user) without enumerating them, which
+matters because a workspace with many trashed sessions would otherwise push
+per-session UI state for all of them.
 
 `config.get { key }` returns the value at `plugins.<plugin-id>.settings.<key>`
 for the calling plugin's own id, so a worker reads back the settings the user

@@ -165,7 +165,7 @@ impl HomeView {
         }
 
         self.refresh_registered_projects();
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
         self.update_selected();
     }
 
@@ -230,13 +230,11 @@ impl HomeView {
         // For the target profile, filter to that profile's instances.
         let existing_titles: Vec<&str> = self
             .instances()
-            .iter()
             .filter(|i| i.source_profile == target_profile)
             .map(|i| i.title.as_str())
             .collect();
         let existing_branches: Vec<&str> = self
             .instances()
-            .iter()
             .filter(|i| i.source_profile == target_profile)
             .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
             .collect();
@@ -474,7 +472,7 @@ impl HomeView {
                 // Rebuild the visible row list too; otherwise the row still
                 // renders under the old profile until the next reload, and
                 // any follow-up keybind hits stale cursor state.
-                self.flat_items = self.build_flat_items();
+                self.rebuild_flat_items();
             }
         }
 
@@ -561,7 +559,7 @@ impl HomeView {
             let prefix = format!("{}/", group_path);
             let ids_to_clear: Vec<String> = self
                 .instances
-                .iter()
+                .values()
                 .filter(|i| {
                     (i.group_path == group_path || i.group_path.starts_with(&prefix))
                         && owning_profile
@@ -600,7 +598,6 @@ impl HomeView {
 
             let sessions_to_delete: Vec<String> = self
                 .instances()
-                .iter()
                 .filter(|i| {
                     (i.group_path == group_path || i.group_path.starts_with(&prefix))
                         && owning_profile
@@ -665,7 +662,7 @@ impl HomeView {
                 }
             }
             self.save()?;
-            self.flat_items = self.build_flat_items();
+            self.rebuild_flat_items();
         }
         Ok(())
     }
@@ -678,7 +675,7 @@ impl HomeView {
     /// stuck in the Deleting state where the background deletion thread never
     /// returned a result.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
-        if let Some(inst) = self.instances.iter().find(|i| i.id == session_id) {
+        if let Some(inst) = self.instances.get(session_id) {
             let inst = inst.clone();
             std::thread::spawn(move || {
                 if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -717,7 +714,7 @@ impl HomeView {
         prefix: &str,
         owning_profile: Option<&str>,
     ) -> bool {
-        self.instances().iter().any(|i| {
+        self.instances().any(|i| {
             (i.group_path == group_path || i.group_path.starts_with(prefix))
                 && owning_profile.is_none_or(|p| i.source_profile == p)
                 && i.has_managed_worktree_or_workspace()
@@ -730,7 +727,7 @@ impl HomeView {
         prefix: &str,
         owning_profile: Option<&str>,
     ) -> bool {
-        self.instances().iter().any(|i| {
+        self.instances().any(|i| {
             (i.group_path == group_path || i.group_path.starts_with(prefix))
                 && owning_profile.is_none_or(|p| i.source_profile == p)
                 && i.sandbox_info.as_ref().is_some_and(|s| s.enabled)
@@ -784,7 +781,7 @@ impl HomeView {
         // Collect sessions belonging to this group and its descendants
         let affected_ids: Vec<String> = self
             .instances
-            .iter()
+            .values()
             .filter(|i| {
                 (i.group_path == ctx.old_path || i.group_path.starts_with(&old_prefix))
                     && i.source_profile == ctx.old_profile
@@ -1088,9 +1085,7 @@ impl HomeView {
 
                     // Get the instance to move
                     let mut instance = self
-                        .instances()
-                        .iter()
-                        .find(|i| i.id == id)
+                        .get_instance(&id)
                         .cloned()
                         .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
 
@@ -1231,7 +1226,7 @@ impl HomeView {
             return Ok(None);
         };
         let (is_snoozed, title) = {
-            let inst = self.instances.iter().find(|i| i.id == id);
+            let inst = self.instances.get(&id);
             match inst {
                 Some(i) => (i.is_snoozed(), i.title.clone()),
                 None => return Ok(None),
@@ -1239,7 +1234,7 @@ impl HomeView {
         };
         if is_snoozed {
             self.apply_user_action(&id, |inst| inst.unsnooze())?;
-            self.flat_items = self.build_flat_items();
+            self.rebuild_flat_items();
             return Ok(Some(format!("Woke: {}", title)));
         }
 
@@ -1259,12 +1254,12 @@ impl HomeView {
         minutes: u32,
     ) -> anyhow::Result<Option<String>> {
         let title = self
-            .instance_map
+            .instances
             .get(id)
             .map(|i| i.title.clone())
             .unwrap_or_default();
         self.apply_user_action(id, |inst| inst.snooze(minutes))?;
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
         if self.sort_order == crate::session::config::SortOrder::Attention {
             self.select_top_attention(None);
         }
@@ -1289,7 +1284,7 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
-        let is_fav = match self.instances.iter().find(|i| i.id == id) {
+        let is_fav = match self.instances.get(&id) {
             Some(i) => i.is_favorited(),
             None => return Ok(()),
         };
@@ -1298,7 +1293,7 @@ impl HomeView {
         } else {
             self.apply_user_action(&id, |inst| inst.favorite())?;
         }
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
         Ok(())
     }
 
@@ -1319,7 +1314,7 @@ impl HomeView {
             if id == archiving_id {
                 return None;
             }
-            let inst = self.instances.iter().find(|i| &i.id == id)?;
+            let inst = self.instances.get(id)?;
             (!inst.is_archived() && !inst.is_trashed()).then(|| id.clone())
         };
         for item in self.flat_items.iter().skip(self.cursor + 1) {
@@ -1346,7 +1341,7 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return Ok(());
         };
-        if !self.instances.iter().any(|i| i.id == id) {
+        if !self.instances.contains_key(&id) {
             return Ok(());
         }
         self.apply_user_action(&id, |inst| inst.toggle_unread())?;
@@ -1358,7 +1353,7 @@ impl HomeView {
         } else if self.manual_unread_hold.as_deref() == Some(id.as_str()) {
             self.manual_unread_hold = None;
         }
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
         // In Attention sort, toggling unread changes the row's rank, so the
         // rebuild can move it; reseat the cursor by id so the next action
         // still targets this session.
@@ -1377,17 +1372,17 @@ impl HomeView {
         // The shelve/unshelve key doubles as restore for the Trash section: a
         // trashed row can't be meaningfully archived, so `z` on it pulls the
         // session back out of the trash instead. See #2489.
-        if matches!(self.instances.iter().find(|i| i.id == id), Some(i) if i.is_trashed()) {
+        if matches!(self.instances.get(&id), Some(i) if i.is_trashed()) {
             self.restore_selected_from_trash();
             return Ok(());
         }
-        let is_archived = match self.instances.iter().find(|i| i.id == id) {
+        let is_archived = match self.instances.get(&id) {
             Some(i) => i.is_archived(),
             None => return Ok(()),
         };
         if is_archived {
             self.apply_user_action(&id, |inst| inst.unarchive())?;
-            self.flat_items = self.build_flat_items();
+            self.rebuild_flat_items();
             // Re-seat the cursor on the just-unarchived session. After the
             // flat_items rebuild the row jumps from tier 99 to its real
             // tier, so without this the cursor stays at the old index and
@@ -1399,7 +1394,7 @@ impl HomeView {
         }
 
         // Tear down all tmux before flipping archived. #1868.
-        if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
+        if let Some(inst) = self.instances.get(&id) {
             inst.kill_all_tmux_sessions();
         }
 
@@ -1416,7 +1411,7 @@ impl HomeView {
             // cursor advances to the next item that needs attention. That path
             // already lands selection on a live row, so it never showed the
             // dead-pane/selection-swap jank the default sort did.
-            self.flat_items = self.build_flat_items();
+            self.rebuild_flat_items();
             self.select_top_attention(None);
             // select_top_attention is a no-op when no session row is visible
             // (the archived row sank into a collapsed Archived section and
@@ -1440,7 +1435,7 @@ impl HomeView {
             // motivated the old follow-the-row behavior (#2025). The
             // Archived section is not auto-revealed; its header already
             // shows the updated count as feedback.
-            self.flat_items = self.build_flat_items();
+            self.rebuild_flat_items();
             match successor {
                 Some(next) => self.select_session_by_id(&next),
                 None => {
@@ -1458,14 +1453,15 @@ impl HomeView {
     /// Move a session to the trash: stop its tmux sessions (a structured-view
     /// worker is reaped by the daemon reconciler once the row reads trashed)
     /// and set `trashed_at`. Durable artifacts are kept so it can be
-    /// restored. The Trash section is revealed so the user sees where the row
-    /// went. See #2489.
+    /// restored. The Trash section's collapse state is left untouched: like
+    /// single-row archive, the section header's count is the feedback, so a
+    /// user who collapsed it stays collapsed (#2489).
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
         if let Err(e) = self.apply_user_action(id, |inst| inst.trash()) {
             tracing::warn!(target: "tui.session", session = %id, "trash failed: {e}");
             return;
         }
-        if let Some(inst) = self.instances.iter().find(|i| i.id == id) {
+        if let Some(inst) = self.instances.get(id) {
             inst.kill_all_tmux_sessions();
         }
         // The session is durably trashed and its agent stopped; relocate its
@@ -1483,8 +1479,7 @@ impl HomeView {
         if let Some(reason) = relocate_warning {
             tracing::warn!(target: "tui.session", session = %id, "trash worktree relocation skipped: {reason}");
         }
-        self.reveal_trashed_section();
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
         self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
         self.update_selected();
     }
@@ -1498,7 +1493,7 @@ impl HomeView {
             return;
         };
         let is_trashed = matches!(
-            self.instances.iter().find(|i| i.id == id),
+            self.instances.get(&id),
             Some(i) if i.is_trashed()
         );
         if !is_trashed {
@@ -1525,7 +1520,7 @@ impl HomeView {
             ));
             return;
         }
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
         self.select_session_by_id(&id);
     }
 
@@ -1544,7 +1539,7 @@ impl HomeView {
             // filter, exactly as `build_flat_items_by_project` builds them.
             crate::session::config::GroupByMode::Project => self
                 .instances
-                .iter()
+                .values()
                 .filter(|i| !i.is_archived() && !i.is_trashed())
                 .filter(|i| {
                     self.active_profile
@@ -1560,7 +1555,7 @@ impl HomeView {
             crate::session::config::GroupByMode::Manual => {
                 let prefix = format!("{}/", group_path);
                 self.instances
-                    .iter()
+                    .values()
                     .filter(|i| !i.is_archived() && !i.is_trashed())
                     .filter(|i| i.group_path == group_path || i.group_path.starts_with(&prefix))
                     .filter(|i| {
@@ -1583,11 +1578,9 @@ impl HomeView {
         }
         // Off-thread tmux teardown so N x 4 shellouts don't block the input
         // thread. Mirrors `force_remove_session`.
-        let kill_targets: Vec<_> = self
-            .instances
+        let kill_targets: Vec<_> = ids
             .iter()
-            .filter(|i| ids.contains(&i.id))
-            .cloned()
+            .filter_map(|id| self.instances.get(id).cloned())
             .collect();
         std::thread::spawn(move || {
             for inst in kill_targets {
@@ -1605,7 +1598,7 @@ impl HomeView {
         });
         self.bulk_apply_user_action(&ids, |inst| inst.archive())?;
         self.reveal_archived_section();
-        self.flat_items = self.build_flat_items();
+        self.rebuild_flat_items();
         // The project header vanishes once its last active member is archived
         // (project headers are seeded from live sessions only), so the cursor's
         // old index may now point past the list end; clamp and re-resolve.

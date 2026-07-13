@@ -1433,6 +1433,17 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // raw; only `cost` is rebased. clamp to zero defensively in case
     // an upstream restart ever reports a smaller cumulative. See #1354.
     const incoming = event.UsageUpdated.usage;
+    // Bandaid for upstream claude-agent-acp #596: mid-turn usage_update
+    // reports the 200k DEFAULT_CONTEXT_WINDOW for models whose real
+    // window is 1M (the `sonnet` / `default` aliases miss its `\b1m\b`
+    // heuristic), and only snaps to the authoritative window at the
+    // turn's `result`. Rendering each frame verbatim makes the footer
+    // flicker 200k <-> 1M every turn. Latch the largest window learned
+    // this session; a real context boundary (clear / compact /
+    // agent-switch / context-reset / model change) nulls sessionUsage,
+    // which resets the latch to the next raw value. Drop once upstream
+    // stops emitting the downgraded mid-turn guess.
+    const size = Math.max(incoming.size, next.sessionUsage?.size ?? 0);
     if (next.usageBaseline && incoming.cost) {
       const rebasedAmount = Math.max(0, incoming.cost.amount - next.usageBaseline.cost);
       const rebasedCost = {
@@ -1441,11 +1452,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       };
       next.sessionUsage = {
         used: incoming.used,
-        size: incoming.size,
+        size,
         cost: rebasedCost,
       };
     } else {
-      next.sessionUsage = incoming;
+      next.sessionUsage = { used: incoming.used, size, cost: incoming.cost };
     }
     return next;
   }
@@ -1482,6 +1493,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ConfigOptionsUpdated" in event) {
     const options = event.ConfigOptionsUpdated.options;
+    // A model change moves the context window, so drop the latched
+    // usage window (see the UsageUpdated arm) and relearn it for the
+    // new model instead of holding the prior model's larger window.
+    const priorModel = next.configOptions.find((o) => o.category === "model")?.current_value;
+    const nextModel = options.find((o) => o.category === "model")?.current_value;
+    if (priorModel !== undefined && nextModel !== undefined && priorModel !== nextModel) {
+      next.sessionUsage = null;
+    }
     next.configOptions = options;
     // The snapshot is authoritative, so any in-flight pending click
     // resolves here regardless of whether the adapter applied the
@@ -2114,6 +2133,45 @@ function mergeToolStart(prev: ToolCall, incoming: ToolCall): ToolCall {
     parent_tool_call_id: incoming.parent_tool_call_id ?? prev.parent_tool_call_id,
     memory_recall: incoming.memory_recall ?? prev.memory_recall,
   };
+}
+
+/** Prepend an older history page's rows ahead of the loaded tail, deduping
+ *  any `tool_start` whose `toolCallId` already exists in the tail. A tool
+ *  call split across the page seam (its `ToolCallStarted` in this older
+ *  page, its `ToolCallCompleted` already in the tail) left a synthesized
+ *  placeholder start in `tailRows` (see synthToolStartRow / #1713). Without
+ *  a cross-page merge the real start would prepend as a second row with the
+ *  same id, and two assistant-ui `tool-call` parts sharing a `toolCallId`
+ *  make `useResources` throw "Duplicate key" and crash the panel (#2711).
+ *  Merge the real start into the existing row in place (real name/kind/args
+ *  and its earlier `started_at` win) and drop the duplicate. Also covers a
+ *  plain frame overlap at the seam. */
+export function mergePrependedActivity(olderRows: ActivityRow[], tailRows: ActivityRow[]): ActivityRow[] {
+  const startIndexById = new Map<string, number>();
+  tailRows.forEach((row, i) => {
+    if (row.kind === "tool_start" && row.toolCallId) startIndexById.set(row.toolCallId, i);
+  });
+  if (startIndexById.size === 0) return olderRows.concat(tailRows);
+
+  let tail = tailRows;
+  const prepended: ActivityRow[] = [];
+  for (const row of olderRows) {
+    const idx = row.kind === "tool_start" && row.toolCallId ? startIndexById.get(row.toolCallId) : undefined;
+    if (idx === undefined) {
+      prepended.push(row);
+      continue;
+    }
+    const existing = tail[idx];
+    if (existing && existing.kind === "tool_start" && existing.tool && row.tool) {
+      const merged = mergeToolStart(existing.tool, row.tool);
+      // Keep the real start's timestamp; the synth placeholder carried the
+      // completion time, which would zero out the duration label (#1060).
+      if (row.tool.started_at) merged.started_at = row.tool.started_at;
+      tail = tail.slice();
+      tail[idx] = { ...existing, tool: merged, text: merged.name, at: merged.started_at };
+    }
+  }
+  return prepended.concat(tail);
 }
 
 function pushActivity(rows: ActivityRow[], row: ActivityRow): ActivityRow[] {

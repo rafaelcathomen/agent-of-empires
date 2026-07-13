@@ -8,6 +8,7 @@ import {
   fetchSettings,
   createSession,
   fetchVolumeIgnoresPreview,
+  fetchIsGitRepo,
   markVolumeIgnoresGlobsAcknowledged,
   type VolumeIgnoresGlobPreview,
   type HooksNeedTrust,
@@ -22,7 +23,6 @@ import { SessionStep } from "./steps/SessionStep";
 import { AgentPickerEssentials } from "./steps/AgentPickerEssentials";
 import { AgentOptions } from "./steps/AgentOptions";
 import { LaunchFooter } from "./LaunchFooter";
-import { getSubmittedBranch } from "./sessionNames";
 import { initialData, reducer, type WizardData } from "./wizardReducer";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 
@@ -228,6 +228,27 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Probe whether the selected path is a git repository so the worktree
+  // toggle can be disabled for a plain folder (e.g. a root picked via "Use
+  // this folder"). `/api/git/is-repo` uses the same `GitWorktree::is_git_repo`
+  // gate the builder enforces, so the UI matches the server's accept/reject.
+  // Only act on a definitive answer: on a transient failure (null) leave the
+  // optimistic default so a probe blip can't misreport a repo as a non-repo.
+  // Scratch sessions have no path and never use a worktree, so skip the probe.
+  const probePath = state.data.scratch ? "" : state.data.path;
+  useEffect(() => {
+    if (!probePath) return;
+    let cancelled = false;
+    fetchIsGitRepo(probePath).then((isRepo) => {
+      if (!cancelled && isRepo !== null) {
+        dispatch({ type: "SET_FIELD", field: "pathIsGitRepo", value: isRepo });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [probePath]);
+
   const handleChange = useCallback((field: string, value: unknown) => {
     dispatch({ type: "SET_FIELD", field, value });
   }, []);
@@ -264,7 +285,11 @@ export function SessionWizard({ onClose, onCreated, prefill }: Props) {
       title: d.title || undefined,
       group: d.group || undefined,
       yolo_mode: d.yoloMode,
-      worktree_branch: !d.scratch && d.useWorktree ? getSubmittedBranch(d.title, d.worktreeBranch) : undefined,
+      worktree_enabled: !d.scratch && d.useWorktree,
+      worktree_branch:
+        !d.scratch && d.useWorktree && d.worktreeBranchDirty && d.worktreeBranch.trim()
+          ? d.worktreeBranch.trim()
+          : undefined,
       create_new_branch: !d.scratch && d.useWorktree && !d.attachExisting,
       base_branch:
         !d.scratch && d.useWorktree && !d.attachExisting && d.baseBranch.trim() ? d.baseBranch.trim() : undefined,

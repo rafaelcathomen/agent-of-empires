@@ -64,9 +64,8 @@ fn claude_config_dir() -> Option<PathBuf> {
 /// from `"../{branch}-workspace-{session-id}"`. A cwd living under a directory
 /// whose name contains one of these is an AoE worktree or workspace, so it is
 /// excluded from the import picker. Derived from config so a custom template is
-/// honored. See #2276. Shared with `codex_import` so both agents' importers
-/// exclude AoE-managed worktrees the same way.
-pub(crate) fn worktree_dir_markers() -> Vec<String> {
+/// honored. See #2276.
+fn worktree_dir_markers() -> Vec<String> {
     let cfg = crate::session::Config::load_or_warn();
     let mut markers = Vec::new();
     for tmpl in [
@@ -104,7 +103,7 @@ fn strip_placeholders(seg: &str) -> String {
 /// one namespace (release vs `-dev`), so a scratch session from the other
 /// namespace slips past a plain `starts_with` check; match the app-dir name +
 /// `scratch` component pair instead. See #2276.
-pub(crate) fn cwd_is_aoe_scratch(cwd: &str) -> bool {
+fn cwd_is_aoe_scratch(cwd: &str) -> bool {
     let comps: Vec<&str> = Path::new(cwd)
         .components()
         .filter_map(|c| c.as_os_str().to_str())
@@ -117,7 +116,7 @@ pub(crate) fn cwd_is_aoe_scratch(cwd: &str) -> bool {
 /// True when any directory component of `cwd` contains a worktree marker. Uses
 /// `contains` (not a suffix match) because workspace dirs carry the marker
 /// mid-name, e.g. `<branch>-workspace-<id>`.
-pub(crate) fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
+fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
     if markers.is_empty() {
         return false;
     }
@@ -218,15 +217,14 @@ fn collect_summaries_in(config_dir: &Path) -> Vec<ClaudeSessionSummary> {
 /// filesystem when the path exists, else fall back to a textual cleanup. An
 /// aoe worktree `project_path` is stored relative to the main repo
 /// (`.../repo/../repo-worktrees/branch`) while the agent records its resolved
-/// process cwd, so an exact string compare would miss the match. Shared with
-/// `codex_import`.
+/// process cwd, so an exact string compare would miss the match.
 pub(crate) fn normalize_cwd(raw: &str) -> PathBuf {
     let p = Path::new(raw);
     std::fs::canonicalize(p).unwrap_or_else(|_| lexical_normalize(p))
 }
 
 /// Resolve `.` and `..` components textually, without touching the filesystem.
-pub(crate) fn lexical_normalize(p: &Path) -> PathBuf {
+fn lexical_normalize(p: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for comp in p.components() {

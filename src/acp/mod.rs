@@ -20,8 +20,6 @@ pub mod agent_registry;
 pub mod approvals;
 pub mod background_agent;
 pub mod client;
-#[cfg(feature = "serve")]
-pub mod codex_import;
 pub mod context_primer;
 pub mod elicitations;
 pub mod event_store;

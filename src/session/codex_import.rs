@@ -9,47 +9,32 @@
 //! for a cwd, create a structured session whose `acp_session_id` is that UUID.
 //!
 //! Each rollout line is `{timestamp, type, payload}`. The `cwd` lives in the
-//! `session_meta` record's payload; user turns are `response_item` records with
-//! `payload = {type:"message", role:"user", content:[{type:"input_text",
-//! text}]}`. The first user message is Codex's injected `AGENTS.md` /
-//! `<INSTRUCTIONS>` preamble, so it is skipped for the display title (the
-//! analog of Claude's `<command-*>` wrappers).
+//! `session_meta` record's payload.
 //!
-//! AoE-managed sessions (scratch dirs, worktree/workspace dirs) are excluded
-//! using the same filters as `claude_import`.
+//! This module is for terminal-to-structured conversion. It resolves the
+//! rollout for a known AoE session cwd, including scratch or worktree dirs.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
-
 use crate::session::capture::parse_codex_rollout_metadata;
-use crate::session::claude_import::{
-    cwd_is_aoe_scratch, cwd_under_worktree, normalize_cwd, worktree_dir_markers,
-};
+use crate::session::claude_import::normalize_cwd;
 
 /// Cap how many lines we read per rollout when extracting metadata. The `cwd`
-/// (session_meta, first record) and the first real user message live at the
-/// head; a few hundred lines is plenty without reading a multi-MB rollout.
+/// usually lives in the first record; a few hundred lines is plenty without
+/// reading a multi-MB rollout.
 const MAX_SCAN_LINES: usize = 400;
 
 /// A discovered Codex session, summarized for resume/matching.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct CodexSessionSummary {
+pub(crate) struct CodexSessionSummary {
     /// The rollout UUID (filename stem). Fed to `session/load`.
-    pub session_id: String,
+    pub(crate) session_id: String,
     /// The working directory recorded in the rollout's `session_meta`.
-    pub cwd: String,
-    /// First human-authored prompt, truncated, for display. `None` when the
-    /// rollout has no readable user message past the injected preamble.
-    pub title: Option<String>,
+    cwd: String,
     /// File modification time as a unix epoch millisecond stamp, for
-    /// recent-first sorting and "last used" display.
-    pub last_modified_ms: u64,
-    /// Whether `cwd` still exists.
-    pub cwd_exists: bool,
-    #[serde(skip)]
+    /// recent-first sorting.
+    last_modified_ms: u64,
     is_child: bool,
 }
 
@@ -64,48 +49,23 @@ fn codex_sessions_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".codex").join("sessions"))
 }
 
-/// Scan all discoverable Codex rollouts, newest first, with AoE-managed
-/// sessions (scratch / worktree / workspace) filtered out. Empty when the
-/// sessions directory is absent. Unreadable rollouts are skipped, not fatal.
-pub fn scan_sessions() -> Vec<CodexSessionSummary> {
-    match codex_sessions_dir() {
-        Some(root) => scan_sessions_in(&root),
-        None => Vec::new(),
-    }
-}
-
 /// The best rollout to resume for `cwd`: the most-recently-modified rollout
-/// whose recorded cwd equals `cwd` (after AoE-managed filtering). `None` when
-/// no rollout matches — callers fall back to a fresh session.
-pub fn find_rollout_for_cwd(cwd: &str) -> Option<CodexSessionSummary> {
+/// whose recorded cwd equals `cwd`. No AoE-managed cwd filter is applied
+/// because conversion resolves a known AoE session's own rollout. `None` when
+/// no rollout matches; callers fall back to a fresh session.
+pub(crate) fn find_rollout_for_cwd(cwd: &str) -> Option<CodexSessionSummary> {
     let root = codex_sessions_dir()?;
     find_rollout_for_cwd_in(&root, cwd)
 }
 
 /// Testable core of [`find_rollout_for_cwd`]: scan `root` for the newest
-/// rollout whose `cwd` matches. Deliberately does NOT apply the AoE-managed
-/// (scratch / worktree) filter: the caller is resolving the rollout of a
-/// *known* aoe session by its own cwd, and an aoe codex session legitimately
-/// lives in a scratch or worktree dir. Filtering here would make those
-/// sessions un-convertible (resume nothing). The AoE-managed filter is only
-/// for the external-import picker (`scan_sessions`).
+/// rollout whose `cwd` matches. It intentionally accepts AoE-managed scratch
+/// and worktree dirs because terminal conversion resolves a known AoE session.
 fn find_rollout_for_cwd_in(root: &Path, cwd: &str) -> Option<CodexSessionSummary> {
     let target = normalize_cwd(cwd);
     collect_summaries_in(root)
         .into_iter()
         .find(|s| !s.is_child && normalize_cwd(&s.cwd) == target)
-}
-
-/// Testable core of [`scan_sessions`]: all rollouts under `root`, with
-/// AoE-managed (scratch / worktree) sessions filtered out, newest-first.
-fn scan_sessions_in(root: &Path) -> Vec<CodexSessionSummary> {
-    let markers = worktree_dir_markers();
-    collect_summaries_in(root)
-        .into_iter()
-        .filter(|s| {
-            !s.is_child && !cwd_is_aoe_scratch(&s.cwd) && !cwd_under_worktree(&s.cwd, &markers)
-        })
-        .collect()
 }
 
 /// Walk `root` recursively for `rollout-*.jsonl`, summarize each, sort
@@ -162,7 +122,6 @@ fn summarize_rollout(path: &Path) -> Option<CodexSessionSummary> {
     let reader = BufReader::new(file);
 
     let mut cwd: Option<String> = None;
-    let mut title: Option<String> = None;
     let mut is_child = false;
 
     for line in reader.lines().take(MAX_SCAN_LINES).map_while(Result::ok) {
@@ -170,29 +129,18 @@ fn summarize_rollout(path: &Path) -> Option<CodexSessionSummary> {
         if line.is_empty() {
             continue;
         }
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
         if let Some(metadata) = parse_codex_rollout_metadata(line) {
-            cwd.get_or_insert(metadata.cwd);
+            cwd = Some(metadata.cwd);
             is_child |= metadata.is_child;
-        }
-        if title.is_none() {
-            title = extract_user_title(&record);
-        }
-        if cwd.is_some() && title.is_some() {
             break;
         }
     }
 
     let cwd = cwd?;
-    let cwd_exists = Path::new(&cwd).is_dir();
     Some(CodexSessionSummary {
         session_id,
         cwd,
-        title,
         last_modified_ms,
-        cwd_exists,
         is_child,
     })
 }
@@ -222,56 +170,6 @@ fn is_uuid(s: &str) -> bool {
             .all(|(g, n)| g.len() == n && g.bytes().all(|b| b.is_ascii_hexdigit()))
 }
 
-/// Pull a human-readable title from a `response_item` user message, skipping
-/// Codex's injected preamble (`# AGENTS.md`, `<INSTRUCTIONS>`,
-/// `<environment_context>`, `<user_instructions>`).
-fn extract_user_title(record: &serde_json::Value) -> Option<String> {
-    let payload = record.get("payload").unwrap_or(record);
-    if payload.get("role").and_then(|v| v.as_str()) != Some("user") {
-        return None;
-    }
-    let content = payload.get("content")?;
-    let text = match content {
-        serde_json::Value::String(s) => displayable_user_text(s).map(str::to_owned),
-        serde_json::Value::Array(parts) => parts.iter().find_map(|p| {
-            let kind = p.get("type").and_then(|v| v.as_str());
-            if kind != Some("input_text") && kind != Some("text") {
-                return None;
-            }
-            let text = p.get("text").and_then(|v| v.as_str())?;
-            displayable_user_text(text).map(str::to_owned)
-        }),
-        _ => None,
-    }?;
-    Some(truncate(&text, 120))
-}
-
-/// A user message's displayable text, or `None` for Codex's injected preamble
-/// blocks. Only those specific system injections are dropped; a real prompt is
-/// kept even if it happens to start with `<`.
-fn displayable_user_text(text: &str) -> Option<&str> {
-    let t = text.trim();
-    if t.is_empty()
-        || t.starts_with("# AGENTS.md")
-        || t.starts_with("<INSTRUCTIONS>")
-        || t.starts_with("<user_instructions>")
-        || t.starts_with("<environment_context>")
-    {
-        None
-    } else {
-        Some(t)
-    }
-}
-
-fn truncate(s: &str, max_chars: usize) -> String {
-    let trimmed: String = s.chars().take(max_chars).collect();
-    if trimmed.chars().count() < s.chars().count() {
-        format!("{trimmed}…")
-    } else {
-        trimmed
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,13 +197,6 @@ mod tests {
         )
     }
 
-    fn user_msg(text: &str) -> String {
-        let esc = text.replace('\\', "\\\\").replace('"', "\\\"");
-        format!(
-            r#"{{"timestamp":"t","type":"response_item","payload":{{"type":"message","role":"user","content":[{{"type":"input_text","text":"{esc}"}}]}}}}"#
-        )
-    }
-
     #[test]
     fn session_id_extracted_from_filename() {
         let p = Path::new("rollout-2026-06-26T08-28-14-019f029d-5a71-71b0-ac3b-09e8d3e068a3.jsonl");
@@ -321,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn summarize_reads_cwd_and_skips_preamble_for_title() {
+    fn summarize_reads_cwd() {
         let tmp = tempfile::tempdir().unwrap();
         let work = tmp.path().join("work");
         fs::create_dir(&work).unwrap();
@@ -330,17 +221,11 @@ mod tests {
             tmp.path(),
             "019f029d-5a71-71b0-ac3b-09e8d3e068a3",
             "2026-06-28T10-00-00",
-            &[
-                meta(cwd),
-                user_msg("# AGENTS.md instructions for /x\n<INSTRUCTIONS>noise"),
-                user_msg("Fix the rollout parser please"),
-            ],
+            &[meta(cwd)],
         );
         let s = summarize_rollout(&path).unwrap();
         assert_eq!(s.session_id, "019f029d-5a71-71b0-ac3b-09e8d3e068a3");
         assert_eq!(s.cwd, cwd);
-        assert_eq!(s.title.as_deref(), Some("Fix the rollout parser please"));
-        assert!(s.cwd_exists);
     }
 
     #[test]
@@ -350,7 +235,7 @@ mod tests {
             tmp.path(),
             "019f029d-5a71-71b0-ac3b-09e8d3e068a3",
             "2026-06-28T10-00-00",
-            &[user_msg("hi, no meta record so no cwd")],
+            &[],
         );
         assert!(summarize_rollout(&path).is_none());
     }
@@ -366,13 +251,13 @@ mod tests {
             tmp.path(),
             "aaaaaaaa-1111-2222-3333-444444444444",
             "2026-06-28T09-00-00",
-            &[meta(&cwd), user_msg("older convo")],
+            &[meta(&cwd)],
         );
         let newer = write_rollout(
             tmp.path(),
             "bbbbbbbb-1111-2222-3333-444444444444",
             "2026-06-28T11-00-00",
-            &[meta(&cwd), user_msg("newer convo")],
+            &[meta(&cwd)],
         );
         // Force mtimes: newer file modified after older.
         let now = std::time::SystemTime::now();
@@ -396,13 +281,13 @@ mod tests {
             tmp.path(),
             "aaaaaaaa-1111-2222-3333-444444444444",
             "2026-06-28T09-00-00",
-            &[meta(&cwd), user_msg("terminal conversation")],
+            &[meta(&cwd)],
         );
         let child = write_rollout(
             tmp.path(),
             "bbbbbbbb-1111-2222-3333-444444444444",
             "2026-06-28T11-00-00",
-            &[subagent_meta(&cwd), user_msg("child conversation")],
+            &[subagent_meta(&cwd)],
         );
         let now = std::time::SystemTime::now();
         filetime_set(&top_level, now - std::time::Duration::from_secs(600));
@@ -427,7 +312,7 @@ mod tests {
             tmp.path(),
             "eeeeeeee-1111-2222-3333-444444444444",
             "2026-06-28T10-00-00",
-            &[meta(&recorded), user_msg("worktree convo")],
+            &[meta(&recorded)],
         );
 
         // Query with the `..`-laden path aoe would pass.
@@ -450,7 +335,7 @@ mod tests {
             &tmp.path().join("sessions"),
             "dddddddd-1111-2222-3333-444444444444",
             "2026-06-28T10-00-00",
-            &[meta(&cwd), user_msg("env-routed convo")],
+            &[meta(&cwd)],
         );
 
         let prev = std::env::var("CODEX_HOME").ok();
@@ -463,24 +348,19 @@ mod tests {
 
         let got = got.expect("rollout found via CODEX_HOME");
         assert_eq!(got.session_id, "dddddddd-1111-2222-3333-444444444444");
-        assert_eq!(got.title.as_deref(), Some("env-routed convo"));
     }
 
     #[test]
-    fn aoe_managed_cwds_excluded_from_picker_but_not_convert() {
+    fn find_rollout_for_cwd_matches_scratch_cwd() {
         let tmp = tempfile::tempdir().unwrap();
         let scratch = "/home/me/.config/agent-of-empires/scratch/abcd";
         write_rollout(
             tmp.path(),
             "cccccccc-1111-2222-3333-444444444444",
             "2026-06-28T10-00-00",
-            &[meta(scratch), user_msg("scratch run")],
+            &[meta(scratch)],
         );
-        // The external-import picker filters AoE-managed (scratch) cwds out.
-        assert!(scan_sessions_in(tmp.path()).is_empty());
-        // But the convert path resolves a known aoe session's own rollout by
-        // cwd regardless: an aoe codex session can live in a scratch dir and
-        // still must be convertible (resume its real conversation).
+
         let got = find_rollout_for_cwd_in(tmp.path(), scratch).unwrap();
         assert_eq!(got.session_id, "cccccccc-1111-2222-3333-444444444444");
     }

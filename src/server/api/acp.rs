@@ -1758,23 +1758,22 @@ pub async fn acp_enable(
     // already-captured id is left untouched. No match -> fresh convert
     // (previous behavior), logged. Scans the filesystem, so off-thread.
     let resume_id: Option<String> = if instance.acp_session_id.is_none() {
-        let found = if captured_resume_id.is_some() {
-            captured_resume_id
-        } else {
-            let cwd = instance.project_path.clone();
-            let tool = instance.tool.clone();
-            tokio::task::spawn_blocking(move || match tool.as_str() {
-                "codex" => {
-                    crate::acp::codex_import::find_rollout_for_cwd(&cwd).map(|r| r.session_id)
-                }
-                "claude" => {
-                    crate::session::claude_import::find_session_for_cwd(&cwd).map(|s| s.session_id)
-                }
-                _ => None,
-            })
-            .await
-            .ok()
-            .flatten()
+        let found = match captured_resume_id {
+            Some(sid) => Some(sid),
+            None => {
+                let cwd = instance.project_path.clone();
+                let tool = instance.tool.clone();
+                tokio::task::spawn_blocking(move || match tool.as_str() {
+                    "codex" => crate::session::codex_import::find_rollout_for_cwd(&cwd)
+                        .map(|r| r.session_id),
+                    "claude" => crate::session::claude_import::find_session_for_cwd(&cwd)
+                        .map(|s| s.session_id),
+                    _ => None,
+                })
+                .await
+                .ok()
+                .flatten()
+            }
         };
         match found {
             Some(sid) => {

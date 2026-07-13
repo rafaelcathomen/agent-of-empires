@@ -8,6 +8,10 @@ pub mod civilizations;
 // serve-gated `acp` module) because terminal/tmux import via the CLI works in
 // every build; only the structured-view import path needs `serve`.
 pub mod claude_import;
+// Discovery of on-disk Codex rollouts for terminal-to-structured conversion.
+// Keep this beside `claude_import` because both are session-store discovery,
+// not ACP transport.
+pub(crate) mod codex_import;
 pub mod config;
 pub(crate) mod container_config;
 pub mod deletion;

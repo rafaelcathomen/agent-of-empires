@@ -79,10 +79,15 @@ def connect():
     )
     # CREATE TABLE IF NOT EXISTS never alters an existing table, so a DB from a
     # build before asker_pid lacks the column and every insert would fail; add
-    # it when missing.
-    have = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
-    if "asker_pid" not in have:
+    # it. A table_info check would be a TOCTOU race under concurrent broadcast
+    # workers (all read it missing, all ALTER, the losers crash on "duplicate
+    # column"), so ALTER unconditionally and treat "duplicate column" as
+    # already-migrated, the same idempotence as the WAL retry above.
+    try:
         conn.execute("ALTER TABLE messages ADD COLUMN asker_pid INTEGER")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e):
+            raise
     conn.commit()
     return conn
 
@@ -253,11 +258,6 @@ def _find_reply(conn, qid):
         "SELECT * FROM messages WHERE in_reply_to=? AND kind='reply' "
         "ORDER BY created_at, rowid LIMIT 1", (qid,)
     ).fetchone()
-
-
-def _print_reply(row):
-    print(f"\n--- reply from {row['from_title']} ---")
-    print(row["body"])
 
 
 EXIT_ANSWERED = 0

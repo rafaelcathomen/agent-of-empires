@@ -20,8 +20,8 @@ A = "a1:AgentA"
 B = "b1:AgentB"
 
 # A fake `aoe` on PATH so the commands that shell out (broadcast resolves via
-# `aoe list --all`, identity via `aoe session current`, doorbell via `aoe send`)
-# are testable without a real daemon. AGENT_CHAT_FAKE_MODE=nonjson makes `list`
+# `aoe list`, identity via `aoe session current`, doorbell via `aoe send`) are
+# testable without a real daemon. AGENT_CHAT_FAKE_MODE=nonjson makes `list`
 # emit aoe's empty-profile plain-text notice instead of JSON.
 FAKE_AOE = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -224,6 +224,25 @@ class AgentChatTest(unittest.TestCase):
         cols = [r[1] for r in
                 sqlite3.connect(self.db).execute("PRAGMA table_info(messages)")]
         self.assertIn("asker_pid", cols)
+
+    def test_old_schema_db_concurrent_broadcast_migrates(self):
+        # Concurrent broadcast workers hitting an old-schema DB must not race the
+        # migration into a "duplicate column name: asker_pid" crash (idempotent
+        # ALTER). This is the first-broadcast-after-upgrade path.
+        import sqlite3
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, thread_id TEXT, from_id "
+            "TEXT, from_title TEXT, to_id TEXT, to_title TEXT, kind TEXT, "
+            "in_reply_to TEXT, body TEXT, status TEXT, created_at TEXT, "
+            "blocking_until REAL)")
+        con.commit()
+        con.close()
+        out = self.run_cli("broadcast", "work/team", "s?", "--timeout", "1",
+                           "--no-doorbell", "--json", extra_env=self.fake_aoe_env())
+        self.assertEqual(out.returncode, 3, out.stderr)  # nobody answered, no crash
+        self.assertNotIn("duplicate column", out.stderr)
+        self.assertNotIn("Traceback", out.stderr)
 
     def test_empty_profile_nonjson_dies_cleanly(self):
         # aoe printing its plain-text "No sessions found" (exit 0) must surface as

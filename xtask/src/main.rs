@@ -405,6 +405,7 @@ fn check_skill() {
     let skills = [
         ("contrib/openclaw-skill/SKILL.md", VersionRule::Forbidden),
         ("contrib/hermes-skill/SKILL.md", VersionRule::Required),
+        ("contrib/agent-chat/SKILL.md", VersionRule::Forbidden),
     ];
 
     // Build the clap command tree once; shared across every skill file.

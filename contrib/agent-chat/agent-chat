@@ -52,6 +52,11 @@ def connect():
             if "locked" not in str(e):
                 raise
             time.sleep(0.05)
+    else:
+        # Falling through to the default rollback journal would serialize
+        # readers; single ask/reply still works, so warn rather than fail.
+        print("agent-chat: warning: could not enable WAL (database stayed "
+              "locked); proceeding on the default journal.", file=sys.stderr)
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute(
         """
@@ -72,6 +77,12 @@ def connect():
         )
         """
     )
+    # CREATE TABLE IF NOT EXISTS never alters an existing table, so a DB from a
+    # build before asker_pid lacks the column and every insert would fail; add
+    # it when missing.
+    have = {r[1] for r in conn.execute("PRAGMA table_info(messages)")}
+    if "asker_pid" not in have:
+        conn.execute("ALTER TABLE messages ADD COLUMN asker_pid INTEGER")
     conn.commit()
     return conn
 
@@ -108,15 +119,16 @@ def aoe_json(args, timeout=AOE_JSON_TIMEOUT):
         raise RuntimeError(f"`{label}` did not return JSON: {out.stdout.strip()[:120]}")
 
 
-def aoe_list_all():
-    """Every session across all profiles, dying cleanly if aoe can't be queried.
+def aoe_list():
+    """Sessions in the active profile, dying cleanly if aoe can't be queried.
 
-    `--all` (not the default-profile-only `aoe list`) so a recipient in a
-    non-default profile is still resolvable, matching `aoe session current`,
-    which already reports across profiles.
+    Scoped to the active profile (not `--all`): the doorbell's `aoe send` is
+    also profile-scoped, so resolving a recipient in another profile would find
+    a session `aoe send` then can't wake. Cross-profile addressing is a separate
+    feature that must thread the profile through to `aoe send -p`.
     """
     try:
-        return aoe_json(["list", "--all"])
+        return aoe_json(["list"])
     except RuntimeError as e:
         die(str(e))
 
@@ -157,7 +169,7 @@ def resolve_recipient(spec):
     if ":" in spec:
         sid, _, title = spec.partition(":")
         return sid, (title or sid)
-    sessions = aoe_list_all()
+    sessions = aoe_list()
     key = spec.strip("/")
     # Most-specific first: exact id, then folder path, then title, then fuzzy.
     # Folder-aware so two agents that share a title in different folders are
@@ -353,7 +365,7 @@ def cmd_ask(args):
 def cmd_broadcast(args):
     """Ask every agent under a folder/group subtree, concurrently."""
     from_id, from_title = identity_from_args(args)
-    sessions = aoe_list_all()
+    sessions = aoe_list()
     path = args.group.strip("/").rstrip("*").rstrip("/")
     targets = [s for s in sessions
                if ((s.get("group") or "").strip("/") == path
@@ -402,11 +414,12 @@ def cmd_reply(args):
                 created_at=now_iso(), blocking_until=None, asker_pid=None)
         conn.execute("UPDATE messages SET status='answered' WHERE id=?", (q["id"],))
 
-    # Doorbell the asker unless it is still blocking-polling (its `ask` pid is
-    # alive); a timed-out or killed asker has no live pid, so its reply is
-    # delivered. Tolerate rows from an older schema lacking the column.
-    asker_pid = q["asker_pid"] if "asker_pid" in q.keys() else None
-    asker_blocking = _pid_alive(asker_pid)
+    # Doorbell the asker unless it is still blocking-polling: its `ask` pid is
+    # alive AND its deadline has not passed. Requiring both bounds PID reuse (a
+    # recycled pid past the deadline no longer suppresses) and covers a timed-out
+    # or killed asker (dead pid), so their replies are delivered.
+    bu = q["blocking_until"]
+    asker_blocking = _pid_alive(q["asker_pid"]) and bu is not None and bu > time.time()
     if not asker_blocking and not args.no_doorbell:
         short_q = (q["body"][:120] + "…") if len(q["body"]) > 120 else q["body"]
         doorbell(q["from_id"],

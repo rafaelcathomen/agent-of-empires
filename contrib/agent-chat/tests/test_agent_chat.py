@@ -203,6 +203,28 @@ class AgentChatTest(unittest.TestCase):
             self.assertEqual(r["status"], "pending")
             self.assertIsNone(r["reply"])
 
+    def test_old_schema_db_is_migrated_not_crashed(self):
+        # A DB created before `asker_pid` existed must get the column added
+        # (ALTER TABLE), not crash on the first insert with "no column named
+        # asker_pid". Mirrors a live DB from an earlier version.
+        import sqlite3
+        con = sqlite3.connect(self.db)
+        con.execute(
+            "CREATE TABLE messages (id TEXT PRIMARY KEY, thread_id TEXT, from_id "
+            "TEXT, from_title TEXT, to_id TEXT, to_title TEXT, kind TEXT, "
+            "in_reply_to TEXT, body TEXT, status TEXT, created_at TEXT, "
+            "blocking_until REAL)")
+        con.commit()
+        con.close()
+        out = self.run_cli("ask", B, "q?", "--timeout", "1", "--no-doorbell",
+                           identity=A)
+        self.assertEqual(out.returncode, 3, out.stderr)  # pending, not a crash
+        self.assertNotIn("asker_pid", out.stderr)
+        self.assertNotIn("Traceback", out.stderr)
+        cols = [r[1] for r in
+                sqlite3.connect(self.db).execute("PRAGMA table_info(messages)")]
+        self.assertIn("asker_pid", cols)
+
     def test_empty_profile_nonjson_dies_cleanly(self):
         # aoe printing its plain-text "No sessions found" (exit 0) must surface as
         # a clean die(), not a raw JSONDecodeError traceback.

@@ -60,7 +60,8 @@ Three moving parts, all local to the machine:
 | `body` | text |
 | `status` | `unread` \| `read` \| `answered` \| `consumed` |
 | `created_at` | ISO-8601 UTC |
-| `blocking_until` | (questions) epoch until which the asker is actively polling; suppresses the reply doorbell |
+| `blocking_until` | (questions) ask deadline (epoch); with `asker_pid` decides whether to suppress the reply doorbell |
+| `asker_pid` | (questions) pid of the blocking `ask` process; a live pid within `blocking_until` means the asker is still polling |
 
 ### CLI
 
@@ -78,17 +79,17 @@ Single self-contained Python 3 (stdlib only). Verbs: `ask`, `reply`, `inbox`,
 
 ```
 A: agent-chat ask "Agile Newton" "which restitution for G1 feet?"
-   -> insert question(thread=T, blocking_until=now+120s)
+   -> insert question(thread=T, blocking_until=now+120s, asker_pid=<ask pid>)
    -> aoe send "Agile Newton" "[agent-chat] Question ... reply with: agent-chat reply <id> \"...\""
    -> poll DB ...
 B: (turn injected) reads doorbell, runs:  agent-chat reply <id> "restitution=0.4"
-   -> insert reply; question.blocking_until still future -> skip doorbell
+   -> insert reply; asker pid alive and within deadline -> skip doorbell
 A: poll sees reply -> prints it, marks consumed, exits 0
 ```
 
-Slow path: no reply within timeout → `ask` returns `pending` and arms async delivery
-(`blocking_until=0`); when B later replies, A is doorbelled and can read it next turn
-(or via `agent-chat replies`).
+Slow path: no reply within timeout → `ask` returns `pending` and exits, so its pid
+is gone; when B later replies the asker is no longer blocking (dead pid), so it is
+doorbelled and can read the reply next turn (or via `agent-chat replies`).
 
 ## Reliability / edge cases
 

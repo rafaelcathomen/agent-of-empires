@@ -3,12 +3,12 @@ name: talk-to-agent
 description: Ask another agent in the Agent-of-Empires (AoE) fleet a question, or broadcast to a whole folder/group, and get replies back. Use when asked to "ask/tell/talk to <session>", consult another agent, poll a group of agents, or coordinate/relay work across AoE sessions. You drive (own) the discussion.
 ---
 
-# Talk to another AoE agent — `agent-chat`
+# Talk to another AoE agent: `agent-chat`
 
 Other agents on this machine run as independent, long-lived AoE sessions.
 `agent-chat` lets you ask one (or a whole folder) a question and get a
 **structured reply back through a shared SQLite store**, using `aoe send` as the
-"doorbell" that wakes the recipient so it actually answers. (No screen-scraping —
+"doorbell" that wakes the recipient so it actually answers. (No screen-scraping;
 the recipient writes its reply via `agent-chat reply`.)
 
 ## Ask one agent
@@ -20,7 +20,7 @@ agent-chat ask "<addr>" "<question>" [--timeout 120] [--json]
 Blocks until the recipient replies or times out. `<addr>` is a session **id**, a
 **full folder path** like `general/skills/skill-pi`, a path **suffix**, or a
 **unique title**. A title that exists in more than one folder errors and lists
-the candidates — pass the full folder path or the id to disambiguate.
+the candidates; pass the full folder path or the id to disambiguate.
 
 ## Broadcast to a whole group (concurrent fan-out)
 

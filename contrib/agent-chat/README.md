@@ -1,7 +1,7 @@
 # agent-chat
 
 Inter-agent messaging for the [aoe](https://www.agent-of-empires.com/) fleet. One
-agent asks another — addressed by its aoe session title or id — a question and gets a
+agent asks another (addressed by its aoe session title or id) a question and gets a
 reply back, even though each agent is an independent, long-lived Claude session in its
 own repo/worktree.
 
@@ -9,7 +9,7 @@ own repo/worktree.
 
 aoe sessions already share an async blackboard (`aoe context`), but there was no way to
 ask a *specific* agent a question and get an answer within your turn. The hard part
-isn't storage — it's the **wakeup**: an idle Claude agent only acts when given a turn.
+isn't storage; it's the **wakeup**: an idle Claude agent only acts when given a turn.
 `agent-chat` uses a shared SQLite store for messages and `aoe send` as the **doorbell**
 that injects a turn into the recipient so it actually sees the question and replies.
 
@@ -22,15 +22,15 @@ ln -sf /path/to/agent-chat/agent-chat ~/.local/bin/agent-chat   # ~/.local/bin m
 For **hands-free** operation (agents replying without a permission prompt), each machine
 also needs two one-time entries under `~/.claude/`:
 
-1. Allow the command — in `~/.claude/settings.json`:
+1. Allow the command, in `~/.claude/settings.json`:
    ```json
    { "permissions": { "allow": ["Bash(agent-chat:*)"] } }
    ```
    Without it, Claude Code's auto-mode classifier blocks `agent-chat reply` as an
    external write and the recipient stalls at a prompt.
-2. Tell agents to honor incoming messages — append to `~/.claude/CLAUDE.md`:
+2. Tell agents to honor incoming messages, append to `~/.claude/CLAUDE.md`:
    > If you receive a message beginning with `[agent-chat]`, it's another agent asking
-   > you a question — answer it by running the `agent-chat reply ...` command it shows.
+   > you a question, answer it by running the `agent-chat reply ...` command it shows.
 
 3. *(optional, recommended)* Let Claude Code agents **auto-discover** the tool from
    natural language ("ask the data-pipeline agent ...") instead of having to know the
@@ -76,26 +76,26 @@ agent-chat ask "<id>" "<q>" --json --no-revive --timeout 60
 
 - `--json` prints one object: `{"status": ..., "msg_id", "thread_id", "reply", and on
   success "reply_id"+"from"}`. `status` is `answered` | `pending` | `skipped`.
-- `--no-revive` never wakes a *stopped* recipient — it returns `skipped` immediately
+- `--no-revive` never wakes a *stopped* recipient; it returns `skipped` immediately
   instead of reviving it (no compute spun up). Live/idle recipients are unaffected.
 - **Exit codes:** `0` answered · `3` no answer (`pending` timed out, or `skipped`) ·
-  `1` error (e.g. unknown recipient). Don't sniff stdout — branch on the exit code or
+  `1` error (e.g. unknown recipient). Don't sniff stdout; branch on the exit code or
   the `status` field.
 
 Headless callers must set `AGENT_CHAT_ID='id:title'` (auto-detect needs a live aoe
-session). A headless one-shot can *ask* but cannot *receive* — recipients must be live
+session). A headless one-shot can *ask* but cannot *receive*; recipients must be live
 interactive aoe sessions.
 
 ## How it works
 
-- **Store** — one SQLite DB (WAL) at `$AGENT_CHAT_DB` or `~/.local/share/agent-chat/mail.db`.
-- **Identity** — `aoe session current` (override with `$AGENT_CHAT_ID='id:title'` or `--from`).
-- **Addressing** — recipients resolved against `aoe list`; pass a title, id, id-prefix,
+- **Store**: one SQLite DB (WAL) at `$AGENT_CHAT_DB` or `~/.local/share/agent-chat/mail.db`.
+- **Identity**: `aoe session current` (override with `$AGENT_CHAT_ID='id:title'` or `--from`).
+- **Addressing**: recipients resolved against `aoe list`; pass a title, id, id-prefix,
   an explicit `id:title`, or a **full folder path** `group/sub/title` (a bare title that
   collides across folders errors and lists the candidates).
-- **Broadcast** — `broadcast <folder-path>` resolves the folder subtree and asks every
+- **Broadcast**: `broadcast <folder-path>` resolves the folder subtree and asks every
   agent in it concurrently (wall-clock = slowest reply, not the sum), excluding self.
-- **Doorbell** — `aoe send <recipient> "..."` wakes an idle/stopped session
+- **Doorbell**: `aoe send <recipient> "..."` wakes an idle/stopped session
   (auto-revives). The doorbell text is self-describing, so recipients need no prior
   knowledge of the protocol (see Install for the one-time permission rule).
 
@@ -117,9 +117,9 @@ Tests run without an aoe daemon (identities via `--from`, recipients via `id:tit
 
 This fork adds two things on top of upstream, keeping the SQLite + doorbell spine:
 
-- **Folder-path addressing** — resolve recipients by `group/sub/title`, with
+- **Folder-path addressing**: resolve recipients by `group/sub/title`, with
   cross-folder ambiguity refusal (upstream resolves by title/id only).
-- **`broadcast`** — concurrent group fan-out to a whole folder subtree.
+- **`broadcast`**: concurrent group fan-out to a whole folder subtree.
 
 Both reuse upstream's `aoe send` doorbell and store-backed reply; no screen-scraping.
 
@@ -127,4 +127,4 @@ See [`docs/2026-06-25-agent-chat-design.md`](docs/2026-06-25-agent-chat-design.m
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT; see the repository's top-level [LICENSE](../../LICENSE).

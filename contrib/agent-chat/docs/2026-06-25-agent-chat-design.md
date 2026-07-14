@@ -1,4 +1,4 @@
-# agent-chat — inter-agent messaging for the aoe fleet
+# agent-chat: inter-agent messaging for the aoe fleet
 
 **Date:** 2026-06-25
 **Status:** Implemented
@@ -9,7 +9,7 @@
 Agents run as long-lived, independent aoe sessions across different repos/worktrees
 (e.g. `Agile Sysid`, `Agile Newton`, `Isaac Sim general`). Today they share knowledge
 only through the async blackboard (`aoe context`). There is no way for one agent to
-**ask a specific other agent a question and get a reply back within its own turn** —
+**ask a specific other agent a question and get a reply back within its own turn**,
 e.g. a "presentation" agent gathering what was done in other projects.
 
 The hard part is **not** message storage. It is the **wakeup**: a Claude agent only
@@ -34,16 +34,16 @@ another session is `aoe send`.
 
 Three moving parts, all local to the machine:
 
-1. **Store** — single SQLite DB (WAL) at `~/.local/share/agent-chat/mail.db`
+1. **Store**: single SQLite DB (WAL) at `~/.local/share/agent-chat/mail.db`
    (`$AGENT_CHAT_DB` override). SQLite gives safe concurrent multi-session access for
    free. One `messages` table.
-2. **Identity & resolution** — built on the aoe daemon:
+2. **Identity & resolution**: built on the aoe daemon:
    - self: `aoe session current --json` → `{id, session}` (override via `$AGENT_CHAT_ID`
      / `--from '<id>:<title>'` outside an aoe session / in tests).
    - recipient: resolve an id-or-title against `aoe list --json` (exact title
      case-insensitive, id, id-prefix, then substring). An explicit `id:title` bypasses
      the lookup. Ambiguous/unknown → error listing candidates.
-3. **Doorbell** — `aoe send <recipient> "<self-describing text>"` injects a turn into
+3. **Doorbell**: `aoe send <recipient> "<self-describing text>"` injects a turn into
    the recipient's Claude session (default revive, so a stopped recipient auto-respawns).
    The text fully describes how to reply, so a recipient needs no prior protocol setup.
 
@@ -108,7 +108,7 @@ message, treat it as a question from another agent and answer it by running the
 
 ## Testing
 
-`python3 -m unittest discover -s tests` — store/logic + blocking-poll round-trip +
+`python3 -m unittest discover -s tests`; store/logic + blocking-poll round-trip +
 async round-trip + thread rendering + error path, all without an aoe daemon.
 
 ## Out of scope (v1)

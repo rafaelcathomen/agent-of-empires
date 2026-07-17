@@ -3709,7 +3709,7 @@ mod tests {
             .set_modified(now)
             .unwrap();
 
-        let _guard = CodexHomeGuard::set(tmp.path().to_str().unwrap());
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
         let result =
             capture_codex_session_id(project_dir.to_str().unwrap(), &HashSet::new()).unwrap();
         assert_eq!(result, top_level_id);

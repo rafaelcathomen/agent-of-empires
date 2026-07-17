@@ -6035,7 +6035,6 @@ fn test_rename_group_with_color_carries_color_to_new_path() {
     let work_session = env
         .view
         .instances()
-        .iter()
         .find(|i| i.title == "work-project")
         .unwrap();
     assert_eq!(work_session.group_path, "projects");
@@ -16625,7 +16624,7 @@ mod heat_rmenu_tests {
         view.set_session_color_and_heat(&id, Some(Some(FolderColor::Teal)), Some(Some(false)));
 
         // In memory.
-        let got = view.instances.iter().find(|i| i.id == id).unwrap();
+        let got = view.instances.values().find(|i| i.id == id).unwrap();
         assert_eq!(got.manual_color, Some(FolderColor::Teal));
         assert_eq!(got.heat_enabled, Some(false));
 
@@ -16648,7 +16647,7 @@ mod heat_rmenu_tests {
         assert!(env
             .view
             .instances
-            .iter()
+            .values()
             .all(|i| i.heat_level == HeatLevel::Neutral));
     }
 
@@ -16676,7 +16675,7 @@ mod heat_rmenu_tests {
     fn recompute_heat_excludes_archived_and_off_rows() {
         let (_g, _base, _tmp) = BaseGuard::ready();
         let mut env = create_test_env_with_sessions(2);
-        for inst in &mut env.view.instances {
+        for inst in env.view.instances.values_mut() {
             inst.source_profile = "test".to_string();
         }
         let now = chrono::Utc::now().timestamp();
@@ -16689,8 +16688,8 @@ mod heat_rmenu_tests {
 
         env.view.recompute_heat();
         // Archived row is Neutral; the live row ramps.
-        let a = env.view.instances.iter().find(|i| i.id == id0).unwrap();
-        let b = env.view.instances.iter().find(|i| i.id == id1).unwrap();
+        let a = env.view.instances.values().find(|i| i.id == id0).unwrap();
+        let b = env.view.instances.values().find(|i| i.id == id1).unwrap();
         assert_eq!(a.heat_level, HeatLevel::Neutral, "archived excluded");
         assert!(matches!(b.heat_level, HeatLevel::Ramp(_)));
     }
@@ -16700,7 +16699,7 @@ mod heat_rmenu_tests {
     fn recompute_heat_active_never_prompted_stays_neutral() {
         let (_g, _base, _tmp) = BaseGuard::ready();
         let mut env = create_test_env_with_sessions(2);
-        for inst in &mut env.view.instances {
+        for inst in env.view.instances.values_mut() {
             inst.source_profile = "test".to_string();
         }
         // Prompt only the first session; the second is Running for a non-prompt
@@ -16712,8 +16711,8 @@ mod heat_rmenu_tests {
         env.view.instances[1].status = crate::session::Status::Running;
 
         env.view.recompute_heat();
-        let a = env.view.instances.iter().find(|i| i.id == id0).unwrap();
-        let b = env.view.instances.iter().find(|i| i.id == id1).unwrap();
+        let a = env.view.instances.values().find(|i| i.id == id0).unwrap();
+        let b = env.view.instances.values().find(|i| i.id == id1).unwrap();
         assert!(matches!(a.heat_level, HeatLevel::Ramp(_)));
         assert_eq!(
             b.heat_level,

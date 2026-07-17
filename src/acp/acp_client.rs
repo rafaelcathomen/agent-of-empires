@@ -23,7 +23,7 @@ use agent_client_protocol::schema::v1::{
     CreateElicitationRequest, CreateElicitationResponse, CreateTerminalRequest,
     CreateTerminalResponse, ElicitationAction, ElicitationCapabilities,
     ElicitationFormCapabilities, EmbeddedResource, EmbeddedResourceResource,
-    FileSystemCapabilities, ForkSessionRequest, ImageContent, InitializeRequest,
+    FileSystemCapabilities, ForkSessionRequest, ImageContent, Implementation, InitializeRequest,
     KillTerminalRequest, KillTerminalResponse, LoadSessionRequest, McpServer, MessageId,
     NewSessionRequest, PermissionOptionKind, PromptRequest, ReadTextFileRequest,
     ReadTextFileResponse, ReleaseTerminalRequest, ReleaseTerminalResponse,
@@ -685,6 +685,15 @@ pub(crate) enum LifecycleSignal {
     /// wall-clock jumps don't perturb the suppression. After the
     /// deadline the watchdog rearms with its normal grace. See #1401.
     WakeupPending { at: chrono::DateTime<chrono::Utc> },
+    /// The `/compact` cycle started ("Compacting..." text chunk). Latches
+    /// `OffProtocolWorkKind::Compaction` so the silent summarization window
+    /// keeps the off-protocol grace floor instead of the base grace, which
+    /// otherwise cancels a large compaction after 120s. See #2898.
+    CompactionStarted,
+    /// The `/compact` cycle finished ("Compacting completed." text chunk).
+    /// Clears the compaction suppression so any continued work in the same
+    /// turn recovers on the normal grace. See #2898.
+    CompactionCompleted,
 }
 
 /// Classify a `SessionUpdate` into a `LifecycleSignal`, or `None` for
@@ -697,13 +706,45 @@ pub(crate) enum LifecycleSignal {
 fn classify_lifecycle_signal(
     update: &agent_client_protocol::schema::v1::SessionUpdate,
 ) -> Option<LifecycleSignal> {
-    use agent_client_protocol::schema::v1::{SessionUpdate, ToolCallStatus};
+    use agent_client_protocol::schema::v1::{ContentBlock, SessionUpdate, ToolCallStatus};
     match update {
         SessionUpdate::UsageUpdate(u) if u.cost.is_some() => Some(LifecycleSignal::TerminalUsage),
-        SessionUpdate::AgentMessageChunk(_)
-        | SessionUpdate::AgentThoughtChunk(_)
-        | SessionUpdate::Plan(_) => Some(LifecycleSignal::Progress),
+        SessionUpdate::AgentMessageChunk(chunk) => {
+            // /compact surfaces only as text chunks; detect its start/end
+            // markers so the watchdog suppresses the silent summarization
+            // window instead of cancelling it. Check completion before start
+            // so a future marker-wording drift can't misroute the end as a
+            // fresh start. Everything else is ordinary progress. See #2898.
+            if let ContentBlock::Text(t) = &chunk.content {
+                if is_compact_completion(&t.text) {
+                    return Some(LifecycleSignal::CompactionCompleted);
+                }
+                if is_compact_start(&t.text) {
+                    return Some(LifecycleSignal::CompactionStarted);
+                }
+            }
+            Some(LifecycleSignal::Progress)
+        }
+        SessionUpdate::AgentThoughtChunk(_) | SessionUpdate::Plan(_) => {
+            Some(LifecycleSignal::Progress)
+        }
         SessionUpdate::ToolCall(tc) => {
+            let id = tc.tool_call_id.0.to_string();
+            if matches!(tc.status, ToolCallStatus::Completed) {
+                let content = Some(tc.content.clone());
+                return Some(LifecycleSignal::ToolCompleted {
+                    id,
+                    succeeded: true,
+                    off_protocol_work: detect_off_protocol_work_completed(&content),
+                });
+            }
+            if matches!(tc.status, ToolCallStatus::Failed) {
+                return Some(LifecycleSignal::ToolCompleted {
+                    id,
+                    succeeded: false,
+                    off_protocol_work: None,
+                });
+            }
             let is_background_task = tc
                 .raw_input
                 .as_ref()
@@ -712,7 +753,7 @@ fn classify_lifecycle_signal(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
             Some(LifecycleSignal::ToolStarted {
-                id: tc.tool_call_id.0.to_string(),
+                id,
                 is_background_task,
             })
         }
@@ -780,6 +821,14 @@ pub(crate) enum OffProtocolWorkKind {
     /// outlasts the turn's final accounting frame. See #1360, #1401, and
     /// the monitor-killed-by-watchdog regression.
     ScheduledWakeup,
+    /// The Claude adapter's `/compact` command. It hides a long context
+    /// summarization API call behind a single "Compacting..." text chunk
+    /// with no further ACP progress until "Compacting completed.". Bounded
+    /// by the turn: dropped on `TerminalUsage` (like `BackgroundCommand`)
+    /// and on the explicit completion marker, so a lost `PromptResponse`
+    /// still self-heals on the fast grace rather than holding the 30-minute
+    /// floor. See #2898.
+    Compaction,
 }
 
 /// Per-tool metadata stored in the silent-orphan watchdog's
@@ -870,6 +919,30 @@ impl SilentOrphanWatchdog {
                 self.cost_seen = false;
                 self.last_refresh_was_progress = true;
             }
+            LifecycleSignal::CompactionStarted => {
+                // Treat the "Compacting..." marker as progress for timer
+                // purposes, then latch the off-protocol floor so the quiet
+                // summarization window that follows is not read as a wedge.
+                // See #2898.
+                self.saw_first_progress = true;
+                self.last_progress_at = Some(now);
+                self.cost_seen = false;
+                self.last_refresh_was_progress = true;
+                self.off_protocol_work_seen = Some(OffProtocolWorkKind::Compaction);
+            }
+            LifecycleSignal::CompactionCompleted => {
+                // Compaction finished; drop its suppression so any continued
+                // work in the same turn recovers on the normal grace. Guard
+                // the clear to Compaction so a completion marker cannot erase
+                // an unrelated off-protocol kind. See #2898.
+                if self.off_protocol_work_seen == Some(OffProtocolWorkKind::Compaction) {
+                    self.off_protocol_work_seen = None;
+                }
+                self.saw_first_progress = true;
+                self.last_progress_at = Some(now);
+                self.cost_seen = false;
+                self.last_refresh_was_progress = true;
+            }
             LifecycleSignal::ToolStarted {
                 id,
                 is_background_task,
@@ -942,7 +1015,16 @@ impl SilentOrphanWatchdog {
                 // idles waiting and resumes in-band), so their floor is
                 // left intact to preserve the #1360 fix and the monitor
                 // fix; only the fire-and-forget BackgroundCommand drops.
-                if self.off_protocol_work_seen == Some(OffProtocolWorkKind::BackgroundCommand) {
+                //
+                // Compaction is likewise turn-bounded: the summarization
+                // call ends before the final accounting frame, so dropping
+                // it here lets a lost PromptResponse after `/compact` recover
+                // on the fast grace instead of holding the floor for 30
+                // minutes. See #2898.
+                if matches!(
+                    self.off_protocol_work_seen,
+                    Some(OffProtocolWorkKind::BackgroundCommand | OffProtocolWorkKind::Compaction)
+                ) {
                     self.off_protocol_work_seen = None;
                 }
             }
@@ -1229,6 +1311,25 @@ fn between_prompt_should_fire(
     now_ms - last_lifecycle_ms >= grace.as_millis() as i64
 }
 
+/// Terminal `Stopped` reason for a between-prompt idle-watchdog fire.
+///
+/// An adopted turn (`Resume { in_flight_turn: true }`, #2899) has no owning
+/// `prompt_fut`, so this watchdog emits its terminal event. If it reached its
+/// cost-populated end-of-turn `UsageUpdate` (`cost_seen`), the turn completed
+/// cleanly: emit `prompt_complete`, the reason the owning connection would have
+/// emitted, which stays out of the supervisor's kill+respawn set so a pending
+/// build respawn proceeds on the idle boundary. If it fired without the cost
+/// marker, the adopted turn stalled mid-stream: route to `reattach_idle` for
+/// recovery. A non-adopted agent-initiated turn (Monitor / scheduled wake, #2325)
+/// keeps `agent_idle`.
+fn between_prompt_stop_reason(adopted: bool, cost_seen: bool) -> &'static str {
+    match (adopted, cost_seen) {
+        (false, _) => "agent_idle",
+        (true, true) => "prompt_complete",
+        (true, false) => "reattach_idle",
+    }
+}
+
 /// Tagged lifecycle signal carried over the watchdog mpsc. The
 /// `epoch` field is captured at signal-construction time from the
 /// shared `current_prompt_epoch` atomic; the prompt loop discards
@@ -1286,6 +1387,36 @@ async fn send_lifecycle_signal(
                 );
             }
         }
+    }
+}
+
+/// Forward a notification's watchdog signals to the per-prompt lifecycle
+/// channel, but only while a prompt is in flight.
+///
+/// The channel's sole consumer is the prompt loop: it drains during a
+/// `session/prompt` and flushes leftovers (discarding them by epoch) at
+/// the start of the next one. Between prompts nothing reads it, so a busy
+/// agent (a background Task subagent streaming child tool calls, or an
+/// agent-initiated turn) fills all slots and the next awaited send parks
+/// the notification handler until the next prompt; with dispatch
+/// serialized per connection, that freezes every subsequent notification
+/// and the session appears dead while the agent keeps working. Skipping
+/// the send loses nothing: a between-prompt envelope could only ever be
+/// flushed unread. The between-prompt watchdog is fed by atomics in the
+/// notification handler, not this channel. See #2888.
+async fn forward_lifecycle_signals(
+    prompt_active: bool,
+    tx: &mpsc::Sender<LifecycleEnvelope>,
+    epoch: u64,
+    lifecycle: Option<LifecycleSignal>,
+    wakeup: Option<LifecycleSignal>,
+    session_label: &str,
+) {
+    if !prompt_active {
+        return;
+    }
+    for signal in [lifecycle, wakeup].into_iter().flatten() {
+        send_lifecycle_signal(tx, LifecycleEnvelope { epoch, signal }, session_label).await;
     }
 }
 
@@ -3560,6 +3691,18 @@ fn is_compact_completion(text: &str) -> bool {
     text.contains("Compacting completed.")
 }
 
+/// Heuristic detector for the start of a `/compact` cycle. The Claude ACP
+/// adapter emits "Compacting..." as a plain `agent_message_chunk` and then
+/// runs the summarization API call with no further ACP progress until
+/// "Compacting completed.". Without a signal, the silent-orphan watchdog
+/// reads that quiet window as a wedged agent and cancels the compaction
+/// after the base grace. Same fragility trade-off as `is_compact_completion`:
+/// a missed match only reverts to that false-positive kill, never data loss.
+/// See #2898.
+fn is_compact_start(text: &str) -> bool {
+    text.contains("Compacting...")
+}
+
 /// Tracks the in-flight assistant text block so claude-agent-acp's leaked
 /// consolidated `agent_message_chunk` restatement can be dropped before it
 /// reaches the watchdog, the event store, or any client. The adapter streams a
@@ -3717,6 +3860,24 @@ fn map_update_to_events(
         },
         SessionUpdate::AgentThoughtChunk(_) => vec![Event::ThinkingStarted],
         SessionUpdate::ToolCall(tc) => {
+            let terminal_status = match tc.status {
+                agent_client_protocol::schema::v1::ToolCallStatus::Completed => Some(false),
+                agent_client_protocol::schema::v1::ToolCallStatus::Failed => Some(true),
+                _ => None,
+            };
+            let completion_content = terminal_status
+                .is_some()
+                .then(|| extract_tool_content_text(&tc.content));
+            let completion_output = terminal_status
+                .is_some()
+                .then(|| extract_tool_output_blocks(&tc.content));
+            let async_subagent = terminal_status.is_some_and(|is_error| {
+                !is_error
+                    && matches!(
+                        detect_off_protocol_work_completed(&Some(tc.content.clone())),
+                        Some(OffProtocolWorkKind::AsyncAgent)
+                    )
+            });
             let raw_args = tc.raw_input.clone().unwrap_or(serde_json::Value::Null);
             // Empty (not the literal "null") when the agent ships no
             // raw_input, so argless tool cards render a clean empty-state.
@@ -3788,6 +3949,16 @@ fn map_update_to_events(
                 if let Some(event) = wakeup_event_from_raw(&raw_args) {
                     events.push(event);
                 }
+            }
+            if let Some(is_error) = terminal_status {
+                events.push(Event::ToolCallCompleted {
+                    tool_call_id: tc.tool_call_id.0.to_string(),
+                    is_error,
+                    content: completion_content.unwrap_or_default(),
+                    output: completion_output.unwrap_or_default(),
+                    completed_at: chrono::Utc::now(),
+                    async_subagent,
+                });
             }
             events
         }
@@ -4254,6 +4425,29 @@ fn mode_config_id(
 /// parent).
 pub(crate) fn should_fork(fork_from: Option<&str>, agent_advertises_fork: bool) -> bool {
     fork_from.is_some_and(|s| !s.is_empty()) && agent_advertises_fork
+}
+
+/// Build the ACP `initialize` request AoE sends to every agent adapter.
+/// `client_info` is mandatory here: strict agent backends (Mistral Vibe's
+/// `vibe-acp`) reject an initialize whose `client_name`/`client_version` are
+/// empty strings, which is what omitting it serializes to. See issue #2767.
+fn build_initialize_request() -> InitializeRequest {
+    let capabilities = ClientCapabilities::new()
+        .fs(FileSystemCapabilities::new()
+            .read_text_file(true)
+            .write_text_file(true))
+        .terminal(true)
+        // Advertise form-mode elicitation so claude-agent-acp
+        // (>=0.44) re-enables AskUserQuestion and routes it to us as
+        // an `elicitation/create` request. Without this the adapter
+        // unconditionally blacklists the tool. See handle_elicitation_request.
+        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()));
+    InitializeRequest::new(ProtocolVersion::V1)
+        .client_capabilities(capabilities)
+        .client_info(
+            Implementation::new("agent-of-empires", env!("CARGO_PKG_VERSION"))
+                .title("Agent of Empires"),
+        )
 }
 
 /// Build a structured view `ConfigOptionDescriptor` from an ACP
@@ -4746,6 +4940,21 @@ fn is_mode_advertised(
     }
 }
 
+/// The `cwd` to send on `session/new` / `session/load` / `session/fork`.
+///
+/// A sandboxed agent runs inside the container (via `docker exec`), so it
+/// must be given the container workdir, not the host project path; the host
+/// path does not exist in the container and the agent rejects it with
+/// "'cwd' does not exist on the machine running the agent" (#2871). The
+/// container workdir is the create-time-pinned value resolved by
+/// `SessionSandbox::from_info`. Non-sandbox sessions keep the host `cwd`.
+fn agent_request_cwd(
+    container_workdir: Option<&std::path::Path>,
+    host_cwd: &std::path::Path,
+) -> PathBuf {
+    container_workdir.unwrap_or(host_cwd).to_path_buf()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_connection_task<W, R>(
     transport: ByteStreams<W, R>,
@@ -4817,6 +5026,15 @@ async fn run_connection_task<W, R>(
     let res_term_wait = resources.clone();
     let res_term_kill = resources.clone();
     let res_term_release = resources.clone();
+    // Sandboxed agents run in-container: the session/new|load|fork request
+    // must carry the container workdir, not the host path (#2871).
+    let agent_cwd = agent_request_cwd(
+        resources
+            .sandbox
+            .as_ref()
+            .map(|s| s.container_workdir.as_path()),
+        &cwd,
+    );
 
     // After a successful `session/load`, claude-agent-acp re-emits the
     // full prior transcript as `session/update` notifications (each
@@ -4831,6 +5049,13 @@ async fn run_connection_task<W, R>(
     let suppress_history_replay = Arc::new(AtomicBool::new(false));
     let suppress_for_notif = suppress_history_replay.clone();
     let suppress_for_block = suppress_history_replay.clone();
+    // Every session/load replays historical notifications. Ordinary reattach
+    // drops their visible transcript via `suppress_history_replay`; import seed
+    // keeps it, but still must prevent history from arming live watchdogs,
+    // poisoning message dedup, or spawning background tailers.
+    let replaying_history = Arc::new(AtomicBool::new(false));
+    let replaying_for_notif = replaying_history.clone();
+    let replaying_for_block = replaying_history.clone();
     let session_label_for_notif = session_label.clone();
 
     // Watchdog inputs (only consulted when `mode` is `Resume { in_flight_turn: true }`):
@@ -4852,6 +5077,14 @@ async fn run_connection_task<W, R>(
     let first_event_after_attach = Arc::new(AtomicBool::new(false));
     let prompt_sent_since_attach = Arc::new(AtomicBool::new(false));
     let watchdog_fired = Arc::new(AtomicBool::new(false));
+    // True for a turn adopted mid-flight via `Resume { in_flight_turn: true }`:
+    // a prior connection issued the `session/prompt`, so this connection has no
+    // owning `prompt_fut` and no real `ClientCmd::Prompt` will emit the turn's
+    // terminal Stopped. Set true once the handshake resolves the mode (below).
+    // Cleared when a real prompt starts or when a terminal path claims the
+    // `watchdog_fired` guard. Drives the cost-marker completion the between-
+    // prompt watchdog emits for the adopted turn. See #2899.
+    let adopted_turn_active = Arc::new(AtomicBool::new(false));
     // Between-prompt idle watchdog state (#2325). Tracks an agent-initiated
     // turn (Monitor / scheduled-wake resume) that runs with no aoe-issued
     // `session/prompt`, so the outer command loop's idle tick can synthesize
@@ -4896,6 +5129,7 @@ async fn run_connection_task<W, R>(
     let between_prompt_tools_for_notif = between_prompt_tools.clone();
     let between_prompt_off_protocol_for_notif = between_prompt_off_protocol.clone();
     let between_prompt_bg_agents_for_notif = between_prompt_bg_agents.clone();
+    let adopted_turn_active_for_notif = adopted_turn_active.clone();
     let prompt_in_flight_for_notif = prompt_in_flight.clone();
 
     // Per-session tracker that drops claude-agent-acp's leaked consolidated
@@ -4918,6 +5152,7 @@ async fn run_connection_task<W, R>(
             move |notification: SessionNotification, _cx| {
                 let event_tx = event_tx_for_notif.clone();
                 let suppress = suppress_for_notif.clone();
+                let replaying_history = replaying_for_notif.clone();
                 let session_label = session_label_for_notif.clone();
                 let last_event_at = last_event_at_for_notif.clone();
                 let first_event_after_attach =
@@ -4936,12 +5171,14 @@ async fn run_connection_task<W, R>(
                     between_prompt_off_protocol_for_notif.clone();
                 let between_prompt_bg_agents =
                     between_prompt_bg_agents_for_notif.clone();
+                let adopted_turn_active = adopted_turn_active_for_notif.clone();
                 let prompt_in_flight = prompt_in_flight_for_notif.clone();
                 let tool_context_cache = tool_context_cache_for_notif.clone();
                 async move {
                     last_event_at
                         .store(chrono::Utc::now().timestamp_millis(), Ordering::Relaxed);
                     let suppressing = suppress.load(Ordering::Relaxed);
+                    let replaying = replaying_history.load(Ordering::Acquire);
                     // Drop claude-agent-acp's leaked consolidated
                     // agent_message_chunk restatement before it reaches the
                     // watchdog, the event store, or any client (#2281). During
@@ -4951,7 +5188,7 @@ async fn run_connection_task<W, R>(
                         let mut dedup = agent_msg_dedup
                             .lock()
                             .expect("agent message dedup mutex poisoned");
-                        if suppressing {
+                        if suppressing || replaying {
                             dedup.reset();
                         } else if dedup.observe(&notification.update) {
                             debug!(
@@ -4981,7 +5218,7 @@ async fn run_connection_task<W, R>(
                         classify_watchdog_notification_signals(
                             &notification.update,
                             profile,
-                            suppressing,
+                            suppressing || replaying,
                         );
                     // Disarm resume-idle only on lifecycle-bearing
                     // notifications (progress/tool/terminal/wakeup). Pure
@@ -4990,6 +5227,7 @@ async fn run_connection_task<W, R>(
                     if lifecycle_signal.is_some() || wakeup_signal.is_some() {
                         first_event_after_attach.store(true, Ordering::Relaxed);
                     }
+                    let prompt_active = prompt_in_flight.load(Ordering::Relaxed);
                     // Between-prompt idle tracking (#2325). Only while no
                     // aoe-issued prompt is in flight: a lifecycle signal here
                     // means the agent resumed itself (Monitor / scheduled
@@ -4997,7 +5235,7 @@ async fn run_connection_task<W, R>(
                     // its cost/progress/wake semantics so the outer loop's
                     // idle tick applies the same grace. During a real prompt
                     // the per-prompt watchdog owns this, so skip.
-                    if !prompt_in_flight.load(Ordering::Relaxed) {
+                    if !prompt_active {
                         let now = chrono::Utc::now().timestamp_millis();
                         if let Some(u) = between_prompt_signal_update(
                             lifecycle_signal.as_ref(),
@@ -5063,6 +5301,34 @@ async fn run_connection_task<W, R>(
                                         .store(true, Ordering::Relaxed);
                                 }
                             }
+                            Some(LifecycleSignal::TerminalUsage)
+                                if adopted_turn_active.load(Ordering::Relaxed) =>
+                            {
+                                // Adopted-turn barrier (#2899). A tool that was
+                                // in flight across the reattach boundary had its
+                                // ToolCall start on the previous connection; this
+                                // connection may see a trailing InProgress update
+                                // (re-inserting it into between_prompt_tools) but
+                                // never the terminal Completed/Failed frame, which
+                                // went to the old connection or only rode the
+                                // dropped PromptResponse. That leaks a stuck entry
+                                // that pins `work_in_flight` true forever, so the
+                                // between-prompt watchdog can never fire. A cost-
+                                // populated end-of-turn UsageUpdate is the adapter's
+                                // authoritative "turn wrapped up" marker (same signal
+                                // the per-prompt watchdog trusts), so drop the
+                                // unreliable inherited tool + untracked-background
+                                // bookkeeping. A future scheduled wake
+                                // (between_prompt_wake_at) and precisely tracked
+                                // async agents (between_prompt_bg_agents) keep their
+                                // own suppression: they carry real continuation
+                                // semantics, unlike a stale ACP tool entry.
+                                between_prompt_tools
+                                    .lock()
+                                    .expect("between-prompt tools mutex poisoned")
+                                    .clear();
+                                between_prompt_off_protocol.store(false, Ordering::Relaxed);
+                            }
                             _ => {}
                         }
                     }
@@ -5079,29 +5345,20 @@ async fn run_connection_task<W, R>(
                     // cancel a legitimate wait. Watchdog correctness
                     // wins; UI ordering is reconciled by the event
                     // store's monotonic seq anyway. See #1401 post-
-                    // impl review.
-                    if let Some(sig) = lifecycle_signal {
-                        send_lifecycle_signal(
-                            &lifecycle_signal_tx,
-                            LifecycleEnvelope {
-                                epoch: envelope_epoch,
-                                signal: sig,
-                            },
-                            &session_label,
-                        )
-                        .await;
-                    }
-                    if let Some(sig) = wakeup_signal {
-                        send_lifecycle_signal(
-                            &lifecycle_signal_tx,
-                            LifecycleEnvelope {
-                                epoch: envelope_epoch,
-                                signal: sig,
-                            },
-                            &session_label,
-                        )
-                        .await;
-                    }
+                    // impl review. Skipped entirely between prompts:
+                    // nothing drains the channel then, so at capacity
+                    // the awaited send would wedge this handler, and
+                    // every notification behind it, until the next
+                    // prompt (#2888).
+                    forward_lifecycle_signals(
+                        prompt_active,
+                        &lifecycle_signal_tx,
+                        envelope_epoch,
+                        lifecycle_signal,
+                        wakeup_signal,
+                        &session_label,
+                    )
+                    .await;
                     for event in mapped_events {
                         // An async sub-agent launch: spawn a tailer that
                         // follows the agent's on-disk transcript and emits
@@ -5117,7 +5374,7 @@ async fn run_connection_task<W, R>(
                             ..
                         } = &event
                         {
-                            if !suppressing && !output_file.is_empty() {
+                            if !suppressing && !replaying && !output_file.is_empty() {
                                 crate::acp::background_agent::spawn_tailer(
                                     agent_id.clone(),
                                     output_file.clone(),
@@ -5255,27 +5512,12 @@ async fn run_connection_task<W, R>(
         )
         .connect_with(transport, |connection: ConnectionTo<Agent>| async move {
             info!(target: "acp.protocol", session = %session_label, "initializing ACP agent");
-            let capabilities = ClientCapabilities::new()
-                .fs(FileSystemCapabilities::new()
-                    .read_text_file(true)
-                    .write_text_file(true))
-                .terminal(true)
-                // Advertise form-mode elicitation so claude-agent-acp
-                // (>=0.44) re-enables AskUserQuestion and routes it to us as
-                // an `elicitation/create` request. Without this the adapter
-                // unconditionally blacklists the tool. See handle_elicitation_request.
-                .elicitation(
-                    ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()),
-                );
             // `initialize` is sent in both Fresh and Resume modes.
             // It's idempotent on every ACP agent we ship against
             // (aoe-agent, claude-agent-acp); the response only carries
             // capability metadata; so re-sending it on attach is safe.
             let init = connection
-                .send_request(
-                    InitializeRequest::new(ProtocolVersion::V1)
-                        .client_capabilities(capabilities),
-                )
+                .send_request(build_initialize_request())
                 .block_task()
                 .await?;
 
@@ -5339,6 +5581,10 @@ async fn run_connection_task<W, R>(
                     ..
                 }
             );
+            // Mark the adopted turn so the notification handler applies the
+            // cost-marker barrier and the between-prompt watchdog emits
+            // `prompt_complete` for it. Set before any turn events arrive. See #2899.
+            adopted_turn_active.store(arm_resume_watchdog, Ordering::Relaxed);
             info!(
                 target: "acp.protocol",
                 session = %session_label,
@@ -5456,7 +5702,7 @@ async fn run_connection_task<W, R>(
                             parent_acp_id = %parent,
                             "structured fork via session/fork"
                         );
-                        let req = ForkSessionRequest::new(parent.clone(), cwd.clone())
+                        let req = ForkSessionRequest::new(parent.clone(), agent_cwd.clone())
                             .mcp_servers(mcp_servers.clone());
                         match connection.send_request(req).block_task().await {
                             Ok(resp) => {
@@ -5593,15 +5839,23 @@ async fn run_connection_task<W, R>(
                             if !seed_history_replay {
                                 suppress_for_block.store(true, Ordering::Relaxed);
                             }
-                            let req = LoadSessionRequest::new(stored.clone(), cwd.clone())
+                            replaying_for_block.store(true, Ordering::Release);
+                            let req = LoadSessionRequest::new(stored.clone(), agent_cwd.clone())
                                 .mcp_servers(mcp_servers.clone());
                             match connection.send_request(req).block_task().await {
                                 Ok(resp) => {
+                                    // Supported adapters await every history
+                                    // notification before returning session/load.
+                                    // The ordered response is therefore the replay
+                                    // fence; notification callbacks also finish in
+                                    // the protocol dispatch loop before this future
+                                    // resolves.
+                                    replaying_for_block.store(false, Ordering::Release);
                                     info!(
                                         target: "acp.protocol",
                                         session = %session_label,
                                         stored_id = %stored,
-                                        "session/load succeeded; suppressing post-load history replay"
+                                        "session/load succeeded; replay response fence reached"
                                     );
                                     // Capture available mode info from the
                                     // load response before consuming resp.
@@ -5629,6 +5883,18 @@ async fn run_connection_task<W, R>(
                                     {
                                         has_config_option_mode = true;
                                     }
+                                    // Imported history contains multiple historical
+                                    // user prompts but no prompt-response boundary.
+                                    // Close the complete replay before advertising the
+                                    // session as promptable so reducers settle to Idle
+                                    // without retiring a raced live prompt.
+                                    if seed_history_replay {
+                                        let _ = event_tx_for_block
+                                            .send(Event::Stopped {
+                                                reason: "history_replay_complete".into(),
+                                            })
+                                            .await;
+                                    }
                                     // Emit AcpSessionAssigned even on resume so the
                                     // frontend reducer can clear any sticky
                                     // `startupError` / `lastError` from a prior crash
@@ -5654,6 +5920,7 @@ async fn run_connection_task<W, R>(
                                     acp_session_id = Some(SessionId::from(stored));
                                 }
                                 Err(e) if seed_history_replay => {
+                                    replaying_for_block.store(false, Ordering::Relaxed);
                                     // Import seed (#2276): the replay may have
                                     // partially populated the (otherwise empty)
                                     // event store before load failed. Falling
@@ -5680,6 +5947,7 @@ async fn run_connection_task<W, R>(
                                         "session/load failed, falling back to session/new: {e}"
                                     );
                                     suppress_for_block.store(false, Ordering::Relaxed);
+                                    replaying_for_block.store(false, Ordering::Relaxed);
                                     let _ = event_tx_for_block
                                         .send(Event::SessionContextReset {
                                             reason: format!("session/load failed: {e}"),
@@ -5699,7 +5967,9 @@ async fn run_connection_task<W, R>(
                             "creating fresh session via session/new"
                         );
                         let new_session = connection
-                            .send_request(NewSessionRequest::new(cwd).mcp_servers(mcp_servers))
+                            .send_request(
+                                NewSessionRequest::new(agent_cwd.clone()).mcp_servers(mcp_servers),
+                            )
                             .block_task()
                             .await?;
                         let id = new_session.session_id.clone();
@@ -5909,11 +6179,14 @@ async fn run_connection_task<W, R>(
                             // observable; any further silence is normal
                             // mid-turn reasoning (Task subagents, slow Bash,
                             // long reads) rather than an orphaned turn. Disarm
-                            // permanently. The narrow residual (the turn
-                            // completes after attach and its PromptResponse is
-                            // lost, leaving a stale spinner) is rare and
-                            // recoverable via force-end-turn / a new prompt.
-                            // See #1216.
+                            // permanently: completion of the observable adopted
+                            // turn is now owned by the between-prompt watchdog,
+                            // which emits `prompt_complete` once the cost-
+                            // populated end-of-turn UsageUpdate lands (the
+                            // barrier at the TerminalUsage arm above clears the
+                            // stale tool bookkeeping that used to pin it). This
+                            // task stays the recovery path only for the fully
+                            // silent case below. See #1216, #2899.
                             info!(
                                 target: "acp.protocol",
                                 session = %session_label_for_watchdog,
@@ -5924,13 +6197,27 @@ async fn run_connection_task<W, R>(
                         let last = last_event_at.load(Ordering::Relaxed);
                         let now = chrono::Utc::now().timestamp_millis();
                         if now - last >= grace_ms {
+                            // Claim the shared terminal guard so the between-
+                            // prompt watchdog can't also emit for this adopted
+                            // turn in the narrow window where the first event
+                            // and this grace expiry interleave. See #2899.
+                            if watchdog_fired
+                                .compare_exchange(
+                                    false,
+                                    true,
+                                    Ordering::AcqRel,
+                                    Ordering::Acquire,
+                                )
+                                .is_err()
+                            {
+                                return;
+                            }
                             info!(
                                 target: "acp.protocol",
                                 session = %session_label_for_watchdog,
                                 idle_ms = now - last,
                                 "resume-idle watchdog: synthesizing Stopped for orphaned in-flight turn"
                             );
-                            watchdog_fired.store(true, Ordering::Relaxed);
                             let _ = event_tx_for_watchdog
                                 .send(Event::Stopped {
                                     reason: "reattach_idle".into(),
@@ -5974,17 +6261,40 @@ async fn run_connection_task<W, R>(
                             .lock()
                             .expect("between-prompt bg-agents mutex poisoned")
                             .is_empty();
+                        let cost_seen = between_prompt_cost_seen.load(Ordering::Relaxed);
                         if between_prompt_should_fire(
                             between_prompt_active.load(Ordering::Relaxed),
                             now,
                             last_lifecycle_at.load(Ordering::Relaxed),
                             wake_at,
-                            between_prompt_cost_seen.load(Ordering::Relaxed),
+                            cost_seen,
                             tools_in_flight || bg_agents_in_flight,
                             between_prompt_off_protocol.load(Ordering::Relaxed),
                             BETWEEN_PROMPT_IDLE_GRACE,
                             OFF_PROTOCOL_WORK_GRACE_FLOOR,
                         ) {
+                            // An adopted turn (#2899) has no owning prompt_fut, so
+                            // this watchdog owns its terminal Stopped. Claim the
+                            // shared `watchdog_fired` guard so the detached
+                            // resume-idle task can't also fire in the narrow window
+                            // where the first observable event and its grace expiry
+                            // interleave; if that task already claimed, still reset
+                            // state below but skip the emit. A non-adopted
+                            // agent-initiated turn is serialized on this loop and
+                            // needs no guard.
+                            let adopted = adopted_turn_active.load(Ordering::Relaxed);
+                            let claimed = !adopted
+                                || watchdog_fired
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::AcqRel,
+                                        Ordering::Acquire,
+                                    )
+                                    .is_ok();
+                            if adopted {
+                                adopted_turn_active.store(false, Ordering::Relaxed);
+                            }
                             // Clear all between-prompt state so a stale expired
                             // wake can't accelerate (or an off-protocol latch
                             // can't pin) the next agent-initiated turn. See #2371.
@@ -6000,16 +6310,20 @@ async fn run_connection_task<W, R>(
                                 .lock()
                                 .expect("between-prompt bg-agents mutex poisoned")
                                 .clear();
-                            info!(
-                                target: "acp.protocol",
-                                session = %session_label,
-                                "between-prompt idle watchdog: synthesizing Stopped for completed agent-initiated turn"
-                            );
-                            let _ = event_tx_for_block
-                                .send(Event::Stopped {
-                                    reason: "agent_idle".into(),
-                                })
-                                .await;
+                            if claimed {
+                                let reason = between_prompt_stop_reason(adopted, cost_seen);
+                                info!(
+                                    target: "acp.protocol",
+                                    session = %session_label,
+                                    reason,
+                                    "between-prompt idle watchdog: synthesizing Stopped for completed turn"
+                                );
+                                let _ = event_tx_for_block
+                                    .send(Event::Stopped {
+                                        reason: reason.into(),
+                                    })
+                                    .await;
+                            }
                         }
                         continue;
                     }
@@ -6039,6 +6353,10 @@ async fn run_connection_task<W, R>(
                         // transition, so we no longer need to synthesize
                         // one for the orphaned prior turn.
                         prompt_sent_since_attach.store(true, Ordering::Relaxed);
+                        // A real prompt supersedes an adopted in-flight turn: this
+                        // prompt's own PromptResponse owns the next Stopped, so the
+                        // adopted-turn completion path must stand down. See #2899.
+                        adopted_turn_active.store(false, Ordering::Relaxed);
                         // A real prompt supersedes any agent-initiated turn the
                         // between-prompt idle watchdog was tracking; this
                         // prompt's own Stopped will own the next transition.
@@ -6708,6 +7026,15 @@ async fn run_connection_task<W, R>(
                         // already idle: the reducer caps lastStoppedSeq at
                         // pendingUserPromptSeq, so a spurious Stopped while
                         // idle is a no-op. See #2237.
+                        //
+                        // This cancel is now the turn's terminal, so stand down
+                        // every idle-completion path: claim the shared guard so
+                        // the detached resume-idle task can't fire, and clear the
+                        // adopted / between-prompt tracking so a later tick can't
+                        // add a duplicate. See #2899.
+                        watchdog_fired.store(true, Ordering::Relaxed);
+                        adopted_turn_active.store(false, Ordering::Relaxed);
+                        between_prompt_active.store(false, Ordering::Relaxed);
                         let _ = event_tx_for_block
                             .send(Event::Stopped {
                                 reason: "cancelled".into(),
@@ -6720,6 +7047,11 @@ async fn run_connection_task<W, R>(
                         // `Stopped` to free a wedged UI (#1100); we only send
                         // a best-effort cancel notification. See #1727.
                         info!(target: "acp.protocol", "force-stop requested with no prompt in flight; best-effort cancel only");
+                        // The supervisor owns the terminal here, so stand down the
+                        // local idle-completion paths to avoid a duplicate. See #2899.
+                        watchdog_fired.store(true, Ordering::Relaxed);
+                        adopted_turn_active.store(false, Ordering::Relaxed);
+                        between_prompt_active.store(false, Ordering::Relaxed);
                         let _ = connection
                             .send_notification(CancelNotification::new(acp_session_id.clone()));
                     }
@@ -7527,11 +7859,87 @@ mod tests {
     use rusqlite::Connection;
 
     #[tokio::test]
+    async fn between_prompt_signals_do_not_block_on_a_full_lifecycle_channel() {
+        // Reproduces #2888: no prompt in flight means nothing drains the
+        // lifecycle channel; once it is full, an unguarded awaited send
+        // parks the notification handler forever and every notification
+        // behind it queues invisibly until the next prompt. The guard must
+        // skip the send entirely, so a between-prompt burst larger than
+        // the channel capacity completes without blocking.
+        let (tx, _rx) = mpsc::channel::<LifecycleEnvelope>(2);
+        for i in 0..2 {
+            tx.try_send(LifecycleEnvelope {
+                epoch: 0,
+                signal: LifecycleSignal::ToolStarted {
+                    id: format!("fill-{i}"),
+                    is_background_task: false,
+                },
+            })
+            .expect("pre-fill fits the channel");
+        }
+        let burst = async {
+            for i in 0..200 {
+                forward_lifecycle_signals(
+                    false,
+                    &tx,
+                    0,
+                    Some(LifecycleSignal::ToolStarted {
+                        id: i.to_string(),
+                        is_background_task: false,
+                    }),
+                    None,
+                    "test",
+                )
+                .await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), burst)
+            .await
+            .expect("between-prompt signals must not block on a full lifecycle channel");
+    }
+
+    #[tokio::test]
+    async fn active_prompt_signals_still_reach_the_lifecycle_channel() {
+        let (tx, mut rx) = mpsc::channel::<LifecycleEnvelope>(8);
+        forward_lifecycle_signals(
+            true,
+            &tx,
+            7,
+            Some(LifecycleSignal::Progress),
+            Some(LifecycleSignal::WakeupPending {
+                at: chrono::Utc::now(),
+            }),
+            "test",
+        )
+        .await;
+        let first = rx.try_recv().expect("lifecycle signal forwarded");
+        assert_eq!(first.epoch, 7);
+        assert!(matches!(first.signal, LifecycleSignal::Progress));
+        let second = rx.try_recv().expect("wakeup signal forwarded");
+        assert!(matches!(
+            second.signal,
+            LifecycleSignal::WakeupPending { .. }
+        ));
+        assert!(rx.try_recv().is_err(), "no extra envelopes");
+    }
+
+    #[tokio::test]
     async fn fake_client_round_trips_events() {
         let (mut client, tx) = AcpClient::fake_for_test(AcpSessionId("s-1".into()));
         tx.send(Event::ThinkingStarted).await.unwrap();
         let event = client.next_event().await.expect("event delivered");
         assert!(matches!(event, Event::ThinkingStarted));
+    }
+
+    #[test]
+    fn initialize_request_carries_non_empty_client_info() {
+        // Regression for #2767: strict agent backends (Mistral Vibe) reject an
+        // initialize whose client_name/client_version are empty. Our request
+        // must always send a populated client_info.
+        let req = build_initialize_request();
+        let info = req.client_info.expect("client_info must be set");
+        assert_eq!(info.name, "agent-of-empires");
+        assert!(!info.version.is_empty());
     }
 
     #[test]
@@ -7707,6 +8115,102 @@ mod tests {
         // Fast grace is 20s; 25s after the last progress with cost_seen
         // and no in-flight work must fire.
         assert!(w.should_fire(t0 + std::time::Duration::from_secs(25), cfg));
+    }
+
+    // #2898: /compact emits one "Compacting..." chunk then runs a long
+    // silent summarization call. Pre-fix that chunk classified as Progress,
+    // so the watchdog fired at the 120s base grace and cancelled the
+    // compaction. CompactionStarted must latch the off-protocol floor so a
+    // large compaction is never cut short, while still recovering on a true
+    // hang past the floor.
+    #[tokio::test]
+    async fn watchdog_compaction_uses_floor_not_base_grace() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::CompactionStarted, t0, wall, cfg);
+        assert_eq!(
+            w.off_protocol_work_seen(),
+            Some(OffProtocolWorkKind::Compaction)
+        );
+        // The exact failure timing from the issue: 120.4s of silence.
+        assert!(
+            !w.should_fire(t0 + std::time::Duration::from_millis(120_400), cfg),
+            "compaction must not be cancelled at the base grace"
+        );
+        // Still finite: a genuinely wedged compaction recovers past the floor.
+        assert!(
+            w.should_fire(t0 + std::time::Duration::from_secs(30 * 60 + 1), cfg),
+            "a hung compaction must eventually recover"
+        );
+    }
+
+    // #2898 reproduce-then-fix: drive the REAL classifier so this test
+    // compiles and runs on the pre-fix tree too. Pre-fix, "Compacting..."
+    // classifies as Progress and the watchdog fires at the 120s base grace
+    // (RED). Post-fix it classifies as CompactionStarted and survives (GREEN).
+    #[tokio::test]
+    async fn watchdog_does_not_cancel_compaction_via_classifier() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        let sig = classify_lifecycle_signal(&text_chunk("Compacting...", Some("m1")))
+            .expect("compact chunk must classify");
+        w.apply_signal(sig, t0, wall, cfg);
+        assert!(
+            !w.should_fire(t0 + std::time::Duration::from_millis(120_400), cfg),
+            "compaction must survive past the base grace"
+        );
+    }
+
+    // #2898: dropping Compaction on TerminalUsage preserves the #2237
+    // finished-but-unacked fast-grace recovery. Without the drop a lost
+    // PromptResponse after /compact would hold the 30-min floor.
+    #[tokio::test]
+    async fn watchdog_terminal_usage_clears_compaction_floor() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::CompactionStarted, t0, wall, cfg);
+        w.apply_signal(
+            LifecycleSignal::TerminalUsage,
+            t0 + std::time::Duration::from_secs(60),
+            wall,
+            cfg,
+        );
+        assert!(
+            w.off_protocol_work_seen().is_none(),
+            "TerminalUsage must clear the compaction floor"
+        );
+        // Fast grace (20s) now governs, keyed off the last progress at t0.
+        // 25s in it fires, and the #2237 clean-completion guard applies
+        // because cost_seen holds with no off-protocol work.
+        assert!(w.should_fire(t0 + std::time::Duration::from_secs(25), cfg));
+        assert!(w.cost_seen());
+    }
+
+    // #2898: the explicit completion marker clears the floor even without a
+    // cost frame, so continued work in the same turn recovers on the normal
+    // grace rather than the 30-min floor.
+    #[tokio::test]
+    async fn watchdog_compaction_completed_restores_base_grace() {
+        let cfg = watchdog_test_cfg();
+        let t0 = tokio::time::Instant::now();
+        let wall = chrono::Utc::now();
+        let mut w = SilentOrphanWatchdog::new();
+        w.apply_signal(LifecycleSignal::CompactionStarted, t0, wall, cfg);
+        let done = t0 + std::time::Duration::from_secs(180);
+        w.apply_signal(LifecycleSignal::CompactionCompleted, done, wall, cfg);
+        assert!(
+            w.off_protocol_work_seen().is_none(),
+            "completion marker must clear the compaction floor"
+        );
+        // Base grace (120s) governs from the completion timestamp.
+        assert!(!w.should_fire(done + std::time::Duration::from_secs(119), cfg));
+        assert!(w.should_fire(done + std::time::Duration::from_secs(121), cfg));
     }
 
     // #2237: when the watchdog fires on a turn that already emitted its
@@ -7937,6 +8441,44 @@ mod tests {
             FAST,
             FLOOR
         ));
+    }
+
+    #[test]
+    fn between_prompt_stop_reason_maps_adopted_and_agent_initiated() {
+        // #2899: a non-adopted agent-initiated turn (Monitor / scheduled wake,
+        // #2325) keeps agent_idle regardless of the cost marker.
+        assert_eq!(between_prompt_stop_reason(false, false), "agent_idle");
+        assert_eq!(between_prompt_stop_reason(false, true), "agent_idle");
+        // An adopted turn that reached its cost-populated end-of-turn
+        // UsageUpdate completed cleanly: prompt_complete, which stays out of
+        // the supervisor's kill+respawn set so a pending build respawn proceeds.
+        assert_eq!(between_prompt_stop_reason(true, true), "prompt_complete");
+        // An adopted turn that fired without the cost marker stalled
+        // mid-stream: route to reattach_idle for recovery, NOT a false
+        // prompt_complete that would tell the supervisor the turn succeeded.
+        assert_eq!(between_prompt_stop_reason(true, false), "reattach_idle");
+    }
+
+    #[test]
+    fn between_prompt_adopted_turn_completes_after_terminal_barrier_clears_stuck_tool() {
+        // #2899: a tool in flight across the adopt boundary leaks a stuck
+        // between_prompt_tools entry (its terminal frame went to the old
+        // connection), pinning work_in_flight true so the watchdog never fires
+        // and the session sits "Running" forever. The cost-populated
+        // end-of-turn UsageUpdate barrier clears that stale bookkeeping; the
+        // adopted turn then ends cleanly as prompt_complete.
+        let last = 1_000_000;
+        let past = last + FAST.as_millis() as i64 + 500;
+        // Stuck tool present -> work_in_flight true -> suppressed forever (bug).
+        assert!(!between_prompt_should_fire(
+            true, past, last, None, true, true, false, FAST, FLOOR
+        ));
+        // Barrier cleared the stale tools -> work_in_flight false -> fires.
+        assert!(between_prompt_should_fire(
+            true, past, last, None, true, false, false, FAST, FLOOR
+        ));
+        // The adopted, cost-seen completion is labeled prompt_complete.
+        assert_eq!(between_prompt_stop_reason(true, true), "prompt_complete");
     }
 
     #[test]
@@ -8849,6 +9391,29 @@ mod tests {
         assert_eq!(computed, "/workspace/feature");
     }
 
+    /// #2871: a sandboxed agent runs in-container, so session/new|load|fork
+    /// must carry the container workdir, not the host path (which does not
+    /// exist inside the container, worktree `..` or not). Non-sandbox
+    /// sessions keep the host cwd.
+    #[test]
+    fn agent_request_cwd_prefers_container_workdir_when_sandboxed() {
+        let host = PathBuf::from(
+            "/Users/nbrake/scm/agent-of-empires/../agent-of-empires-worktrees/bohemians",
+        );
+        let container = PathBuf::from("/workspace/bohemians");
+
+        assert_eq!(
+            agent_request_cwd(Some(container.as_path()), &host),
+            container,
+            "sandboxed request must use the container workdir"
+        );
+        assert_eq!(
+            agent_request_cwd(None, &host),
+            host,
+            "non-sandbox request must use the host cwd unchanged"
+        );
+    }
+
     /// Sandboxed structured view spawn must wrap the agent command in
     /// `docker exec` argv with `-i`, the container workdir, an `-e`
     /// flag per env entry, then the container name, then the agent
@@ -9426,6 +9991,34 @@ mod tests {
         assert!(!is_compact_completion("Compacting..."));
         assert!(!is_compact_completion("compact done"));
         assert!(!is_compact_completion(""));
+    }
+
+    #[test]
+    fn is_compact_start_matches_adapter_string() {
+        assert!(is_compact_start("Compacting..."));
+        assert!(is_compact_start("\n\nCompacting...\n"));
+        // The completion marker must not be read as a fresh start.
+        assert!(!is_compact_start("Compacting completed."));
+        assert!(!is_compact_start("compacting"));
+        assert!(!is_compact_start(""));
+    }
+
+    #[test]
+    fn classify_lifecycle_signal_routes_compaction_markers() {
+        // "Compacting..." arms the compaction floor; "Compacting completed."
+        // clears it; ordinary text stays plain progress. See #2898.
+        assert!(matches!(
+            classify_lifecycle_signal(&text_chunk("Compacting...", Some("m1"))),
+            Some(LifecycleSignal::CompactionStarted)
+        ));
+        assert!(matches!(
+            classify_lifecycle_signal(&text_chunk("Compacting completed.", Some("m2"))),
+            Some(LifecycleSignal::CompactionCompleted)
+        ));
+        assert!(matches!(
+            classify_lifecycle_signal(&text_chunk("regular assistant output", Some("m3"))),
+            Some(LifecycleSignal::Progress)
+        ));
     }
 
     #[test]
@@ -10191,6 +10784,64 @@ mod tests {
                 is_background_task, ..
             }) => assert!(!is_background_task),
             other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_lifecycle_signal_terminal_initial_tool_call_is_completed() {
+        use agent_client_protocol::schema::v1::{SessionUpdate, ToolCall, ToolCallStatus};
+
+        for (status, succeeded) in [
+            (ToolCallStatus::Completed, true),
+            (ToolCallStatus::Failed, false),
+        ] {
+            let tc = ToolCall::new("tc-history", "Read").status(status);
+            match classify_lifecycle_signal(&SessionUpdate::ToolCall(tc)) {
+                Some(LifecycleSignal::ToolCompleted {
+                    id,
+                    succeeded: actual,
+                    off_protocol_work,
+                }) => {
+                    assert_eq!(id, "tc-history");
+                    assert_eq!(actual, succeeded);
+                    assert!(off_protocol_work.is_none());
+                }
+                other => panic!("expected terminal ToolCompleted, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn map_terminal_initial_tool_call_emits_start_and_completion() {
+        use agent_client_protocol::schema::v1::{
+            Content, SessionUpdate, ToolCall, ToolCallContent, ToolCallStatus,
+        };
+
+        for (status, is_error) in [
+            (ToolCallStatus::Completed, false),
+            (ToolCallStatus::Failed, true),
+        ] {
+            let tc = ToolCall::new("tc-history", "Read")
+                .status(status)
+                .content(vec![ToolCallContent::Content(Content::new(
+                    "history output",
+                ))]);
+            let events = map_update_to_events(SessionUpdate::ToolCall(tc), &agent_profiles::CODEX);
+            assert!(matches!(
+                events.first(),
+                Some(Event::ToolCallStarted { .. })
+            ));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                Event::ToolCallCompleted {
+                    tool_call_id,
+                    is_error: actual_error,
+                    content,
+                    ..
+                } if tool_call_id == "tc-history"
+                    && *actual_error == is_error
+                    && content == "history output"
+            )));
         }
     }
 

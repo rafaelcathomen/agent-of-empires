@@ -14,7 +14,7 @@ import { act, renderHook } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { emptyAcpState, type QueuedPrompt } from "../lib/acpTypes";
+import { applyEvent, emptyAcpState, type QueuedPrompt } from "../lib/acpTypes";
 import { AgentProfileProvider } from "../lib/agentProfileContext";
 import { reportAcpInteraction } from "../lib/api";
 import { acpHookReducer, combineQueuedPrompts, useAcpSession } from "./useAcpSession";
@@ -206,6 +206,81 @@ describe("acpHookReducer / queue actions", () => {
     expect(next.turnActive).toBe(true);
     expect(next.queuedPrompts[0]?.text).toBe("queued follow-up");
   });
+
+  it("keeps an optimistic live prompt active across the history replay boundary", () => {
+    let state = acpHookReducer(emptyAcpState(), {
+      kind: "user_prompt",
+      text: "live prompt",
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "imported prompt" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { Stopped: { reason: "history_replay_complete" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { AcpSessionAssigned: { acp_session_id: "loaded-id" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 4,
+      event: { UserPromptSent: { text: "live prompt" } },
+    });
+
+    expect(state.pendingUserPromptSeq).toBe(2);
+    expect(state.lastStoppedSeq).toBe(1);
+    expect(state.turnActive).toBe(true);
+  });
+
+  it("does not promote a rejected same-text optimistic row", () => {
+    let state = acpHookReducer(emptyAcpState(), {
+      kind: "user_prompt",
+      text: "same text",
+    });
+    state = acpHookReducer(state, {
+      kind: "user_prompt",
+      text: "same text",
+    });
+    state = acpHookReducer(state, {
+      kind: "prompt_send_rejected",
+      text: "same text",
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "same text" } },
+    });
+
+    expect(state.activity[0]?.id).not.toBe("user-seq-1");
+    expect(state.activity[0]?.optimistic).toBe(false);
+    expect(state.activity[1]?.id).toBe("user-seq-1");
+    expect(state.activity[1]?.optimistic).toBeUndefined();
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { UserPromptSent: { text: "imported prompt" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 4,
+      event: { Stopped: { reason: "history_replay_complete" } },
+    });
+
+    expect(state.turnActive).toBe(false);
+    expect(state.lastStoppedSeq).toBe(state.pendingUserPromptSeq);
+  });
 });
 
 describe("combineQueuedPrompts (combined drain mode)", () => {
@@ -307,6 +382,7 @@ describe("useAcpSession drain race (#1144)", () => {
   let promptPostStatus: number;
   let promptPostBody: string;
   let promptPostBodies: string[];
+  let promptPostBarrier: Promise<void> | null;
   let replayResponse: { frames: unknown[]; lost: boolean; highest_seq: number };
 
   beforeEach(() => {
@@ -315,6 +391,7 @@ describe("useAcpSession drain race (#1144)", () => {
     promptPostStatus = 200;
     promptPostBody = "simulated failure";
     promptPostBodies = [];
+    promptPostBarrier = null;
     vi.mocked(reportAcpInteraction).mockClear();
     replayResponse = { frames: [], lost: false, highest_seq: 0 };
     vi.stubGlobal(
@@ -329,10 +406,15 @@ describe("useAcpSession drain race (#1144)", () => {
           if (typeof init?.body === "string") {
             promptPostBodies.push(init.body);
           }
-          if (promptPostStatus >= 400) {
-            return new Response(promptPostBody, { status: promptPostStatus });
+          const status = promptPostStatus;
+          const body = promptPostBody;
+          if (promptPostBarrier) {
+            await promptPostBarrier;
           }
-          return new Response("{}", { status: promptPostStatus });
+          if (status >= 400) {
+            return new Response(body, { status });
+          }
+          return new Response("{}", { status });
         }
         return new Response("{}", { status: 200 });
       }),
@@ -622,6 +704,235 @@ describe("useAcpSession drain race (#1144)", () => {
     expect(result.current.state.queuedPrompts).toHaveLength(1);
     expect(result.current.state.queuedPrompts[0]?.text).toBe("wake me up");
     expect(result.current.state.lastError ?? "").not.toContain("Could not send prompt");
+  });
+
+  it("defers an import-time prompt without duplicating its optimistic row", async () => {
+    const { result } = renderHook(() => useAcpSession("sess-import-wait", "running"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready: history import in progress";
+    await act(async () => {
+      await result.current.sendPrompt("send after import");
+    });
+    await flushAsync();
+
+    expect(promptPostCount).toBe(1);
+    expect(result.current.state.importWaiting).toBe(true);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    expect(result.current.state.activity.filter((row) => row.kind === "user_prompt")).toHaveLength(0);
+    expect(result.current.state.turnActive).toBe(false);
+
+    promptPostStatus = 202;
+    promptPostBody = "";
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-import-wait",
+          seq: 1,
+          event: { AcpSessionAssigned: { acp_session_id: "loaded-id" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+
+    expect(result.current.state.importWaiting).toBe(false);
+    expect(promptPostCount).toBe(2);
+    expect(result.current.state.queuedPrompts).toHaveLength(0);
+
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-import-wait",
+          seq: 2,
+          event: { UserPromptSent: { text: "send after import" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(result.current.state.activity.filter((row) => row.kind === "user_prompt")).toHaveLength(1);
+    expect(result.current.state.pendingUserPromptSeq).toBe(1);
+  });
+
+  it("retries when assignment arrives before the import-time 503 response", async () => {
+    const { result } = renderHook(() => useAcpSession("sess-import-race", "running"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    let releasePromptPost: () => void = () => {};
+    promptPostBarrier = new Promise((resolve) => {
+      releasePromptPost = resolve;
+    });
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready: history import in progress";
+    let sendPromise: Promise<void> = Promise.resolve();
+    act(() => {
+      sendPromise = result.current.sendPrompt("send across completion race");
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(1);
+
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-import-race",
+          seq: 1,
+          event: { AcpSessionAssigned: { acp_session_id: "loaded-id" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+
+    promptPostStatus = 202;
+    promptPostBody = "";
+    promptPostBarrier = null;
+    await act(async () => {
+      releasePromptPost();
+      await sendPromise;
+    });
+    await flushAsync();
+
+    expect(result.current.state.importWaiting).toBe(false);
+    expect(promptPostCount).toBe(2);
+    expect(result.current.state.queuedPrompts).toHaveLength(0);
+  });
+
+  it("retries when replay recovery observes assignment before the import-time 503", async () => {
+    const { result } = renderHook(() => useAcpSession("sess-import-lag-race", "running"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+
+    let releasePromptPost: () => void = () => {};
+    promptPostBarrier = new Promise((resolve) => {
+      releasePromptPost = resolve;
+    });
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready: history import in progress";
+    let sendPromise: Promise<void> = Promise.resolve();
+    act(() => {
+      sendPromise = result.current.sendPrompt("send after lag recovery");
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(1);
+
+    replayResponse = {
+      frames: [
+        {
+          session_id: "sess-import-lag-race",
+          seq: 1,
+          event: { AcpSessionAssigned: { acp_session_id: "loaded-id" } },
+        },
+      ],
+      lost: false,
+      highest_seq: 1,
+    };
+    act(() => {
+      ws.onmessage?.({ data: JSON.stringify({ kind: "lagged", skipped: 1 }) } as MessageEvent);
+    });
+    await flushAsync();
+
+    promptPostStatus = 202;
+    promptPostBody = "";
+    promptPostBarrier = null;
+    await act(async () => {
+      releasePromptPost();
+      await sendPromise;
+    });
+    await flushAsync();
+
+    expect(result.current.state.importWaiting).toBe(false);
+    expect(promptPostCount).toBe(2);
+    expect(result.current.state.queuedPrompts).toHaveLength(0);
+  });
+
+  it("does not treat an overlapped old assignment as import completion", async () => {
+    const { result } = renderHook(() => useAcpSession("sess-import-old-overlap", "running"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-import-old-overlap",
+          seq: 1,
+          event: { AcpSessionAssigned: { acp_session_id: "old-id" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+
+    let releasePromptPost: () => void = () => {};
+    promptPostBarrier = new Promise((resolve) => {
+      releasePromptPost = resolve;
+    });
+    promptPostStatus = 503;
+    promptPostBody = "worker_not_ready: history import in progress";
+    let sendPromise: Promise<void> = Promise.resolve();
+    act(() => {
+      sendPromise = result.current.sendPrompt("wait for a new assignment");
+    });
+    await flushAsync();
+
+    replayResponse = {
+      frames: [
+        {
+          session_id: "sess-import-old-overlap",
+          seq: 1,
+          event: { AcpSessionAssigned: { acp_session_id: "old-id" } },
+        },
+      ],
+      lost: false,
+      highest_seq: 1,
+    };
+    act(() => {
+      ws.onmessage?.({ data: JSON.stringify({ kind: "lagged", skipped: 1 }) } as MessageEvent);
+    });
+    await flushAsync();
+
+    promptPostBarrier = null;
+    await act(async () => {
+      releasePromptPost();
+      await sendPromise;
+    });
+    await flushAsync();
+
+    expect(result.current.state.importWaiting).toBe(true);
+    expect(promptPostCount).toBe(1);
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+
+    promptPostStatus = 202;
+    promptPostBody = "";
+    act(() => {
+      ws.onmessage?.({
+        data: JSON.stringify({
+          session_id: "sess-import-old-overlap",
+          seq: 2,
+          event: { AcpSessionAssigned: { acp_session_id: "new-id" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+
+    expect(result.current.state.importWaiting).toBe(false);
+    expect(promptPostCount).toBe(2);
+    expect(result.current.state.queuedPrompts).toHaveLength(0);
   });
 
   it("still surfaces an error banner on a worker_capacity_full 503 (#1748)", async () => {

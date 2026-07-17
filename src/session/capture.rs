@@ -118,6 +118,39 @@ pub(crate) fn capture_claude_session_id(
     anyhow::bail!("No active Claude session found for {}", project_path)
 }
 
+/// Whether we can affirmatively prove Claude has *no* persisted transcript for
+/// `session_id` under `project_path` on the host filesystem.
+///
+/// Claude only writes `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` once a
+/// conversation has real content. A session AoE minted a UUID for but that was
+/// killed before the first prompt (an "empty thread") therefore has a stored
+/// `agent_session_id` that never hit disk, and `claude --resume <uuid>` on it
+/// fails with "No conversation found" every time. Callers use this to launch
+/// such an id as a fresh pinned session (`--session-id <uuid>`) instead of a
+/// guaranteed-to-fail `--resume`.
+///
+/// Returns `true` ONLY when the Claude home resolves and the transcript file is
+/// confirmed missing. Any uncertainty (home dir unresolved) returns `false` so
+/// the caller preserves the existing `--resume` attempt rather than risk
+/// downgrading a real conversation to a fresh start. The check is
+/// existence-only (no mtime freshness gate), so an idle-but-real conversation
+/// whose jsonl is older than the live-capture window is still reported present.
+pub(crate) fn claude_host_transcript_confirmed_absent(
+    project_path: &str,
+    session_id: &str,
+) -> bool {
+    let Ok(claude_home) = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude") else {
+        return false;
+    };
+    let canonical = canonicalize_or_raw(project_path);
+    let dir_name = encode_claude_project_path(&canonical.to_string_lossy());
+    let transcript = claude_home
+        .join("projects")
+        .join(dir_name)
+        .join(format!("{session_id}.jsonl"));
+    !transcript.is_file()
+}
+
 /// Scan `~/.claude/projects/{encoded-path}/` and pick this poller's session.
 ///
 /// Tie-break:
@@ -1526,8 +1559,11 @@ pub(crate) fn capture_codex_session_id(
         let file = std::fs::File::open(path).ok()?;
         let reader = std::io::BufReader::new(file);
         let first_line = std::io::BufRead::lines(reader).next()?.ok()?;
-        let cwd = parse_codex_cwd_from_json(&first_line)?;
-        let cwd_matches = std::fs::canonicalize(&cwd)
+        let metadata = parse_codex_rollout_metadata(&first_line)?;
+        if metadata.is_child {
+            return None;
+        }
+        let cwd_matches = std::fs::canonicalize(&metadata.cwd)
             .map(|c| c == canonical_project)
             .unwrap_or(false);
         if cwd_matches {
@@ -1540,17 +1576,52 @@ pub(crate) fn capture_codex_session_id(
     chosen.ok_or_else(|| anyhow::anyhow!("No Codex session found matching project path"))
 }
 
-/// Parse the CWD from a Codex `.jsonl` first line (already in memory).
+/// Identity metadata from the first `session_meta` record in a Codex rollout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexRolloutMetadata {
+    pub(crate) cwd: String,
+    pub(crate) is_child: bool,
+}
+
+/// Parse the CWD and thread identity from a Codex rollout record.
 ///
-/// Shared by the host scanner and the container scanner. Extracts `payload.cwd`
-/// from the JSON object on the first line of a session file.
-fn parse_codex_cwd_from_json(line: &str) -> Option<String> {
+/// Recent Codex versions identify child rollouts in several overlapping ways.
+/// Older versions may omit all of them, so missing child metadata is treated as
+/// a top-level session for compatibility with existing terminal transcripts.
+pub(crate) fn parse_codex_rollout_metadata(line: &str) -> Option<CodexRolloutMetadata> {
     let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
-    parsed
-        .get("payload")
-        .and_then(|p| p.get("cwd"))
+    let payload = parsed.get("payload")?;
+    let cwd = payload
+        .get("cwd")
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
+        .filter(|cwd| !cwd.is_empty())?
+        .to_string();
+    let has_nonempty_string = |key: &str| {
+        payload
+            .get(key)
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| !value.is_empty())
+    };
+    let source_is_child = payload.get("source").is_some_and(|source| {
+        source.as_str() == Some("subagent")
+            || source
+                .as_object()
+                .is_some_and(|source| source.contains_key("subagent"))
+    });
+    let thread_source = payload
+        .get("thread_source")
+        .and_then(|value| value.as_str());
+    let source_is_explicit_top_level = payload
+        .get("source")
+        .and_then(|source| source.as_str())
+        .is_some_and(|source| !source.is_empty() && source != "subagent");
+    let explicit_top_level = thread_source == Some("user") || source_is_explicit_top_level;
+    let is_child = thread_source == Some("subagent")
+        || source_is_child
+        || has_nonempty_string("parent_thread_id")
+        || (has_nonempty_string("forked_from_id") && !explicit_top_level);
+
+    Some(CodexRolloutMetadata { cwd, is_child })
 }
 
 /// Extract UUID from a Codex rollout filename.
@@ -1651,11 +1722,12 @@ fn select_codex_session_in_container(
             Some((j, _)) => j,
             None => rest,
         };
-        let cwd = match parse_codex_cwd_from_json(json_part.trim()) {
-            Some(c) => c,
+        let metadata = match parse_codex_rollout_metadata(json_part.trim()) {
+            Some(metadata) if !metadata.is_child => metadata,
             None => continue,
+            Some(_) => continue,
         };
-        candidates.push((uuid, cwd, ts));
+        candidates.push((uuid, metadata.cwd, ts));
     }
 
     if candidates.is_empty() {
@@ -2245,6 +2317,7 @@ pub(crate) fn hermes_poll_fn_sandboxed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::EnvGuard;
     use serial_test::serial;
 
     #[test]
@@ -2331,6 +2404,50 @@ mod tests {
 
         let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
         assert_eq!(result.unwrap(), uuid_new);
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_claude_host_transcript_confirmed_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let present = "11111111-2222-3333-4444-555555555555";
+        let missing = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let file = project_dir.join(format!("{present}.jsonl"));
+        std::fs::write(&file, "data\n").unwrap();
+        // Existence-only: an old mtime (past the live-capture window) must not
+        // read as absent, or an idle real conversation would lose its resume.
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(hour_ago))
+            .unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        assert!(
+            !claude_host_transcript_confirmed_absent("/tmp/myproject", present),
+            "a transcript on disk (even stale) must not be reported absent"
+        );
+        assert!(
+            claude_host_transcript_confirmed_absent("/tmp/myproject", missing),
+            "an unwritten sid must be reported confirmed-absent"
+        );
+        // A project dir that was never created is also confirmed-absent.
+        assert!(claude_host_transcript_confirmed_absent(
+            "/tmp/never-opened-project",
+            present
+        ));
 
         match old_val {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
@@ -2983,29 +3100,6 @@ mod tests {
         }
     }
 
-    /// Sets `VIBE_HOME` for the test's lifetime and restores it on Drop, so a
-    /// panicking assertion can't leak the override into later serial tests.
-    struct VibeHomeGuard {
-        previous: Option<String>,
-    }
-
-    impl VibeHomeGuard {
-        fn set(value: &Path) -> Self {
-            let previous = std::env::var("VIBE_HOME").ok();
-            std::env::set_var("VIBE_HOME", value);
-            Self { previous }
-        }
-    }
-
-    impl Drop for VibeHomeGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(v) => std::env::set_var("VIBE_HOME", v),
-                None => std::env::remove_var("VIBE_HOME"),
-            }
-        }
-    }
-
     #[test]
     fn test_extract_vibe_meta_nested() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3066,7 +3160,7 @@ mod tests {
         });
         std::fs::write(s2_dir.join("meta.json"), s2_meta.to_string()).unwrap();
 
-        let _guard = VibeHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("VIBE_HOME", tmp.path())]);
 
         let exclusion = HashSet::new();
         let result = capture_vibe_session_id(project_dir.to_str().unwrap(), &exclusion);
@@ -3091,7 +3185,7 @@ mod tests {
         });
         std::fs::write(s1_dir.join("meta.json"), s1_meta.to_string()).unwrap();
 
-        let _guard = VibeHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("VIBE_HOME", tmp.path())]);
 
         let exclusion = HashSet::new();
         let result = capture_vibe_session_id(project_dir.to_str().unwrap(), &exclusion);
@@ -3123,7 +3217,7 @@ mod tests {
         });
         std::fs::write(s1_dir.join("meta.json"), s1_meta.to_string()).unwrap();
 
-        let _guard = VibeHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("VIBE_HOME", tmp.path())]);
 
         let mut extra = HashSet::new();
         extra.insert("stale-sid-cleared-by-cascade".to_string());
@@ -3413,23 +3507,56 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_codex_cwd_from_json() {
+    fn test_parse_codex_rollout_metadata() {
         let line = r#"{"type":"session_meta","payload":{"cwd":"/home/user/myproject"}}"#;
         assert_eq!(
-            parse_codex_cwd_from_json(line),
-            Some("/home/user/myproject".to_string())
+            parse_codex_rollout_metadata(line),
+            Some(CodexRolloutMetadata {
+                cwd: "/home/user/myproject".to_string(),
+                is_child: false,
+            })
         );
     }
 
     #[test]
-    fn test_parse_codex_cwd_from_json_missing_field() {
-        let line = r#"{"type":"session_meta","payload":{}}"#;
-        assert_eq!(parse_codex_cwd_from_json(line), None);
+    fn test_parse_codex_rollout_metadata_detects_child_markers() {
+        for payload in [
+            r#"{"cwd":"/repo","thread_source":"subagent"}"#,
+            r#"{"cwd":"/repo","source":{"subagent":{"thread_spawn":{}}}}"#,
+            r#"{"cwd":"/repo","parent_thread_id":"parent"}"#,
+            r#"{"cwd":"/repo","forked_from_id":"parent"}"#,
+        ] {
+            let line = format!(r#"{{"type":"session_meta","payload":{payload}}}"#);
+            assert!(
+                parse_codex_rollout_metadata(&line)
+                    .expect("metadata")
+                    .is_child,
+                "payload was not classified as a child: {payload}"
+            );
+        }
     }
 
     #[test]
-    fn test_parse_codex_cwd_from_json_invalid_json() {
-        assert_eq!(parse_codex_cwd_from_json("not json at all"), None);
+    fn test_parse_codex_rollout_metadata_keeps_user_forks_top_level() {
+        let line = r#"{"type":"session_meta","payload":{"cwd":"/repo","thread_source":"user","source":"cli","forked_from_id":"parent"}}"#;
+        assert_eq!(
+            parse_codex_rollout_metadata(line),
+            Some(CodexRolloutMetadata {
+                cwd: "/repo".to_string(),
+                is_child: false,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_codex_rollout_metadata_missing_field() {
+        let line = r#"{"type":"session_meta","payload":{}}"#;
+        assert_eq!(parse_codex_rollout_metadata(line), None);
+    }
+
+    #[test]
+    fn test_parse_codex_rollout_metadata_invalid_json() {
+        assert_eq!(parse_codex_rollout_metadata("not json at all"), None);
     }
 
     #[test]
@@ -3498,23 +3625,6 @@ mod tests {
         assert_eq!(selected, uuid_new);
     }
 
-    struct CodexHomeGuard(Option<String>);
-    impl CodexHomeGuard {
-        fn set(path: &str) -> Self {
-            let prev = std::env::var("CODEX_HOME").ok();
-            std::env::set_var("CODEX_HOME", path);
-            Self(prev)
-        }
-    }
-    impl Drop for CodexHomeGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("CODEX_HOME", v),
-                None => std::env::remove_var("CODEX_HOME"),
-            }
-        }
-    }
-
     #[test]
     #[serial]
     fn test_codex_respects_codex_home_env() {
@@ -3535,7 +3645,7 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = CodexHomeGuard::set(tmp.path().to_str().unwrap());
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
 
         let result = capture_codex_session_id(project_dir.to_str().unwrap(), &HashSet::new());
         assert!(result.is_ok());
@@ -3549,10 +3659,60 @@ mod tests {
         let sessions_dir = tmp.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
 
-        let _guard = CodexHomeGuard::set(tmp.path().to_str().unwrap());
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
 
         let result = capture_codex_session_id("/tmp/some-project", &HashSet::new());
         assert!(result.is_err(), "Empty sessions dir should return error");
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_capture_skips_newer_subagent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let project_dir = tmp.path().join("test-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let top_level_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let child_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let top_level =
+            sessions_dir.join(format!("rollout-2025-03-06T10-30-00-{top_level_id}.jsonl"));
+        let child = sessions_dir.join(format!("rollout-2025-03-06T10-31-00-{child_id}.jsonl"));
+        std::fs::write(
+            &top_level,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"cwd":"{}","thread_source":"user","source":"cli"}}}}"#,
+                project_dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &child,
+            format!(
+                r#"{{"type":"session_meta","payload":{{"cwd":"{}","thread_source":"subagent","source":{{"subagent":{{"thread_spawn":{{}}}}}},"parent_thread_id":"{top_level_id}"}}}}"#,
+                project_dir.display()
+            ),
+        )
+        .unwrap();
+        let now = std::time::SystemTime::now();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&top_level)
+            .unwrap()
+            .set_modified(now - std::time::Duration::from_secs(60))
+            .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&child)
+            .unwrap()
+            .set_modified(now)
+            .unwrap();
+
+        let _guard = CodexHomeGuard::set(tmp.path().to_str().unwrap());
+        let result =
+            capture_codex_session_id(project_dir.to_str().unwrap(), &HashSet::new()).unwrap();
+        assert_eq!(result, top_level_id);
     }
 
     #[test]
@@ -3598,6 +3758,27 @@ mod tests {
         let result =
             select_codex_session_in_container(stdout.as_bytes(), "/workspace", &exclusion).unwrap();
         assert_eq!(result, uuid_available);
+    }
+
+    #[test]
+    fn test_select_codex_session_in_container_skips_newer_subagent() {
+        let top_level_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let child_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let stdout = format!(
+            "\
+===CODEX:1700000000:rollout-2025-01-01T00-00-00-{top_level_id}.jsonl===
+{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"/workspace\",\"thread_source\":\"user\",\"source\":\"cli\"}}}}
+===END===
+===CODEX:1700001000:rollout-2025-01-02T00-00-00-{child_id}.jsonl===
+{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"/workspace\",\"thread_source\":\"subagent\",\"source\":{{\"subagent\":{{\"thread_spawn\":{{}}}}}},\"parent_thread_id\":\"{top_level_id}\"}}}}
+===END===
+"
+        );
+
+        let result =
+            select_codex_session_in_container(stdout.as_bytes(), "/workspace", &HashSet::new())
+                .unwrap();
+        assert_eq!(result, top_level_id);
     }
 
     #[test]
@@ -3709,7 +3890,7 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = GeminiHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("GEMINI_CLI_HOME", tmp.path())]);
 
         let result = capture_gemini_session_id(project_path, &HashSet::new());
         assert_eq!(result.unwrap(), "new-id-222");
@@ -3752,7 +3933,7 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(older))
             .unwrap();
 
-        let _guard = GeminiHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("GEMINI_CLI_HOME", tmp.path())]);
 
         let mut exclusion = HashSet::new();
         exclusion.insert("json-id-AAA".to_string());
@@ -3773,27 +3954,6 @@ mod tests {
             "json-id-AAA",
             "Filename stem in exclusion should have no effect"
         );
-    }
-
-    struct GeminiHomeGuard {
-        previous: Option<String>,
-    }
-
-    impl GeminiHomeGuard {
-        fn set(value: &Path) -> Self {
-            let previous = std::env::var("GEMINI_CLI_HOME").ok();
-            std::env::set_var("GEMINI_CLI_HOME", value);
-            Self { previous }
-        }
-    }
-
-    impl Drop for GeminiHomeGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(v) => std::env::set_var("GEMINI_CLI_HOME", v),
-                None => std::env::remove_var("GEMINI_CLI_HOME"),
-            }
-        }
     }
 
     #[test]
@@ -3887,7 +4047,7 @@ mod tests {
         );
         std::fs::write(&session_file, body).unwrap();
 
-        let _guard = GeminiHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("GEMINI_CLI_HOME", tmp.path())]);
 
         let result = capture_gemini_session_id(project_path, &HashSet::new());
         assert_eq!(result.unwrap(), "jsonl-session-id");

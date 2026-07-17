@@ -466,6 +466,53 @@ describe("SessionRow context menu", () => {
     expect(screen.queryByTestId("sidebar-context-menu-switch-agent")).toBeNull();
   });
 
+  it("shows structured conversion only for ACP-capable terminal sessions", () => {
+    const ws = workspace("w-acp-terminal", [session({ view: "terminal", acp_capable: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).not.toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-disable-structured")).toBeNull();
+  });
+
+  it("shows structured conversion when an ACP-capable terminal session omits its view", () => {
+    const ws = workspace("w-implicit-terminal", [session({ acp_capable: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).not.toBeNull();
+  });
+
+  it("hides structured conversion for a terminal session without ACP support", () => {
+    const ws = workspace("w-terminal", [session({ view: "terminal", acp_capable: false })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).toBeNull();
+  });
+
+  it("opens confirmation before converting structured view to terminal", () => {
+    const ws = workspace("w-structured", [session({ view: "structured" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-disable-structured"));
+    expect(screen.queryByTestId("session-view-conversion-dialog")).not.toBeNull();
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
   it("hides the triage section in read-only mode", () => {
     // structured_view is set so the Switch agent gate is also exercised:
     // it must stay hidden in read-only even on a structured view row.
@@ -482,6 +529,38 @@ describe("SessionRow context menu", () => {
     expect(menu.textContent).not.toContain("Snooze");
     expect(menu.textContent).not.toContain("Delete");
     expect(screen.queryByTestId("sidebar-context-menu-switch-agent")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-disable-structured")).toBeNull();
+  });
+
+  it("hides structured enable conversion in read-only mode", () => {
+    const ws = workspace("w-read-only-terminal", [session({ view: "terminal", acp_capable: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} readOnly />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-disable-structured")).toBeNull();
+  });
+
+  it("uses the running structured navigation session for conversion eligibility and confirmation title", () => {
+    const ws = workspace("w-mixed-structured", [
+      session({ id: "terminal-sibling", title: "terminal sibling", view: "terminal", acp_capable: true }),
+      session({ id: "structured-target", title: "structured target", view: "structured", status: "Running" }),
+    ]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+
+    expect(screen.queryByTestId("sidebar-context-menu-enable-structured")).toBeNull();
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-disable-structured"));
+    expect(screen.getByTestId("session-view-conversion-dialog").textContent).toContain("structured target");
   });
 });
 
@@ -660,6 +739,75 @@ describe("SessionRow triage actions", () => {
     }
   });
 
+  it("Enable structured click POSTs the view conversion request", async () => {
+    const ws = workspace("w-enable", [session({ id: "sess-enable", view: "terminal", acp_capable: true })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-enable-structured"));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-enable/acp/enable");
+    expect(init?.method).toBe("POST");
+  });
+
+  it("confirmed structured disable POSTs the view conversion request", async () => {
+    const ws = workspace("w-disable", [session({ id: "sess-disable", view: "structured" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-disable-structured"));
+    fireEvent.click(screen.getByRole("button", { name: "Convert to terminal" }));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-disable/acp/disable");
+    expect(init?.method).toBe("POST");
+  });
+
+  it("confirmed structured disable targets the running structured navigation session", async () => {
+    const ws = workspace("w-mixed-disable", [
+      session({ id: "terminal-sibling", view: "terminal", acp_capable: true }),
+      session({ id: "structured-target", title: "structured target", view: "structured", status: "Running" }),
+    ]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-disable-structured"));
+    fireEvent.click(screen.getByRole("button", { name: "Convert to terminal" }));
+
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    expect(fetchSpy.mock.calls[0]![0]).toBe("/api/sessions/structured-target/acp/disable");
+  });
+
+  it("structured enable targets the running terminal navigation session", async () => {
+    const ws = workspace("w-mixed-enable", [
+      session({ id: "structured-sibling", view: "structured" }),
+      session({ id: "terminal-target", view: "terminal", acp_capable: true, status: "Running" }),
+    ]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-disable-structured")).toBeNull();
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-enable-structured"));
+
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    expect(fetchSpy.mock.calls[0]![0]).toBe("/api/sessions/terminal-target/acp/enable");
+  });
+
   it("New Session click calls onCreateSession with the row's repo path", () => {
     // main_repo_path wins over project_path, matching handleCreateSession's
     // own project key (`main_repo_path || project_path`), so the wizard
@@ -777,5 +925,93 @@ describe("SessionRow unread", () => {
     expect(screen.queryByTestId("sidebar-unread-dot")).toBeNull();
     fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
     expect(screen.queryByTestId("sidebar-context-menu-unread")).toBeNull();
+  });
+});
+
+describe("SessionRow color label (#2383)", () => {
+  it("renders the color dot when a session carries a color", () => {
+    const ws = workspace("w-color", [session({ id: "s-color", color: "red" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    const dot = screen.getByTestId("sidebar-session-color-dot");
+    expect(dot.getAttribute("data-color")).toBe("red");
+    expect(dot.className).toContain("bg-red-500");
+  });
+
+  it("renders no color dot when color is unset", () => {
+    const ws = workspace("w-nocolor", [session({ id: "s-nocolor" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-session-color-dot")).toBeNull();
+  });
+
+  it("renders no color dot for an unknown color value", () => {
+    const ws = workspace("w-badcolor", [session({ id: "s-bad", color: "chartreuse" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    expect(screen.queryByTestId("sidebar-session-color-dot")).toBeNull();
+  });
+
+  it("Color swatch click fires PATCH /api/sessions/:id/color with { color: 'red' }", async () => {
+    const ws = workspace("w-live", [session({ id: "sess-color-it" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-color-red"));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-color-it/color");
+    expect(init?.method).toBe("PATCH");
+    expect(JSON.parse(init!.body as string)).toEqual({ color: "red" });
+  });
+
+  it("shows a Clear color item on a colored row that fires { color: null }", async () => {
+    const ws = workspace("w-colored", [session({ id: "sess-clear-it", color: "green" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-color-clear"));
+    await vi.waitFor(() => expect(fetchSpy).toHaveBeenCalled());
+    const [url, init] = fetchSpy.mock.calls[0]!;
+    expect(url).toBe("/api/sessions/sess-clear-it/color");
+    expect(JSON.parse(init!.body as string)).toEqual({ color: null });
+  });
+
+  it("hides the Clear color item when no color is set", () => {
+    const ws = workspace("w-nocolor", [session({ id: "sess-noclear" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-color-clear")).toBeNull();
+  });
+
+  it("hides the color section in read-only mode", () => {
+    const ws = workspace("w-ro", [session({ id: "sess-ro-color", color: "amber" })]);
+    render(
+      <Wrap>
+        <Row ws={ws} readOnly />
+      </Wrap>,
+    );
+    fireEvent.contextMenu(screen.getByTestId("sidebar-session-row"));
+    expect(screen.queryByTestId("sidebar-context-menu-color-red")).toBeNull();
+    expect(screen.queryByTestId("sidebar-context-menu-color-clear")).toBeNull();
   });
 });

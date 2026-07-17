@@ -64,9 +64,8 @@ fn claude_config_dir() -> Option<PathBuf> {
 /// from `"../{branch}-workspace-{session-id}"`. A cwd living under a directory
 /// whose name contains one of these is an AoE worktree or workspace, so it is
 /// excluded from the import picker. Derived from config so a custom template is
-/// honored. See #2276. Shared with `codex_import` so both agents' importers
-/// exclude AoE-managed worktrees the same way.
-pub(crate) fn worktree_dir_markers() -> Vec<String> {
+/// honored. See #2276.
+fn worktree_dir_markers() -> Vec<String> {
     let cfg = crate::session::Config::load_or_warn();
     let mut markers = Vec::new();
     for tmpl in [
@@ -104,7 +103,7 @@ fn strip_placeholders(seg: &str) -> String {
 /// one namespace (release vs `-dev`), so a scratch session from the other
 /// namespace slips past a plain `starts_with` check; match the app-dir name +
 /// `scratch` component pair instead. See #2276.
-pub(crate) fn cwd_is_aoe_scratch(cwd: &str) -> bool {
+fn cwd_is_aoe_scratch(cwd: &str) -> bool {
     let comps: Vec<&str> = Path::new(cwd)
         .components()
         .filter_map(|c| c.as_os_str().to_str())
@@ -117,7 +116,7 @@ pub(crate) fn cwd_is_aoe_scratch(cwd: &str) -> bool {
 /// True when any directory component of `cwd` contains a worktree marker. Uses
 /// `contains` (not a suffix match) because workspace dirs carry the marker
 /// mid-name, e.g. `<branch>-workspace-<id>`.
-pub(crate) fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
+fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
     if markers.is_empty() {
         return false;
     }
@@ -140,8 +139,39 @@ pub(crate) fn cwd_under_worktree(cwd: &str, markers: &[String]) -> bool {
 /// are filtered separately by the endpoint, which has the instance list.
 /// See #2276.
 pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
+    let Some(config_dir) = claude_config_dir() else {
+        return Vec::new();
+    };
+    scan_sessions_in(&config_dir)
+}
+
+/// The best session to resume for `cwd`: the most-recently-modified Claude
+/// session whose recorded cwd matches `cwd`. Unlike [`scan_sessions`] this does
+/// NOT apply the AoE-managed (scratch / worktree) filter, because the caller is
+/// resolving a *known* aoe session's own transcript by its cwd, which
+/// legitimately may be a scratch or worktree dir. `cwd` is normalized so an aoe
+/// worktree's unresolved `..` still matches Claude's recorded resolved cwd.
+/// `None` when no session matches; the caller falls back to a fresh structured
+/// session.
+pub fn find_session_for_cwd(cwd: &str) -> Option<ClaudeSessionSummary> {
+    let config_dir = claude_config_dir()?;
+    find_session_for_cwd_in(&config_dir, cwd)
+}
+
+fn find_session_for_cwd_in(config_dir: &Path, cwd: &str) -> Option<ClaudeSessionSummary> {
+    let target = normalize_cwd(cwd);
+    collect_summaries_in(config_dir)
+        .into_iter()
+        .find(|s| normalize_cwd(&s.cwd) == target)
+}
+
+/// Scan the `projects/` tree under `config_dir` (the resolved Claude config
+/// directory). Split out from [`scan_sessions`] so tests can point at a temp
+/// config tree without mutating the global `CLAUDE_CONFIG_DIR` env (which would
+/// race the parallel test runner). See [`scan_sessions`] for filtering rules.
+pub fn scan_sessions_in(config_dir: &Path) -> Vec<ClaudeSessionSummary> {
     let worktree_markers = worktree_dir_markers();
-    collect_summaries()
+    collect_summaries_in(config_dir)
         .into_iter()
         // Scratch sessions live under `<app_dir>/scratch/<id>`; worktree
         // sessions under a dir named by the worktree path template. Both are
@@ -150,35 +180,10 @@ pub fn scan_sessions() -> Vec<ClaudeSessionSummary> {
         .collect()
 }
 
-/// The best session to resume for `cwd`: the most-recently-modified Claude
-/// session whose recorded cwd matches `cwd`. Unlike [`scan_sessions`] this does
-/// NOT apply the AoE-managed (scratch / worktree) filter, because the caller is
-/// resolving a *known* aoe session's own transcript by its cwd, which legitimately
-/// may be a scratch or worktree dir. `cwd` is normalized so an aoe worktree's
-/// unresolved `..` still matches Claude's recorded resolved cwd. `None` when no
-/// session matches; the caller falls back to a fresh structured session.
-pub fn find_session_for_cwd(cwd: &str) -> Option<ClaudeSessionSummary> {
-    let target = normalize_cwd(cwd);
-    collect_summaries()
-        .into_iter()
-        .find(|s| normalize_cwd(&s.cwd) == target)
-}
-
 /// Walk `<config>/projects/**/*.jsonl`, summarize each, newest-first. No
 /// filtering; callers decide what to exclude. Empty when the projects dir is
 /// absent (Claude Code never run). Unreadable files are skipped, not fatal.
-fn collect_summaries() -> Vec<ClaudeSessionSummary> {
-    let Some(config_dir) = claude_config_dir() else {
-        return Vec::new();
-    };
-    scan_sessions_in(&config_dir)
-}
-
-/// Scan the `projects/` tree under `config_dir` (the resolved Claude config
-/// directory). Split out from [`scan_sessions`] so tests can point at a temp
-/// config tree without mutating the global `CLAUDE_CONFIG_DIR` env (which would
-/// race the parallel test runner). See [`scan_sessions`] for filtering rules.
-pub fn scan_sessions_in(config_dir: &Path) -> Vec<ClaudeSessionSummary> {
+fn collect_summaries_in(config_dir: &Path) -> Vec<ClaudeSessionSummary> {
     let projects = config_dir.join("projects");
     let Ok(project_dirs) = fs::read_dir(&projects) else {
         return Vec::new();
@@ -212,15 +217,14 @@ pub fn scan_sessions_in(config_dir: &Path) -> Vec<ClaudeSessionSummary> {
 /// filesystem when the path exists, else fall back to a textual cleanup. An
 /// aoe worktree `project_path` is stored relative to the main repo
 /// (`.../repo/../repo-worktrees/branch`) while the agent records its resolved
-/// process cwd, so an exact string compare would miss the match. Shared with
-/// `codex_import`.
+/// process cwd, so an exact string compare would miss the match.
 pub(crate) fn normalize_cwd(raw: &str) -> PathBuf {
     let p = Path::new(raw);
     std::fs::canonicalize(p).unwrap_or_else(|_| lexical_normalize(p))
 }
 
 /// Resolve `.` and `..` components textually, without touching the filesystem.
-pub(crate) fn lexical_normalize(p: &Path) -> PathBuf {
+fn lexical_normalize(p: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for comp in p.components() {

@@ -703,7 +703,7 @@ export async function dismissPluginUpdate(id: string, fingerprint: string): Prom
  *  validates it to this closed set; each surface maps it to a color. */
 export type PluginUiTone = "neutral" | "info" | "success" | "warn" | "danger";
 
-/** The nine host-rendered slots, kebab-case as the host serializes them. */
+/** The host-rendered slots, kebab-case as the host serializes them. */
 export type PluginUiSlot =
   | "status-bar"
   | "row-badge"
@@ -712,6 +712,7 @@ export type PluginUiSlot =
   | "filter-facet"
   | "card"
   | "pane"
+  | "composer-action"
   | "detail-badge"
   | "notification";
 
@@ -774,19 +775,19 @@ export async function setPluginEnabled(id: string, enabled: boolean): Promise<Pl
 }
 
 /** A worker accepted an action. `baselineRevision` is the scope's UI mutation
- *  counter the host read before forwarding; the pane holds its spinner until
- *  the polled counter moves off this value. `null` means the daemon did not
- *  report a baseline (older daemon), so the caller skips the wait and just
+ *  counter the host read before forwarding; the UI action can hold its spinner
+ *  until the polled counter moves off this value. `null` means the daemon did
+ *  not report a baseline (older daemon), so the caller skips the wait and just
  *  clears when the POST settles. */
 export interface PluginActionAccepted {
   baselineRevision: number | null;
 }
 
 /**
- * Forward a plugin pane's UI action (e.g. a "Refresh" button) to the plugin's
- * worker. Fire-and-forget at the worker: the worker runs the named method and
- * re-pushes its UI state, which a later ui-state poll renders. `sessionId`
- * scopes the baseline revision to the firing pane's session. Returns the
+ * Forward a plugin UI action (e.g. a "Refresh" or composer button) to the
+ * plugin's worker. Fire-and-forget at the worker: the worker runs the named
+ * method and re-pushes its UI state, which a later ui-state poll renders.
+ * `sessionId` scopes the baseline revision to the firing UI's session. Returns the
  * accepted baseline (or null if the daemon omitted one), or null on read-only
  * (403), no running worker (404), or network failure.
  */
@@ -1408,6 +1409,30 @@ export async function switchAcpAgent(
   });
 }
 
+export interface ViewSwitchResponse {
+  session_id: string;
+  view: "structured" | "terminal";
+}
+
+export type ViewSwitchResult = { ok: true; response: ViewSwitchResponse } | { ok: false; message: string };
+
+async function switchSessionView(sessionId: string, target: "enable" | "disable"): Promise<ViewSwitchResult> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/${target}`, {
+      method: "POST",
+    });
+    if (!res.ok) {
+      return { ok: false, message: (await res.text()) || `Server error (${res.status})` };
+    }
+    return { ok: true, response: (await res.json()) as ViewSwitchResponse };
+  } catch {
+    return { ok: false, message: "Could not change this session view. Please try again." };
+  }
+}
+
+export const enableStructuredView = (sessionId: string) => switchSessionView(sessionId, "enable");
+export const disableStructuredView = (sessionId: string) => switchSessionView(sessionId, "disable");
+
 // --- Acp install agent (Tier 2 of #2109) ---
 
 export interface InstallAgentResponse {
@@ -1977,6 +2002,33 @@ export async function smartRenameSession(id: string): Promise<{ ok: boolean; mes
 }
 
 /**
+ * Request an on-demand "summary of the conversation so far" for a
+ * structured-view session (see #2808). Best-effort: a 202 means the summary
+ * one-shot started, and the result arrives later as a ConversationSummary
+ * event over the structured-view WS. Returns the server's message on a gate
+ * failure (not structured, no one-shot agent, sandboxed) so the caller can
+ * surface it.
+ */
+export async function summarizeSession(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/summarize`, {
+      method: "POST",
+    });
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
  * Edit a managed worktree session's workdir name: move the worktree
  * directory and, optionally, rename its git branch. The session must not be
  * running. Returns the server's validation message on failure so the caller
@@ -2073,6 +2125,23 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pinned }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Set (or clear, with `null`) a session's color label. Rendered as a colored
+ *  status dot in the sidebar; the palette is `red` / `amber` / `green`. Also
+ *  settable from the CLI via `aoe session color`. See #2383. */
+export async function setSessionColor(id: string, color: string | null): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/color`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ color }),
     });
     if (!res.ok) return null;
     return (await res.json()) as SessionResponse;

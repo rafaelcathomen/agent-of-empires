@@ -25,7 +25,7 @@ mod registry;
 mod resolved;
 mod validate;
 
-pub use merge::{clear_path, merge_json};
+pub use merge::{apply_changed_leaves, clear_path, merge_json};
 pub use plugin::{
     plugin_field_descriptors, plugin_section_id, rewrite_plugin_sections, section_plugin_id,
     storage_leaf as plugin_storage_leaf, storage_value as plugin_storage_value, PLUGIN_CATEGORY,
@@ -130,6 +130,10 @@ pub enum ValidationKind {
     EnvList,
     /// Each list entry must be a `host:container` port mapping (digits only).
     PortMappingList,
+    /// A container network mode: empty, `none`, `bridge`, or a named network
+    /// (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`). `host` and other namespace-sharing
+    /// forms are rejected because they defeat sandbox isolation.
+    Network,
     /// Value must be one of a closed set of strings. Used by plugin `select`
     /// settings so an off-menu value cannot be persisted (core selects encode
     /// their options in the widget and need no separate rule).

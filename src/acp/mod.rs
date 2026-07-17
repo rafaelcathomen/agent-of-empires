@@ -20,8 +20,6 @@ pub mod agent_registry;
 pub mod approvals;
 pub mod background_agent;
 pub mod client;
-#[cfg(feature = "serve")]
-pub mod codex_import;
 pub mod context_primer;
 pub mod elicitations;
 pub mod event_store;
@@ -38,10 +36,13 @@ pub mod protocol;
 pub mod runner;
 #[cfg(feature = "serve")]
 pub mod sandbox;
+pub mod session_paths;
 pub mod session_tee;
 pub mod state;
 pub mod supervisor;
 pub mod terminal_handler;
+#[cfg(feature = "serve")]
+pub mod version_probe;
 pub mod worker_registry;
 
 pub use agent_registry::{AgentRegistry, AgentSpec};

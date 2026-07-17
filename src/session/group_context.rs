@@ -649,7 +649,7 @@ pub fn detach_for_instance(inst: &Instance) -> Result<()> {
 /// to call repeatedly thanks to the write-if-changed guards in `attach`; used as
 /// the TUI's post-mutation reconcile so create and move are both covered without
 /// a per-operation hook.
-pub fn reconcile_all(instances: &[Instance]) {
+pub fn reconcile_all<'a>(instances: impl IntoIterator<Item = &'a Instance>) {
     for inst in instances {
         if inst.group_path.is_empty() {
             continue;

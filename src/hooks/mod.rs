@@ -29,7 +29,7 @@ pub(crate) use dir_guard::{
 pub(crate) use dir_guard::{clear_base_override_for_test, override_base_for_test, reset_for_test};
 pub use status_file::{
     cleanup_hook_status_dir, hook_status_dir, read_hook_heat, read_hook_session_id,
-    read_hook_status, read_hook_subagent_active, read_hook_urgent,
+    read_hook_status, read_hook_status_age, read_hook_subagent_active, read_hook_urgent,
 };
 pub(crate) use targets::{
     has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
@@ -1106,6 +1106,124 @@ pub fn uninstall_codex_hooks(config_path: &Path) -> Result<bool> {
     Ok(modified)
 }
 
+/// Disable Gemini's folder-trust confirmation by merging
+/// `security.folderTrust.enabled = false` into its `settings.json`.
+///
+/// In a YOLO-mode sandboxed session the container is ephemeral, so Gemini
+/// re-prompts to trust the working directory on every launch even though the
+/// user already opted out of approvals. Merging this flag suppresses the
+/// prompt (issue #472). Any other keys the user (or AoE's hook installer) has
+/// written to the same file are preserved, and an unwritable/malformed file is
+/// treated as empty rather than propagated as an error, mirroring the hook
+/// installers above.
+pub fn disable_gemini_folder_trust(settings_path: &Path) -> Result<()> {
+    with_config_lock(settings_path, "json.lock", || {
+        let mut settings: Value = if settings_path.exists() {
+            let content = std::fs::read_to_string(settings_path)?;
+            serde_json::from_str(&content).unwrap_or_else(|e| {
+                tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", settings_path.display(), e);
+                serde_json::json!({})
+            })
+        } else {
+            serde_json::json!({})
+        };
+
+        let before = settings.clone();
+
+        let root = settings
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Settings file root is not a JSON object"))?;
+        let security = root
+            .entry("security")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !security.is_object() {
+            *security = Value::Object(serde_json::Map::new());
+        }
+        let folder_trust = security
+            .as_object_mut()
+            .expect("ensured object above")
+            .entry("folderTrust")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !folder_trust.is_object() {
+            *folder_trust = Value::Object(serde_json::Map::new());
+        }
+        folder_trust
+            .as_object_mut()
+            .expect("ensured object above")
+            .insert("enabled".to_string(), Value::Bool(false));
+
+        if settings == before {
+            return Ok(());
+        }
+
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let formatted = serde_json::to_string_pretty(&settings)?;
+        crate::session::atomic_write_following_symlinks(settings_path, formatted.as_bytes())?;
+        tracing::info!(target: "hooks.install",
+            "Disabled Gemini folder trust in {}", settings_path.display());
+        Ok(())
+    })
+}
+
+/// Mark `project_path` as trusted in Codex's `config.toml` by merging
+/// `[projects."<project_path>"].trust_level = "trusted"`.
+///
+/// Codex keys folder trust on the absolute working directory, so
+/// `project_path` must be the path Codex sees as its cwd (inside a sandbox
+/// that is the in-container worktree path, not the host path). Used for
+/// YOLO-mode sandboxed sessions so the ephemeral container does not re-prompt
+/// for folder trust (issue #472). Runs under the same lock as the Codex hook
+/// installers so it cannot interleave with a concurrent hook rewrite, and
+/// preserves every other key in the file, including an existing `[projects.*]`
+/// block.
+pub fn trust_codex_project(config_path: &Path, project_path: &str) -> Result<()> {
+    with_codex_config_lock(config_path, || {
+        let mut config = read_codex_config(config_path)?;
+        let before = config.to_string();
+
+        let root = config.as_table_mut();
+        if !root.contains_key("projects") {
+            let mut projects = toml_edit::Table::new();
+            // Implicit so an empty `[projects]` header is never emitted; only
+            // the per-project `[projects."<path>"]` sub-table renders.
+            projects.set_implicit(true);
+            root.insert("projects", toml_edit::Item::Table(projects));
+        }
+        let projects = root
+            .get_mut("projects")
+            .and_then(|item| item.as_table_mut())
+            .ok_or_else(|| anyhow::anyhow!("Codex projects key is not a TOML table"))?;
+
+        if !projects
+            .get(project_path)
+            .is_some_and(|item| item.is_table())
+        {
+            projects.insert(
+                project_path,
+                toml_edit::Item::Table(toml_edit::Table::new()),
+            );
+        }
+        let project = projects
+            .get_mut(project_path)
+            .and_then(|item| item.as_table_mut())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Codex projects.{project_path} entry is not a TOML table")
+            })?;
+        project.insert("trust_level", toml_edit::value("trusted"));
+
+        if config.to_string() == before {
+            return Ok(());
+        }
+
+        write_codex_config(config_path, &config)?;
+        tracing::info!(target: "hooks.install",
+            "Marked {} trusted in Codex config {}", project_path, config_path.display());
+        Ok(())
+    })
+}
+
 /// Remove all AoE hooks from an agent's `settings.json` file.
 ///
 /// Strips AoE hook entries while preserving user-defined hooks. If an event
@@ -1874,6 +1992,7 @@ pub fn uninstall_all_hooks() {
 mod tests {
     use super::targets::collect_env_lists_from_session;
     use super::*;
+    use crate::session::test_support::EnvGuard;
     use tempfile::TempDir;
 
     fn claude_events() -> Vec<crate::agents::ResolvedHookEvent> {
@@ -1917,29 +2036,6 @@ mod tests {
             .events
     }
 
-    struct CodexHomeGuard(Option<String>);
-    impl CodexHomeGuard {
-        fn set(path: &Path) -> Self {
-            let prev = std::env::var("CODEX_HOME").ok();
-            std::env::set_var("CODEX_HOME", path);
-            Self(prev)
-        }
-
-        fn unset() -> Self {
-            let prev = std::env::var("CODEX_HOME").ok();
-            std::env::remove_var("CODEX_HOME");
-            Self(prev)
-        }
-    }
-    impl Drop for CodexHomeGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("CODEX_HOME", v),
-                None => std::env::remove_var("CODEX_HOME"),
-            }
-        }
-    }
-
     fn claude_hook_config() -> &'static crate::agents::AgentHookConfig {
         crate::agents::get_agent("claude")
             .unwrap()
@@ -1948,36 +2044,10 @@ mod tests {
             .unwrap()
     }
 
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, prev }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::remove_var(key);
-            Self { key, prev }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
-
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_agent_settings_path_defaults_to_home_relative() {
-        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+        let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let path = agent_settings_path_for_host_environment(claude_hook_config(), &[]).unwrap();
         let expected = dirs::home_dir().unwrap().join(".claude/settings.json");
         assert_eq!(path, expected);
@@ -1986,7 +2056,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_agent_settings_path_honors_host_env_override() {
-        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+        let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let host_env = vec!["CLAUDE_CONFIG_DIR=/home/me/.claude-work".to_string()];
         let path =
             agent_settings_path_for_host_environment(claude_hook_config(), &host_env).unwrap();
@@ -1999,7 +2069,7 @@ mod tests {
     #[serial_test::serial(shell_env)]
     fn test_agent_settings_path_host_env_takes_precedence_over_process_env() {
         // When both are set, the session's profile env wins over AoE's own env.
-        let _guard = EnvGuard::set("CLAUDE_CONFIG_DIR", "/from/process/env");
+        let _guard = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", "/from/process/env")]);
         let host_env = vec!["CLAUDE_CONFIG_DIR=/from/host/env".to_string()];
         let path =
             agent_settings_path_for_host_environment(claude_hook_config(), &host_env).unwrap();
@@ -2011,7 +2081,7 @@ mod tests {
     fn test_agent_settings_path_falls_back_to_process_env() {
         // Not present in the host env list at all, but set in AoE's own env:
         // the launched agent inherits it, so hooks must follow.
-        let _guard = EnvGuard::set("CLAUDE_CONFIG_DIR", "/tmp/claude-proc");
+        let _guard = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", "/tmp/claude-proc")]);
         let path = agent_settings_path_for_host_environment(claude_hook_config(), &[]).unwrap();
         assert_eq!(path, PathBuf::from("/tmp/claude-proc/settings.json"));
     }
@@ -2019,7 +2089,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_agent_settings_path_display_matches_resolution() {
-        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+        let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
 
         // Default: tilde-relative, matching how the path is shown elsewhere.
         assert_eq!(
@@ -2038,7 +2108,7 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_agent_settings_path_empty_override_is_ignored() {
-        let _guard = EnvGuard::unset("CLAUDE_CONFIG_DIR");
+        let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
         let host_env = vec!["CLAUDE_CONFIG_DIR=".to_string()];
         let path =
             agent_settings_path_for_host_environment(claude_hook_config(), &host_env).unwrap();
@@ -2400,7 +2470,7 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_config_path_respects_codex_home() {
         let tmp = TempDir::new().unwrap();
-        let _guard = CodexHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
 
         assert_eq!(codex_config_path().unwrap(), tmp.path().join("config.toml"));
         assert_eq!(
@@ -2413,7 +2483,7 @@ mod tests {
     #[serial_test::serial]
     fn test_codex_config_path_for_host_environment_ignores_empty_codex_home() {
         let tmp = TempDir::new().unwrap();
-        let _guard = CodexHomeGuard::unset();
+        let _guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
 
         // An empty `CODEX_HOME=` must not resolve to a bare relative
@@ -2437,7 +2507,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         // An empty `CODEX_HOME` in AoE's own process env must fall back to the
         // home-relative default rather than a bare relative `config.toml`.
-        let _guard = CodexHomeGuard::set(Path::new(""));
+        let _guard = EnvGuard::set(&[("CODEX_HOME", Path::new(""))]);
         std::env::set_var("HOME", tmp.path());
 
         let path = codex_config_path().unwrap();
@@ -2452,7 +2522,7 @@ mod tests {
     #[serial_test::serial]
     fn test_iter_hook_targets_includes_profile_codex_home() {
         let tmp = TempDir::new().unwrap();
-        let _guard = CodexHomeGuard::unset();
+        let _guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
@@ -2735,6 +2805,134 @@ trust_level = "trusted"
     }
 
     #[test]
+    fn test_disable_gemini_folder_trust_creates_nested_flag() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join(".gemini").join("settings.json");
+
+        disable_gemini_folder_trust(&settings_path).unwrap();
+
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(
+            settings["security"]["folderTrust"]["enabled"],
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_disable_gemini_folder_trust_preserves_existing_keys() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+        std::fs::write(
+            &settings_path,
+            r#"{"theme":"dark","security":{"auth":{"selectedType":"oauth"}}}"#,
+        )
+        .unwrap();
+
+        disable_gemini_folder_trust(&settings_path).unwrap();
+
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(settings["theme"], "dark");
+        assert_eq!(settings["security"]["auth"]["selectedType"], "oauth");
+        assert_eq!(
+            settings["security"]["folderTrust"]["enabled"],
+            Value::Bool(false)
+        );
+    }
+
+    #[test]
+    fn test_disable_gemini_folder_trust_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("settings.json");
+
+        disable_gemini_folder_trust(&settings_path).unwrap();
+        let first = std::fs::read_to_string(&settings_path).unwrap();
+        let mtime = std::fs::metadata(&settings_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        disable_gemini_folder_trust(&settings_path).unwrap();
+        let second = std::fs::read_to_string(&settings_path).unwrap();
+        assert_eq!(first, second);
+        // No-change second pass must not rewrite the file.
+        assert_eq!(
+            mtime,
+            std::fs::metadata(&settings_path)
+                .unwrap()
+                .modified()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_trust_codex_project_writes_project_table() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join(".codex").join("config.toml");
+
+        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+
+        let config_text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            config_text.contains(r#"[projects."/workspace/my-worktree"]"#),
+            "unexpected config:\n{config_text}"
+        );
+        let config: toml::Value = toml::from_str(&config_text).unwrap();
+        assert_eq!(
+            config["projects"]["/workspace/my-worktree"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn test_trust_codex_project_preserves_existing_config() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"model = "gpt-5.3-codex"
+
+[projects."/other/path"]
+trust_level = "trusted"
+"#,
+        )
+        .unwrap();
+
+        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+
+        let config: toml::Value =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(config["model"].as_str(), Some("gpt-5.3-codex"));
+        assert_eq!(
+            config["projects"]["/other/path"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+        assert_eq!(
+            config["projects"]["/workspace/my-worktree"]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn test_trust_codex_project_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+        let first = std::fs::read_to_string(&config_path).unwrap();
+        let mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+
+        trust_codex_project(&config_path, "/workspace/my-worktree").unwrap();
+        let second = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            mtime,
+            std::fs::metadata(&config_path).unwrap().modified().unwrap()
+        );
+    }
+
+    #[test]
     fn test_install_codex_hooks_preserves_inline_disabled_flag_and_skips_install() {
         let tmp = TempDir::new().unwrap();
         let codex_dir = tmp.path().join(".codex");
@@ -2894,6 +3092,8 @@ command = "echo user-hook"
         let waiting_matcher = waiting["matcher"].as_str().unwrap();
         assert!(waiting_matcher.contains("permission_prompt"));
         assert!(waiting_matcher.contains("elicitation_dialog"));
+        // Agent-view identifier (2.1.198) rides the permission/waiting group.
+        assert!(waiting_matcher.contains("agent_needs_input"));
         assert!(!waiting_matcher.contains("idle_prompt"));
         assert!(
             waiting["hooks"][0]["command"]
@@ -2905,8 +3105,17 @@ command = "echo user-hook"
 
         let idle = notification
             .iter()
-            .find(|g| g["matcher"].as_str() == Some("idle_prompt"))
+            .find(|g| {
+                g["matcher"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("idle_prompt"))
+            })
             .expect("idle_prompt matcher group present");
+        // Agent-view completion (2.1.198) rides the idle group.
+        assert!(idle["matcher"]
+            .as_str()
+            .unwrap()
+            .contains("agent_completed"));
         assert!(
             idle["hooks"][0]["command"]
                 .as_str()
@@ -4377,6 +4586,70 @@ hooks_auto_accept: false
             .unwrap_or(false)
     }
 
+    #[cfg(target_os = "linux")]
+    fn acl_probe_uid() -> u32 {
+        let euid = nix::unistd::geteuid().as_raw();
+        [65534u32, 65533, 1, 2]
+            .into_iter()
+            .find(|uid| *uid != euid)
+            .expect("probe uid list must include a uid different from euid")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn try_setfacl(path: &Path, spec: &str) -> bool {
+        match std::process::Command::new("setfacl")
+            .args(["-m", spec])
+            .arg(path)
+            .output()
+        {
+            Ok(output) if output.status.success() => true,
+            Ok(output) => {
+                eprintln!(
+                    "skipping: setfacl failed for {}: {}",
+                    path.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                false
+            }
+            Err(e) => {
+                eprintln!("skipping: setfacl unavailable: {e}");
+                false
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ls_ldn_mode(path: &Path) -> Option<String> {
+        let output = std::process::Command::new("ls")
+            .args(["-ldn"])
+            .arg(path)
+            .env("LC_ALL", "C")
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        String::from_utf8(output.stdout)
+            .ok()?
+            .split_whitespace()
+            .next()
+            .map(str::to_string)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn chmod_0700(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn hook_accepts_mode(mode: &str) -> bool {
+        matches!(
+            mode,
+            "drwx------" | "drwx------." | "drwx------+" | "drwx------@"
+        )
+    }
+
     #[test]
     fn host_shell_in_dash_refuses_wrong_mode() {
         if !dash_available() {
@@ -4402,6 +4675,95 @@ hooks_auto_accept: false
         assert!(
             !base.join("dash_wrong_mode").exists(),
             "dash must reject 0o755 parent and refuse to mkdir under it"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_shell_accepts_acl_suffix_when_mode_tight() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("aoe-hooks-acl-tight");
+        let inst = base.join("acl_tight");
+        std::fs::create_dir_all(&inst).unwrap();
+        chmod_0700(&base);
+        chmod_0700(&inst);
+
+        let probe_uid = acl_probe_uid();
+        let tight_acl = format!("u::rwx,g::---,o::---,u:{probe_uid}:---,m::---");
+        if !try_setfacl(&base, &tight_acl) || !try_setfacl(&inst, &tight_acl) {
+            return;
+        }
+
+        for path in [&base, &inst] {
+            let mode = ls_ldn_mode(path).expect("ls -ldn must report mode");
+            assert!(
+                mode.starts_with("drwx------") && mode.ends_with('+'),
+                "precondition failed: {} must report a tight ACL suffix, got {mode}",
+                path.display()
+            );
+            assert!(
+                hook_accepts_mode(&mode),
+                "precondition failed: hook pattern must accept {mode}"
+            );
+        }
+
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "acl_tight")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "hook must exit 0");
+        assert_eq!(
+            std::fs::read_to_string(inst.join("status")).unwrap(),
+            "running",
+            "snippet must write status when ACL suffix is tight"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn host_shell_rejects_acl_widening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("aoe-hooks-acl-wide");
+        let inst = base.join("acl_wide");
+        std::fs::create_dir_all(&inst).unwrap();
+        chmod_0700(&base);
+        chmod_0700(&inst);
+
+        let probe_uid = acl_probe_uid();
+        let wide_acl = format!("u::rwx,g::---,o::---,u:{probe_uid}:r-x,m::r-x");
+        if !try_setfacl(&inst, &wide_acl) {
+            return;
+        }
+
+        let base_mode = ls_ldn_mode(&base).expect("ls -ldn must report base mode");
+        assert!(
+            hook_accepts_mode(&base_mode),
+            "precondition failed: base must pass before instance guard is tested"
+        );
+
+        let inst_mode = ls_ldn_mode(&inst).expect("ls -ldn must report instance mode");
+        assert!(
+            inst_mode.ends_with('+') && !hook_accepts_mode(&inst_mode),
+            "precondition failed: widened ACL must produce a rejected + mode, got {inst_mode}"
+        );
+
+        let cmd =
+            hook_command_with_base("running", base.to_str().unwrap(), HookInstallTarget::Host);
+        let output = std::process::Command::new("sh")
+            .args(["-c", &cmd])
+            .env("AOE_INSTANCE_ID", "acl_wide")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "hook must exit 0 even when ACL widens access"
+        );
+        assert!(
+            !inst.join("status").exists(),
+            "snippet must not write status when ACL widens access"
         );
     }
 
@@ -4608,13 +4970,10 @@ hooks_auto_accept: false
     #[serial_test::serial(shell_env)]
     fn collect_env_lists_warns_on_corrupt_global_config_but_not_on_missing() {
         let tmp = TempDir::new().unwrap();
-        let _codex = CodexHomeGuard::unset();
-        let _home = EnvGuard::set("HOME", tmp.path().to_str().unwrap());
+        let _codex = EnvGuard::unset(&["CODEX_HOME"]);
+        let _home = EnvGuard::set(&[("HOME", tmp.path())]);
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let _xdg = EnvGuard::set(
-            "XDG_CONFIG_HOME",
-            tmp.path().join(".config").to_str().unwrap(),
-        );
+        let _xdg = EnvGuard::set(&[("XDG_CONFIG_HOME", tmp.path().join(".config"))]);
 
         let app_dir = crate::session::get_app_dir().unwrap();
         let config_path = app_dir.join("config.toml");

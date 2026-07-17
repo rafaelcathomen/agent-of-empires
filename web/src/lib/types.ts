@@ -45,6 +45,11 @@ export interface SessionResponse {
    *  rows and prepends a `*` marker. Toggled via the TUI `f`/`F` keybind
    *  or `aoe session favorite|unfavorite`. */
   favorited: boolean;
+  /** Per-session color label (`red` / `amber` / `green`), or null / undefined
+   *  when unset. Rendered as a colored status dot in the sidebar for
+   *  at-a-glance agent status signaling. Set via the sidebar context menu or
+   *  `aoe session color <id> <color>`. See #2383. */
+  color?: string | null;
   /** True when the agent has flagged this session as urgent via the
    *  `attention-urgent` hook. Mirrors `Instance::is_urgent()` server-side
    *  (false for archived / snoozed sessions). The sidebar's Attention sort
@@ -134,6 +139,13 @@ export interface SessionResponse {
    *  structured row with a captured id to diverge from). Absent for terminal
    *  sessions and structured ones whose worker has not minted an id yet. */
   acp_session_id?: string;
+  /** The session's resolved ACP registry key (`agent_name` when set, else
+   *  `tool`), matching the `name` entries `/api/acp/agents` returns. The
+   *  structured view's switch-agent modal uses this as the current-agent
+   *  fallback before the first `AgentSwitched` event lands (which is the only
+   *  event that populates the reduced `state.agent`), so it can gray out the
+   *  running backend on a never-switched session. See #2803. */
+  acp_agent?: string;
   /** True when this session's agent can run a structured ACP `session/fork`:
    *  it is ACP-capable AND declares a real fork strategy. Resume-only ACP
    *  agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but

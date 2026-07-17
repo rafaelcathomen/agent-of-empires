@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::git::error::GitError;
 use crate::session::config::SessionConfig;
-use crate::session::{EnsureReadyError, EnsureReadyOutcome, Instance, Status, Storage};
+use crate::session::{ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance, Status, Storage};
 
 use super::validate_display_label;
 use super::validate_no_shell_injection;
@@ -64,6 +64,11 @@ pub struct SessionResponse {
     /// favorited rows and render the `*` marker without re-implementing
     /// the predicate. Cross-feature parity with the TUI's `f`/`F` keybind.
     pub favorited: bool,
+    /// Per-session color label (`red` / `amber` / `green`), or omitted when
+    /// unset. Rendered as a colored status dot in the web sidebar; set via the
+    /// sidebar context menu or `aoe session color`. See #2383.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
     /// True when the agent has flagged this session as urgent via the
     /// `attention-urgent` hook (read from `/tmp/aoe-hooks-<euid>/{id}/attention.json`
     /// by `Instance::is_urgent()`). The web sidebar's Attention sort floats
@@ -184,6 +189,16 @@ pub struct SessionResponse {
     #[cfg(feature = "serve")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acp_session_id: Option<String>,
+    /// The session's resolved ACP registry key (`agent_name` when set, else
+    /// `tool`), matching the `name` entries `/api/acp/agents` returns. The
+    /// structured view's switch-agent modal reads this as the current-agent
+    /// fallback before the first `AgentSwitched` event lands (which is the
+    /// only event that populates the reduced `state.agent`), so it can gray
+    /// out the running backend on a never-switched session. Omitted for
+    /// sessions with no resolved agent. See #2803.
+    #[cfg(feature = "serve")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acp_agent: Option<String>,
     /// True when this session's agent can run a structured ACP `session/fork`:
     /// it is ACP-capable AND declares a real fork strategy. Resume-only ACP
     /// agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but
@@ -342,6 +357,7 @@ impl SessionResponse {
             is_sandboxed: inst.is_sandboxed(),
             scratch: inst.scratch,
             favorited: inst.is_favorited(),
+            color: inst.color.clone(),
             urgent: inst.is_urgent(),
             pinned_at: inst.pinned_at.map(|t| t.to_rfc3339()),
             archived_at: inst.archived_at.map(|t| t.to_rfc3339()),
@@ -403,6 +419,19 @@ impl SessionResponse {
             },
             #[cfg(feature = "serve")]
             acp_session_id: inst.acp_session_id.clone(),
+            // Resolved the same way as `acp_capable` above: `agent_name` when
+            // set and non-empty, else `tool`. This is the ACP registry key,
+            // so it matches `/api/acp/agents` names the switch-agent modal
+            // filters against. See #2803.
+            #[cfg(feature = "serve")]
+            acp_agent: {
+                let resolved = inst
+                    .agent_name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(inst.tool.as_str());
+                (!resolved.is_empty()).then(|| resolved.to_string())
+            },
             // Shares `agent_is_structured_fork_capable` with the create-time
             // guard so the web "Fork" affordance and server-side acceptance
             // cannot drift: forkable = ACP-capable AND a real fork strategy.
@@ -889,14 +918,7 @@ pub async fn update_workspace_ordering(
     body: Result<Json<UpdateWorkspaceOrderingBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1038,7 +1060,7 @@ async fn probe_container_holds_worktree(id: &str, is_sandboxed: bool) -> bool {
 /// Rename a session's title (and, when tied, its worktree directory).
 ///
 /// The sandbox container probe runs on the blocking pool via
-/// [`probe_container_holds_worktree`], which fails closed on a
+/// `probe_container_holds_worktree`, which fails closed on a
 /// `spawn_blocking` panic or cancellation so the rename is rejected
 /// with `409 CONFLICT` rather than proceeding against a possibly-live
 /// container mount and hitting `EBUSY`.
@@ -1048,13 +1070,7 @@ pub async fn rename_session(
     body: Result<Json<RenameSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1084,11 +1100,7 @@ pub async fn rename_session(
     let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         (
             inst.worktree_info.clone(),
@@ -1246,11 +1258,7 @@ pub async fn rename_session(
     let mut response = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         if let Some(path) = new_path.as_deref() {
             apply_worktree_name_edit(inst, path, new_branch.as_deref());
@@ -1329,7 +1337,7 @@ fn worktree_edit_error_response(
 /// its git branch).
 ///
 /// The sandbox container probe runs on the blocking pool via
-/// [`probe_container_holds_worktree`], which fails closed on a
+/// `probe_container_holds_worktree`, which fails closed on a
 /// `spawn_blocking` panic or cancellation so the edit is rejected with
 /// `409 CONFLICT` rather than proceeding against a possibly-live container
 /// mount and hitting `EBUSY`.
@@ -1339,13 +1347,7 @@ pub async fn set_worktree_name(
     body: Result<Json<SetWorktreeNameBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1372,11 +1374,7 @@ pub async fn set_worktree_name(
     let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         (
             inst.worktree_info.clone(),
@@ -1533,11 +1531,7 @@ pub async fn set_worktree_name(
     let response = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         apply_worktree_name_edit(inst, &new_path, new_branch.as_deref());
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
@@ -1587,14 +1581,7 @@ pub async fn update_session_group(
     body: Result<Json<UpdateGroupBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1620,11 +1607,7 @@ pub async fn update_session_group(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -1650,12 +1633,12 @@ pub async fn update_session_group(
 
     let mut instances = state.instances.write().await;
     let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::error!(
+        tracing::warn!(
             target: "http.api.sessions",
             session = %id,
             "group update: instance vanished after persist"
         );
-        return persist_failed_response();
+        return super::session_gone_after_persist();
     };
     apply_session_group(inst, group);
 
@@ -1776,19 +1759,72 @@ fn persist_failed_response() -> axum::response::Response {
         .into_response()
 }
 
+/// Run `f` on the disk instances under the storage flock (off the async
+/// runtime) and return its result. The single serialization point shared by
+/// every server claim/commit; the claim/commit decision itself lives in the
+/// neutral `session::claim` helpers so the CLI, daemon, and TUI agree.
+///
+/// Claims are written to disk ONLY: the in-memory `state.instances.op_claim` is
+/// eventually-consistent (the disk watcher reloads it) and never authoritative,
+/// so no claim decision ever reads it. See #2541.
+async fn with_locked_storage<T, F>(state: &Arc<AppState>, profile: &str, f: F) -> Result<T, ()>
+where
+    T: Send + 'static,
+    F: FnOnce(&mut Vec<Instance>) -> T + Send + 'static,
+{
+    let profile = profile.to_string();
+    let file_watch = state.file_watch.clone();
+    match tokio::task::spawn_blocking(move || {
+        let storage = Storage::new(&profile, file_watch).map_err(|e| e.to_string())?;
+        storage
+            .update(|instances, _groups| Ok(f(instances)))
+            .map_err(|e| e.to_string())
+    })
+    .await
+    {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => {
+            tracing::error!(target: "http.api.sessions", "locked storage op failed: {e}");
+            Err(())
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.sessions", "locked storage op join failed: {e}");
+            Err(())
+        }
+    }
+}
+
+/// Release the `op` claim for session `id` on disk and in memory,
+/// ownership-guarded so a peer's fresh claim (stale-override) is never cleared.
+/// Best-effort: a stranded claim self-heals via the TTL. See #2541.
+async fn release_op_claim(state: &Arc<AppState>, profile: &str, id: &str, op: ClaimOp) {
+    let _ = persist_session_update(
+        profile.to_string(),
+        "op-claim-release",
+        state.file_watch.clone(),
+        {
+            let id = id.to_string();
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+                    inst.clear_op_claim_if_owned(op);
+                }
+            }
+        },
+    )
+    .await;
+    let mut instances = state.instances.write().await;
+    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+        inst.clear_op_claim_if_owned(op);
+    }
+}
+
 pub async fn update_session_notifications(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Result<Json<UpdateNotificationsBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1811,11 +1847,7 @@ pub async fn update_session_notifications(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -1847,12 +1879,12 @@ pub async fn update_session_notifications(
 
     let mut instances = state.instances.write().await;
     let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::error!(
+        tracing::warn!(
             target: "http.api.sessions",
             session = %id,
             "notification update: instance vanished after persist"
         );
-        return persist_failed_response();
+        return super::session_gone_after_persist();
     };
     apply(&mut inst.notify_on_waiting, waiting);
     apply(&mut inst.notify_on_idle, idle);
@@ -1886,14 +1918,7 @@ pub async fn update_session_diff_base(
     body: Result<Json<UpdateDiffBaseBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -1906,11 +1931,7 @@ pub async fn update_session_diff_base(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -1943,12 +1964,12 @@ pub async fn update_session_diff_base(
 
     let mut instances = state.instances.write().await;
     let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::error!(
+        tracing::warn!(
             target: "http.api.sessions",
             session = %id,
             "diff-base update: instance vanished after persist"
         );
-        return persist_failed_response();
+        return super::session_gone_after_persist();
     };
     inst.base_branch_override = new_override;
 
@@ -1972,6 +1993,15 @@ pub async fn update_session_diff_base(
 #[derive(Deserialize)]
 pub struct UpdatePinBody {
     pub pinned: bool,
+}
+
+#[derive(Deserialize)]
+pub struct UpdateColorBody {
+    /// A palette member (`red` / `amber` / `green`) sets the label; `null` (or
+    /// a missing field) clears it. Validated against
+    /// `crate::session::is_valid_session_color`, matching the CLI.
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2035,14 +2065,7 @@ pub async fn update_session_pin(
     body: Result<Json<UpdatePinBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -2055,11 +2078,7 @@ pub async fn update_session_pin(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -2090,12 +2109,12 @@ pub async fn update_session_pin(
 
     let mut instances = state.instances.write().await;
     let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        tracing::error!(
+        tracing::warn!(
             target: "http.api.sessions",
             session = %id,
             "pin update: instance vanished after persist"
         );
-        return persist_failed_response();
+        return super::session_gone_after_persist();
     };
     if pinned {
         inst.pin();
@@ -2108,20 +2127,88 @@ pub async fn update_session_pin(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
+pub async fn update_session_color(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    body: Result<Json<UpdateColorBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return super::read_only_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    // Validate up front so an unknown color never reaches disk. `None` clears
+    // the label. Mirrors the CLI's palette check.
+    let new_color = body.color.map(|c| c.trim().to_lowercase());
+    if let Some(c) = &new_color {
+        if !crate::session::is_valid_session_color(c) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("invalid color {c:?}; expected one of: red, amber, green, or null"),
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    let lock = state.instance_lock(&id).await;
+    let _guard = lock.lock().await;
+
+    let profile = {
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return super::session_not_found();
+        };
+        inst.source_profile.clone()
+    };
+
+    // Persist first; only mutate memory once disk is durable. See #1589.
+    let persist_id = id.clone();
+    let persist_color = new_color.clone();
+    if persist_session_update(
+        profile,
+        "color update",
+        state.file_watch.clone(),
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                // Pre-validated above, so this cannot fail.
+                let _ = inst.set_color(persist_color);
+            }
+        },
+    )
+    .await
+    .is_err()
+    {
+        return persist_failed_response();
+    }
+
+    let mut instances = state.instances.write().await;
+    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "color update: instance vanished after persist"
+        );
+        return super::session_gone_after_persist();
+    };
+    let _ = inst.set_color(new_color);
+
+    let response =
+        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
+    (StatusCode::OK, Json(serde_json::json!(response))).into_response()
+}
+
 pub async fn update_session_archive(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Result<Json<UpdateArchiveBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -2138,11 +2225,7 @@ pub async fn update_session_archive(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -2175,12 +2258,12 @@ pub async fn update_session_archive(
     let (was_structured_view, inst_clone, kill_pane) = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::error!(
+            tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
                 "archive update: instance vanished after persist"
             );
-            return persist_failed_response();
+            return super::session_gone_after_persist();
         };
         if archived {
             inst.archive();
@@ -2258,11 +2341,7 @@ pub async fn update_session_archive(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -2280,14 +2359,7 @@ pub async fn trash_session(
     body: Option<Json<TrashSessionBody>>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let body = body.map(|Json(b)| b).unwrap_or_default();
 
@@ -2297,11 +2369,7 @@ pub async fn trash_session(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -2327,12 +2395,12 @@ pub async fn trash_session(
     let (was_structured_view, inst_clone) = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::error!(
+            tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
                 "trash: instance vanished after persist"
             );
-            return persist_failed_response();
+            return super::session_gone_after_persist();
         };
         inst.trash();
         let structured_view;
@@ -2437,11 +2505,7 @@ pub async fn trash_session(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -2457,14 +2521,7 @@ pub async fn restore_session(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
 
     let lock = state.instance_lock(&id).await;
@@ -2473,14 +2530,42 @@ pub async fn restore_session(
     let (profile, snapshot) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            return super::session_not_found();
+        };
+        (inst.source_profile.clone(), inst.clone())
+    };
+
+    // Symmetric claim (#2541): win the Restore claim on disk BEFORE the unlocked
+    // worktree move. The in-memory `instance_lock` held above does not serialize
+    // a purge running in another process (CLI / another daemon); only the
+    // durable on-disk claim does. A fresh peer Purge claim wins and the restore
+    // is refused.
+    let claim_id = id.clone();
+    match with_locked_storage(&state, &profile, move |instances| {
+        crate::session::claim::decide_restore_claim(instances, &claim_id, chrono::Utc::now())
+    })
+    .await
+    {
+        Ok(crate::session::claim::RestoreClaimDecision::Claimed) => {}
+        Ok(crate::session::claim::RestoreClaimDecision::AlreadyGone) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "message": "Session not found" })),
             )
                 .into_response();
-        };
-        (inst.source_profile.clone(), inst.clone())
-    };
+        }
+        Ok(crate::session::claim::RestoreClaimDecision::PurgeInProgress) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "purge_in_progress",
+                    "message": "Session is being purged; restore was refused"
+                })),
+            )
+                .into_response();
+        }
+        Err(()) => return persist_failed_response(),
+    }
 
     // Move the worktree back to its pre-trash location before clearing the
     // marker. Strict: if the original path is occupied or git refuses, keep
@@ -2497,10 +2582,12 @@ pub async fn restore_session(
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!(target: "http.api.sessions", session = %id, "restore relocation join failed: {e}");
+            release_op_claim(&state, &profile, &id, ClaimOp::Restore).await;
             return persist_failed_response();
         }
     };
     if let crate::session::trash::RestoreOutcome::Failed { reason } = &restored.0 {
+        release_op_claim(&state, &profile, &id, ClaimOp::Restore).await;
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
@@ -2513,24 +2600,39 @@ pub async fn restore_session(
     let restored_path = restored.1.project_path.clone();
     let restored_pre = restored.1.pre_trash_project_path.clone();
 
-    let persist_id = id.clone();
+    // Final commit under the flock: untrash + release our claim, but only if we
+    // still own it. A stale-override purge (past the TTL) may have stolen it
+    // mid-move; in that case do not untrash and let the purge win (degrades to
+    // #2534, never worse than the status quo). See #2541.
+    let commit_id = id.clone();
     let (rp, pre) = (restored_path.clone(), restored_pre.clone());
-    if persist_session_update(
-        profile,
-        "restore",
-        state.file_watch.clone(),
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.project_path = rp.clone();
-                inst.pre_trash_project_path = pre.clone();
-                inst.untrash();
-            }
-        },
-    )
+    let commit = match with_locked_storage(&state, &profile, move |instances| {
+        crate::session::claim::finalize_restore_commit(instances, &commit_id, &rp, &pre)
+    })
     .await
-    .is_err()
     {
-        return persist_failed_response();
+        Ok(v) => v,
+        Err(()) => return persist_failed_response(),
+    };
+    match commit {
+        crate::session::claim::RestoreCommit::Committed => {}
+        crate::session::claim::RestoreCommit::PurgeStoleClaim => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "purge_in_progress",
+                    "message": "Session was claimed by a purge mid-restore; restore was refused"
+                })),
+            )
+                .into_response();
+        }
+        crate::session::claim::RestoreCommit::AlreadyGone => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "message": "Session not found" })),
+            )
+                .into_response();
+        }
     }
 
     let mut instances = state.instances.write().await;
@@ -2540,6 +2642,7 @@ pub async fn restore_session(
     inst.project_path = restored_path;
     inst.pre_trash_project_path = restored_pre;
     inst.untrash();
+    inst.clear_op_claim_if_owned(ClaimOp::Restore);
     let response =
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -2576,11 +2679,7 @@ pub async fn force_smart_rename(
             )
         })
     }) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "message": "Session not found" })),
-        )
-            .into_response();
+        return super::session_not_found();
     };
 
     // Preflight the SAME gate the spawned try_smart_rename re-applies, so the
@@ -2625,13 +2724,17 @@ pub async fn force_smart_rename(
         return (status, Json(serde_json::json!({ "message": message }))).into_response();
     }
 
-    let Some(first_message) = state.acp_event_store.first_user_prompt(&id) else {
+    let Some((first_user_prompt, agent_prose)) = state
+        .acp_event_store
+        .first_turn_context(&id, crate::session::smart_rename::FIRST_TURN_AGENT_BYTES)
+    else {
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "message": "No prompt to name this session from yet" })),
         )
             .into_response();
     };
+    let context = crate::session::smart_rename::render_first_turn(&first_user_prompt, &agent_prose);
 
     // Clear the attempted gate so try_smart_rename does not short-circuit on a
     // prior failed attempt. The inflight guard inside try_smart_rename still
@@ -2647,8 +2750,93 @@ pub async fn force_smart_rename(
     tokio::spawn(crate::session::smart_rename::try_smart_rename(
         state.clone(),
         id.clone(),
-        first_message,
+        crate::session::smart_rename::SmartRenameInput {
+            first_user_prompt,
+            context,
+        },
+        crate::session::smart_rename::RenameTrigger::Forced,
     ));
+    StatusCode::ACCEPTED.into_response()
+}
+
+/// On-demand "summarize the conversation so far" for a structured-view
+/// session. Preflights the same eligibility gate the spawned task re-applies
+/// so the caller never gets a 202 for a session that would silently drop, then
+/// runs the summary one-shot detached (best-effort, like the automatic
+/// trigger). A `202` means "summary started", not "summary ready"; the result
+/// arrives later as a `ConversationSummary` event over the structured-view WS.
+/// Bypasses the `conversation_summary` setting and the delta threshold: an
+/// explicit request always runs if the session is eligible. See #2808.
+pub async fn summarize_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(resp) = super::acp::read_only_block(&state) {
+        return resp;
+    }
+
+    let Some((profile, tool, command, sandboxed, structured)) = ({
+        let instances = state.instances.read().await;
+        instances.iter().find(|i| i.id == id).map(|i| {
+            (
+                i.source_profile.clone(),
+                i.tool.clone(),
+                i.command.clone(),
+                i.is_sandboxed(),
+                i.is_structured(),
+            )
+        })
+    }) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "message": "Session not found" })),
+        )
+            .into_response();
+    };
+
+    let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+    if let Err(reason) = crate::session::conversation_summary::resolve_summary_agent(
+        structured,
+        &tool,
+        &config.session.conversation_summary_agent,
+        sandboxed,
+        &command,
+        &config.session.agent_command_override,
+    ) {
+        use crate::session::smart_rename::SkipReason;
+        let (status, message) = match reason {
+            SkipReason::NotStructured => (
+                StatusCode::BAD_REQUEST,
+                "Session is not a structured-view session",
+            ),
+            SkipReason::Sandboxed => (
+                StatusCode::CONFLICT,
+                "Conversation summary is not available for sandboxed sessions",
+            ),
+            SkipReason::NoOneshot => (
+                StatusCode::CONFLICT,
+                "The summary agent has no one-shot mode",
+            ),
+            SkipReason::CommandOverridden => (
+                StatusCode::CONFLICT,
+                "The summary agent's command is overridden",
+            ),
+            // resolve_summary_agent never returns the rename-only reasons.
+            SkipReason::NameNotDefault | SkipReason::Disabled => (
+                StatusCode::CONFLICT,
+                "Conversation summary is unavailable for this session",
+            ),
+        };
+        return (status, Json(serde_json::json!({ "message": message }))).into_response();
+    }
+
+    tokio::spawn(
+        crate::session::conversation_summary::try_conversation_summary(
+            state.clone(),
+            id.clone(),
+            crate::session::conversation_summary::SummaryTrigger::Manual,
+        ),
+    );
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -2661,14 +2849,7 @@ pub async fn stop_session(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
 
     let lock = state.instance_lock(&id).await;
@@ -2680,11 +2861,7 @@ pub async fn stop_session(
     let (profile, is_structured, already_stopped) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         let structured;
         #[cfg(feature = "serve")]
@@ -2711,11 +2888,7 @@ pub async fn stop_session(
                 SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
             }
             None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "message": "Session not found" })),
-                )
-                    .into_response();
+                return super::session_not_found();
             }
         };
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
@@ -2749,12 +2922,12 @@ pub async fn stop_session(
     let inst_clone = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::error!(
+            tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
                 "stop session: instance vanished after persist"
             );
-            return persist_failed_response();
+            return super::session_gone_after_persist();
         };
         inst.status = Status::Stopped;
         if is_structured {
@@ -2801,11 +2974,7 @@ pub async fn stop_session(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -2821,13 +2990,7 @@ pub async fn start_session(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
 
     let lock = state.instance_lock(&id).await;
@@ -2836,11 +2999,7 @@ pub async fn start_session(
     let (profile, is_structured, is_stopped, instance) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         let structured;
         #[cfg(feature = "serve")]
@@ -2867,11 +3026,7 @@ pub async fn start_session(
                 SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
             }
             None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "message": "Session not found" })),
-                )
-                    .into_response();
+                return super::session_not_found();
             }
         };
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
@@ -2913,11 +3068,7 @@ pub async fn start_session(
                 SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
             }
             None => {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({ "message": "Session not found" })),
-                )
-                    .into_response();
+                return super::session_not_found();
             }
         };
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
@@ -2971,11 +3122,7 @@ pub async fn start_session(
                     )
                 }
                 None => {
-                    return (
-                        StatusCode::NOT_FOUND,
-                        Json(serde_json::json!({ "message": "Session not found" })),
-                    )
-                        .into_response();
+                    return super::session_not_found();
                 }
             };
             if let Some(sid) = resume_failed_sid {
@@ -3024,14 +3171,7 @@ pub async fn update_session_snooze(
     body: Result<Json<UpdateSnoozeBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -3060,11 +3200,7 @@ pub async fn update_session_snooze(
     let (was_structured_view, profile) = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         let structured_view;
         #[cfg(feature = "serve")]
@@ -3105,12 +3241,12 @@ pub async fn update_session_snooze(
     {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::error!(
+            tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
                 "snooze update: instance vanished after persist"
             );
-            return persist_failed_response();
+            return super::session_gone_after_persist();
         };
         match minutes {
             Some(m) => inst.snooze(m),
@@ -3149,11 +3285,7 @@ pub async fn update_session_snooze(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -3171,14 +3303,7 @@ pub async fn update_session_unread(
     body: Result<Json<UpdateUnreadBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "read_only",
-                "message": "Server is in read-only mode"
-            })),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -3192,11 +3317,7 @@ pub async fn update_session_unread(
     let profile = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         };
         inst.source_profile.clone()
     };
@@ -3227,12 +3348,12 @@ pub async fn update_session_unread(
 
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::error!(
+            tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
                 "unread update: instance vanished after persist"
             );
-            return persist_failed_response();
+            return super::session_gone_after_persist();
         };
         if mark_unread {
             inst.mark_unread();
@@ -3247,11 +3368,7 @@ pub async fn update_session_unread(
             SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
         }
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
+            return super::session_not_found();
         }
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
@@ -3304,6 +3421,34 @@ async fn purge_session_artifacts(
     recent_entry: Option<crate::session::RecentProjectEntry>,
 ) -> Result<Vec<String>, String> {
     let profile = instance.source_profile.clone();
+    let was_trashed = instance.is_trashed();
+
+    // Symmetric claim (#2541): win the Purge claim on disk before any
+    // irreversible teardown, so a restore from another process cannot bring the
+    // session back after its artifacts are gone. Refuse when a fresh Restore
+    // claim holds the row; a row already gone from disk proceeds (the teardown
+    // is idempotent and the final removal is a no-op).
+    let claim_id = id.to_string();
+    match with_locked_storage(state, &profile, move |instances| {
+        crate::session::claim::decide_purge_claim(
+            instances,
+            &claim_id,
+            was_trashed,
+            chrono::Utc::now(),
+        )
+    })
+    .await
+    {
+        Ok(crate::session::claim::PurgeClaimDecision::Claimed)
+        | Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {}
+        Ok(crate::session::claim::PurgeClaimDecision::Restored)
+        | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => {
+            return Err("Session is being restored, so it was not purged".to_string())
+        }
+        Err(()) => {
+            return Err("Failed to acquire the purge claim under the storage lock".to_string())
+        }
+    }
 
     // True once we have crossed the irreversible line (the structured-view
     // transcript has been deleted). After that point a sidecar-cleanup
@@ -3369,6 +3514,7 @@ async fn purge_session_artifacts(
             // Nothing irreversible happened (no transcript to lose), so keep
             // the row intact and let the caller surface the error; the user
             // can retry, e.g. with force on a dirty worktree.
+            release_op_claim(state, &profile, id, ClaimOp::Purge).await;
             return Err(errs);
         }
         // The durable transcript is already gone; a kept row would only allow
@@ -3387,13 +3533,24 @@ async fn purge_session_artifacts(
 
     // Disk first: if persistence fails, in-memory state stays intact and the
     // poll loop will not re-add a half-deleted row.
+    // #2534/#2541: revalidate under the flock. The teardown ran on an unlocked
+    // snapshot; if a restore from another process brought the session back
+    // (stale-override past the claim TTL), keep the row and release our purge
+    // claim (ownership-guarded) rather than deleting a session the user just
+    // restored. Degrades that rare residual to #2534 behavior, never worse.
+    // Deliberately hand-rolled rather than routed through `with_locked_storage`:
+    // this fn returns `Result<_, String>` and must propagate the storage error
+    // string up to the caller, whereas `with_locked_storage` logs and collapses
+    // to `Result<_, ()>`. See #2541.
     let storage = Storage::new(&profile, state.file_watch.clone())
         .map_err(|e| format!("Session was torn down but storage init failed: {e}"))?;
     let id_for_save = id.to_string();
-    tokio::task::spawn_blocking(move || {
+    let kept_restored = tokio::task::spawn_blocking(move || {
         storage.update(|instances, _groups| {
-            instances.retain(|i| i.id != id_for_save);
-            Ok(())
+            Ok(matches!(
+                crate::session::claim::finalize_purge_removal(instances, &id_for_save, was_trashed),
+                crate::session::claim::PurgeCommit::KeptRestored
+            ))
         })
     })
     .await
@@ -3401,6 +3558,17 @@ async fn purge_session_artifacts(
     .map_err(|e| {
         format!("Session deletion completed on disk, but sessions.json could not be updated: {e}")
     })?;
+
+    if kept_restored {
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "session was restored while its purge ran; kept the restored row, but its worktree, branch, container, or transcript may already be gone"
+        );
+        // Leave the in-memory row and its lock in place; the poll loop
+        // converges its trashed flag from the peer's on-disk untrash.
+        return Ok(messages);
+    }
 
     {
         let mut instances = state.instances.write().await;
@@ -3431,6 +3599,31 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
             .map(|i| (i.id.clone(), i.source_profile.clone()))
             .collect()
     };
+
+    // Self-heal (#2541): clear op_claims left by a purge/restore that crashed
+    // mid-operation. `try_claim` already treats an expired claim as free (that
+    // is the authoritative self-heal), so this startup sweep is
+    // belt-and-suspenders that tidies stale claims on disk. It only visits
+    // profiles that currently have a trashed candidate; a stray claim elsewhere
+    // is still healed by the next `try_claim`.
+    let profiles: std::collections::HashSet<String> =
+        candidates.iter().map(|(_, p)| p.clone()).collect();
+    let now = chrono::Utc::now();
+    let ttl = Instance::OP_CLAIM_TTL;
+    for profile in profiles {
+        let _ = persist_session_update(
+            profile,
+            "op-claim-self-heal",
+            state.file_watch.clone(),
+            move |instances| {
+                for inst in instances.iter_mut() {
+                    inst.clear_expired_op_claim(ttl, now);
+                }
+            },
+        )
+        .await;
+    }
+
     for (id, profile) in candidates {
         let lock = state.instance_lock(&id).await;
         let _guard = lock.lock().await;
@@ -3568,12 +3761,7 @@ pub async fn delete_session(
     body: Option<Json<DeleteSessionBody>>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        );
+        return super::read_only_response();
     }
 
     let body = body.map(|Json(b)| b).unwrap_or_default();
@@ -3592,10 +3780,7 @@ pub async fn delete_session(
     };
 
     let Some(instance) = instance else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "message": "Session not found" })),
-        );
+        return super::session_not_found();
     };
 
     // Captured before `instance` moves into the deletion task; recorded into
@@ -3647,7 +3832,7 @@ pub async fn delete_session(
     });
 
     match join.await {
-        Ok(resp) => resp,
+        Ok(resp) => resp.into_response(),
         Err(e) => {
             tracing::error!(target: "http.api.sessions",
                 "Deletion task panicked or was cancelled: {e}");
@@ -3658,6 +3843,7 @@ pub async fn delete_session(
                     "message": "Deletion task failed",
                 })),
             )
+                .into_response()
         }
     }
 }
@@ -4054,13 +4240,7 @@ pub async fn create_session(
     body: Result<Json<CreateSessionBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(body) = match body {
         Ok(b) => b,
@@ -4466,18 +4646,27 @@ pub async fn create_session(
                 std::path::Path::new(&instance.project_path),
             );
             let defaults = resolved_config.acp.acp_defaults_for(&agent_key);
-            instance.agent_model = body
+            // Preserve the explicit request model separately (trimmed to match
+            // the resolver's normalization) so a terminal fallback below can
+            // keep it while dropping any ACP-derived default; agent_model is
+            // ACP-only.
+            let explicit_model = body
                 .agent_model
-                .filter(|s| !s.trim().is_empty())
-                .or_else(|| defaults.and_then(|d| d.model.clone()));
-            // Per-model effort override wins when a model is resolved, else the
-            // flat default effort. The explicit request effort always wins.
-            let mut agent_effort =
-                body.agent_effort
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| {
-                        defaults.and_then(|d| d.effort_for_model(instance.agent_model.as_deref()))
-                    });
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            // Explicit request wins, else the per-agent default; effort is keyed
+            // on the resolved model. Same single-source resolver the spawn path
+            // uses; persist the model here so the composer shows it and the
+            // session stays pinned to it. See resolve_spawn_model_effort.
+            let (resolved_model, mut agent_effort) =
+                crate::session::config::resolve_spawn_model_effort(
+                    defaults,
+                    explicit_model.clone(),
+                    body.agent_effort,
+                );
+            instance.agent_model = resolved_model;
             // Don't trust the client's capability decision. Re-resolve
             // whether this agent can actually run in structured view; a custom
             // agent without an `agent_acp_cmd` (or any non-ACP tool)
@@ -4516,6 +4705,9 @@ pub async fn create_session(
 
             if !instance.is_structured() {
                 agent_effort = None;
+                // Terminal sessions keep only an explicitly requested model,
+                // never an ACP-derived default (agent_model is ACP-only).
+                instance.agent_model = explicit_model;
             }
 
             agent_effort
@@ -4734,8 +4926,11 @@ pub async fn create_session(
                             .await
                             .iter()
                             .any(|i| i.id == id);
+                        // Capacity-aware banner selection (and the benign
+                        // first-tick duplicate) is documented on
+                        // `structured_spawn_error_message`.
                         let message =
-                            format!("Failed to start structured view agent {agent:?}: {e}");
+                            crate::server::api::structured_spawn_error_message(&e, &agent);
                         if still_present {
                             tracing::warn!(
                                 target: "acp.supervisor",
@@ -5122,13 +5317,7 @@ pub async fn ensure_terminal(
     axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let index = q.index;
     if index > crate::server::pane::MAX_TERMINAL_INDEX {
@@ -5241,13 +5430,7 @@ pub async fn ensure_container_terminal(
     axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let index = q.index;
     if index > crate::server::pane::MAX_TERMINAL_INDEX {
@@ -5345,13 +5528,7 @@ pub async fn kill_terminal(
     axum::extract::Query(q): axum::extract::Query<crate::server::live_ws::TerminalIndexQuery>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(
-                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
-            ),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let index = q.index;
     if index == 0 || index > crate::server::pane::MAX_TERMINAL_INDEX {
@@ -5571,13 +5748,10 @@ async fn resolve_diff_repos(
     id: &str,
 ) -> Result<DiffContext, axum::response::Response> {
     let instances = state.instances.read().await;
-    let inst = instances.iter().find(|i| i.id == id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_found", "message": "Session not found"})),
-        )
-            .into_response()
-    })?;
+    let inst = instances
+        .iter()
+        .find(|i| i.id == id)
+        .ok_or_else(super::session_not_found)?;
     let repos = if let Some(ws) = inst.workspace_info.as_ref() {
         ws.repos
             .iter()
@@ -8145,11 +8319,7 @@ pub async fn send_message(
     req: Result<Json<SendMessageRequest>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "read_only"})),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(req) = match req {
         Ok(j) => j,
@@ -8483,11 +8653,7 @@ pub async fn paste_image(
     use base64::Engine as _;
 
     if state.read_only {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({"error": "read_only"})),
-        )
-            .into_response();
+        return super::read_only_response();
     }
     let Json(req) = match req {
         Ok(j) => j,
@@ -8685,13 +8851,12 @@ pub async fn read_output(
 #[cfg(test)]
 mod workspace_ordering_tests {
     use super::*;
+    use crate::session::test_support::{isolate_app_dir_at, AppDirGuard};
     use serial_test::serial;
     use tempfile::tempdir;
 
-    fn setup_test_home(temp: &std::path::Path) {
-        std::env::set_var("HOME", temp);
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
+    fn setup_test_home(temp: &std::path::Path) -> AppDirGuard {
+        isolate_app_dir_at(temp)
     }
 
     fn mock_response(id: &str, project_path: &str, branch: Option<&str>) -> SessionResponse {
@@ -8741,6 +8906,8 @@ mod workspace_ordering_tests {
             #[cfg(feature = "serve")]
             acp_session_id: None,
             #[cfg(feature = "serve")]
+            acp_agent: None,
+            #[cfg(feature = "serve")]
             acp_can_fork: false,
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
@@ -8751,6 +8918,7 @@ mod workspace_ordering_tests {
             monitor_active: false,
             monitor_description: None,
             favorited: false,
+            color: None,
             urgent: false,
             pinned_at: None,
             archived_at: None,
@@ -8793,7 +8961,7 @@ mod workspace_ordering_tests {
     #[serial]
     fn merge_prepends_unseen_newest_first() -> anyhow::Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         // Persisted ordering already contains `b`. Sessions come in
         // creation order (oldest first) `[b, a, c]`; `a` and `c` are
@@ -8830,7 +8998,7 @@ mod workspace_ordering_tests {
     #[serial]
     fn merge_dedupes_within_a_single_request() -> anyhow::Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         // Two sessions on the same workspace (rare but legal: multiple
         // agents in one worktree). The workspace id appears once.
@@ -8848,7 +9016,7 @@ mod workspace_ordering_tests {
     #[serial]
     fn merge_no_op_when_all_known() -> anyhow::Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         crate::session::update_workspace_ordering(|ord| {
             ord.order = vec!["/tmp/repo::a".to_string(), "/tmp/repo::b".to_string()];
@@ -8872,7 +9040,7 @@ mod workspace_ordering_tests {
     #[serial]
     fn merge_read_only_returns_merged_but_does_not_write() -> anyhow::Result<()> {
         let temp = tempdir()?;
-        setup_test_home(temp.path());
+        let _guard = setup_test_home(temp.path());
 
         // Empty starting state. Read-only request observes a new
         // workspace; the response includes it but disk is untouched.

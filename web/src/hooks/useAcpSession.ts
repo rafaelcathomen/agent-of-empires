@@ -46,7 +46,17 @@ import { reportAcpInteraction, setSessionArchive, setSessionSnooze } from "../li
 /** Outcome of an immediate prompt POST, used by the drain effect to
  *  decide whether to retire queued items (delivered or permanently
  *  rejected) or keep them for a later retry (transient failure). */
-type PromptSendResult = "ok" | "retryable_failure" | "non_retryable_failure";
+type PromptSendResult = "ok" | "import_pending" | "import_completed" | "retryable_failure" | "non_retryable_failure";
+
+function countNewAssignments(frames: readonly AcpFrame[], appliedThrough: number): number {
+  return frames.filter(
+    (frame) =>
+      frame.seq > appliedThrough &&
+      typeof frame.event === "object" &&
+      frame.event !== null &&
+      "AcpSessionAssigned" in frame.event,
+  ).length;
+}
 
 export type Action =
   | { kind: "frame"; frame: AcpFrame }
@@ -55,7 +65,14 @@ export type Action =
   | { kind: "handshake"; frames: AcpFrame[] }
   | { kind: "lagged"; skipped: number }
   | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[] }
-  | { kind: "prompt_send_rejected" }
+  | { kind: "prompt_send_rejected"; text: string }
+  | {
+      kind: "defer_prompt_for_import";
+      text: string;
+      attachments?: PromptAttachmentInput[];
+      alreadyQueued?: boolean;
+      waitForAssignment: boolean;
+    }
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
   | { kind: "approval_resolved_locally"; nonce: string }
@@ -165,10 +182,11 @@ function evictOldestPersistedAcpState(currentKey: string): boolean {
  *  row stays in the in-memory `stateCache`, so it survives a component
  *  remount but not a hard page reload. See #1833 / #1000. */
 function toPersistedState(state: AcpState): AcpState {
-  if (!state.queuedPrompts.some((q) => q.attachments?.length)) return state;
+  const persistable = state.importWaiting ? { ...state, importWaiting: false } : state;
+  if (!persistable.queuedPrompts.some((q) => q.attachments?.length)) return persistable;
   return {
-    ...state,
-    queuedPrompts: state.queuedPrompts.filter((q) => !q.attachments?.length),
+    ...persistable,
+    queuedPrompts: persistable.queuedPrompts.filter((q) => !q.attachments?.length),
   };
 }
 
@@ -611,6 +629,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
         id: `user-${Date.now()}-${state.activity.length}`,
         kind: "user_prompt",
         text: action.text,
+        optimistic: true,
         attachments: action.attachments && action.attachments.length > 0 ? action.attachments : undefined,
         at: new Date().toISOString(),
       }),
@@ -633,14 +652,58 @@ export function reducer(state: AcpState, action: Action): AcpState {
     // the composer returns to idle without waiting for a Stopped frame
     // that will never arrive.
     const lastStoppedSeq = Math.min(state.lastStoppedSeq + 1, state.pendingUserPromptSeq);
+    const optimisticIndex = state.activity.findIndex(
+      (row) => row.kind === "user_prompt" && row.text === action.text && row.optimistic === true,
+    );
+    const activity =
+      optimisticIndex < 0
+        ? state.activity
+        : state.activity.map((row, index) => (index === optimisticIndex ? { ...row, optimistic: false } : row));
     return {
       ...state,
+      activity,
       inFlightTool: null,
       lastStoppedSeq,
       turnActive: isTurnActive({
         pendingUserPromptSeq: state.pendingUserPromptSeq,
         lastStoppedSeq,
       }),
+    };
+  }
+  if (action.kind === "defer_prompt_for_import") {
+    let optimisticIndex = -1;
+    for (let i = state.activity.length - 1; i >= 0; i -= 1) {
+      const row = state.activity[i];
+      if (
+        row?.kind === "user_prompt" &&
+        row.text === action.text &&
+        !row.id.startsWith("user-seq-") &&
+        row.optimistic !== false
+      ) {
+        optimisticIndex = i;
+        break;
+      }
+    }
+    const activity =
+      optimisticIndex >= 0
+        ? [...state.activity.slice(0, optimisticIndex), ...state.activity.slice(optimisticIndex + 1)]
+        : state.activity;
+    const pendingUserPromptSeq = Math.max(state.lastStoppedSeq, state.pendingUserPromptSeq - 1);
+    const queuedPrompts = action.alreadyQueued
+      ? state.queuedPrompts
+      : state.queuedPrompts.concat({
+          id: `q-${Date.now()}-${state.queuedPrompts.length}`,
+          text: action.text,
+          queuedAt: new Date().toISOString(),
+          ...(action.attachments && action.attachments.length > 0 ? { attachments: action.attachments } : {}),
+        });
+    return {
+      ...state,
+      activity,
+      pendingUserPromptSeq,
+      turnActive: isTurnActive({ pendingUserPromptSeq, lastStoppedSeq: state.lastStoppedSeq }),
+      queuedPrompts,
+      importWaiting: action.waitForAssignment,
     };
   }
   if (action.kind === "enqueue_prompt") {
@@ -831,6 +894,13 @@ export function useAcpSession(
     if (sessionIdRef.current) cacheSet(sessionIdRef.current, state);
   }, [state]);
   const wsRef = useRef<WebSocket | null>(null);
+  // Incremented synchronously whenever this hook observes an
+  // AcpSessionAssigned frame. A prompt POST captures the generation before
+  // waiting on the server, then compares it when a retryable import timeout
+  // returns. This closes the edge where assignment arrived just before the
+  // HTTP 503 and would otherwise leave the queue waiting for an event that
+  // already happened.
+  const assignmentGenerationRef = useRef(0);
   // Auto-reconnect machinery (#1130). retryCountRef is the persistent
   // attempt counter across `onclose` -> scheduled `connect()` cycles;
   // retryTimerRef holds the pending setTimeout so manualReconnect can
@@ -1055,7 +1125,9 @@ export function useAcpSession(
           dispatch({ kind: "lagged", skipped: tail.highest_seq });
           return;
         }
-        dispatch({ kind: "frames", frames: tail.frames ?? [], oldestSeq: tail.next_cursor ?? 0 });
+        const tailFrames = tail.frames ?? [];
+        assignmentGenerationRef.current += countNewAssignments(tailFrames, lastSeqRef.current);
+        dispatch({ kind: "frames", frames: tailFrames, oldestSeq: tail.next_cursor ?? 0 });
         setHasMoreOlder(tail.has_more ?? false);
         // Advance the seq ref synchronously (the [state.lastSeq] effect
         // mirror lags a render tick) so the WS dial that follows this
@@ -1076,7 +1148,9 @@ export function useAcpSession(
           );
           if (hsRes.ok) {
             const hs = (await hsRes.json()) as ReplayPageResponse;
-            if ((hs.frames ?? []).length > 0) dispatch({ kind: "handshake", frames: hs.frames });
+            if ((hs.frames ?? []).length > 0) {
+              dispatch({ kind: "handshake", frames: hs.frames });
+            }
           }
         }
         dispatch({ kind: "lagged_resolved" });
@@ -1113,6 +1187,7 @@ export function useAcpSession(
           // first page, where `cursor` is the client's resume point.
           if (data.highest_seq < firstSince) {
             dispatch({ kind: "reset" });
+            lastSeqRef.current = 0;
           }
         }
         // Honor `lost` on every page: a retention prune between pages
@@ -1124,7 +1199,10 @@ export function useAcpSession(
           return;
         }
         if (data.frames.length > 0) {
+          const appliedThrough = lastSeqRef.current;
+          assignmentGenerationRef.current += countNewAssignments(data.frames, appliedThrough);
           dispatch({ kind: "frames", frames: data.frames });
+          lastSeqRef.current = data.frames.reduce((highest, frame) => Math.max(highest, frame.seq), appliedThrough);
         }
         const next = data.next_cursor;
         if (data.has_more && next != null && next > cursor && next < target) {
@@ -1399,7 +1477,13 @@ export function useAcpSession(
               // streaming, the spinner stays "honest" and the escape
               // hatch doesn't appear. See WorkingSpinner in StructuredView.
               lastActivityRef.current = Date.now();
-              dispatch({ kind: "frame", frame: data as AcpFrame });
+              const frame = data as AcpFrame;
+              const appliedThrough = lastSeqRef.current;
+              assignmentGenerationRef.current += countNewAssignments([frame], appliedThrough);
+              if (frame.seq > appliedThrough) {
+                lastSeqRef.current = frame.seq;
+              }
+              dispatch({ kind: "frame", frame });
             }
           } catch {
             // Ignore malformed frames; the server should never send them.
@@ -1515,6 +1599,7 @@ export function useAcpSession(
   const dispatchPromptNow = useCallback(
     async (text: string, attachments?: PromptAttachmentInput[]): Promise<PromptSendResult> => {
       if (!sessionId) return "retryable_failure";
+      const assignmentGeneration = assignmentGenerationRef.current;
       if (statusRef.current !== "open") {
         dispatch({
           kind: "error",
@@ -1582,14 +1667,18 @@ export function useAcpSession(
           // carries them in memory; see sendPrompt + the drain effect), so
           // suppress the banner for attachment sends too. See #1833.
           const workerNotReady = res.status === 503 && detail.startsWith("worker_not_ready");
+          const importPending = res.status === 503 && detail.startsWith("worker_not_ready: history import in progress");
           if (rejected) {
-            dispatch({ kind: "prompt_send_rejected" });
+            dispatch({ kind: "prompt_send_rejected", text });
           }
           if (!workerNotReady) {
             dispatch({
               kind: "error",
               message: `Could not send prompt (${res.status}). ${detail}`.trim(),
             });
+          }
+          if (importPending) {
+            return assignmentGenerationRef.current === assignmentGeneration ? "import_pending" : "import_completed";
           }
           return rejected ? "non_retryable_failure" : "retryable_failure";
         }
@@ -1657,7 +1746,8 @@ export function useAcpSession(
       // "absent" until the respawn lands); parking would leave it in the
       // local queue forever and the worker would never come back. Only a
       // non-dormant cold worker (genuine mid-resume) still parks. See #1689.
-      const blockedAsideFromWorker = wsClosed || state.turnActive || state.workerStopped || state.workerRestarting;
+      const blockedAsideFromWorker =
+        wsClosed || state.turnActive || state.workerStopped || state.workerRestarting || state.importWaiting;
       const shouldEnqueue = state.workerIdleStopped
         ? blockedAsideFromWorker
         : blockedAsideFromWorker || workerNotRunning;
@@ -1676,6 +1766,16 @@ export function useAcpSession(
         return;
       }
       const result = await dispatchPromptNow(text, attachments);
+      if (result === "import_pending" || result === "import_completed") {
+        dispatch({
+          kind: "defer_prompt_for_import",
+          text,
+          attachments,
+          waitForAssignment: result === "import_pending",
+        });
+        reportAcpInteraction("prompt_queued");
+        return;
+      }
       // Idle-dormant direct send: the worker was respawning and did not
       // come online within send_prompt's wait window, so the POST returned
       // a retryable typed 503. Park the prompt (with its attachments)
@@ -1695,6 +1795,7 @@ export function useAcpSession(
       state.workerStopped,
       state.workerRestarting,
       state.workerIdleStopped,
+      state.importWaiting,
       dispatchPromptNow,
     ],
   );
@@ -1716,6 +1817,7 @@ export function useAcpSession(
     if (!sessionIdRef.current) return;
     if (state.turnActive) return;
     if (state.workerStopped || state.workerRestarting) return;
+    if (state.importWaiting) return;
     // Worker still mid-resume from a daemon cold start (or it never
     // came online). Park queued prompts so they don't POST into a
     // worker that's not online yet; the next REST poll flips
@@ -1777,6 +1879,16 @@ export function useAcpSession(
       const sentIds = snapshot.map((q) => q.id);
       void dispatchPromptNow(combined, combinedAttachments.length > 0 ? combinedAttachments : undefined)
         .then((result) => {
+          if (result === "import_pending" || result === "import_completed") {
+            drainingRef.current = false;
+            dispatch({
+              kind: "defer_prompt_for_import",
+              text: combined,
+              alreadyQueued: true,
+              waitForAssignment: result === "import_pending",
+            });
+            return;
+          }
           // Retire on success and on non-retryable rejection; only a
           // transient failure keeps the batch queued for the next retry.
           if (result !== "retryable_failure") {
@@ -1791,6 +1903,16 @@ export function useAcpSession(
       const headId = head.id;
       void dispatchPromptNow(head.text, head.attachments)
         .then((result) => {
+          if (result === "import_pending" || result === "import_completed") {
+            drainingRef.current = false;
+            dispatch({
+              kind: "defer_prompt_for_import",
+              text: head.text,
+              alreadyQueued: true,
+              waitForAssignment: result === "import_pending",
+            });
+            return;
+          }
           if (result !== "retryable_failure") {
             dispatch({ kind: "dequeue_prompt", id: headId });
           }
@@ -1806,6 +1928,7 @@ export function useAcpSession(
     state.workerStopped,
     state.workerRestarting,
     state.workerIdleStopped,
+    state.importWaiting,
     state.queuedPrompts,
     dispatchPromptNow,
   ]);

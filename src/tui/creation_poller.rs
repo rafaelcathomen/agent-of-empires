@@ -101,6 +101,7 @@ impl CreationPoller {
         let data = request.data;
         let hooks = request.hooks;
         let profile = data.profile.clone();
+        let sandbox = data.sandbox;
 
         let existing_titles: Vec<&str> = request
             .existing_instances
@@ -129,25 +130,7 @@ impl CreationPoller {
         };
         let group_refs: Vec<&str> = existing_groups.iter().map(|s| s.as_str()).collect();
 
-        let params = InstanceParams {
-            title: data.title,
-            path: data.path.clone(),
-            group: data.group,
-            tool: data.tool,
-            worktree_enabled: data.worktree_enabled,
-            worktree_branch: data.worktree_branch,
-            create_new_branch: data.create_new_branch,
-            base_branch: data.base_branch,
-            sandbox: data.sandbox,
-            sandbox_image: data.sandbox_image,
-            yolo_mode: data.yolo_mode,
-            extra_env: data.extra_env,
-            extra_args: data.extra_args,
-            command_override: data.command_override,
-            extra_repo_paths: data.extra_repo_paths,
-            scratch: data.scratch,
-            fork_seed: data.fork_seed,
-        };
+        let params = InstanceParams::from(data);
 
         let build_result = match builder::build_instance(
             params,
@@ -179,7 +162,7 @@ impl CreationPoller {
         // Execute on_create hooks after worktree setup, before starting
         if has_on_create {
             let hooks = hooks.as_ref().unwrap();
-            if data.sandbox {
+            if sandbox {
                 // Ensure the container is running so we can exec hooks inside it.
                 // Don't create the tmux session yet -- that happens at attach time
                 // where the terminal size is available.
@@ -229,7 +212,7 @@ impl CreationPoller {
         // This prevents blocking the UI thread when the session is first attached.
         if has_on_launch {
             let hooks = hooks.as_ref().unwrap();
-            if data.sandbox {
+            if sandbox {
                 if !container_started {
                     if let Err(e) = instance.get_container_for_instance() {
                         let msg = format!("Container startup warning: {:#}", e);
@@ -263,7 +246,7 @@ impl CreationPoller {
             }
         }
 
-        if data.sandbox && !container_started {
+        if sandbox && !container_started {
             // Only ensure the container is running here if hooks didn't already
             // start it. Don't create the tmux session yet -- that happens at attach time
             // where the terminal size is available.

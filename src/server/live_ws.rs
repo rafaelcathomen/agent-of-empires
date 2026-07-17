@@ -48,7 +48,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
@@ -90,6 +90,60 @@ const PING_INTERVAL: Duration = Duration::from_secs(30);
 /// Floor between drift re-asserts (see the capture loop): both known
 /// writers dedup, so this only matters against an unknown one.
 const REASSERT_MIN_INTERVAL: Duration = Duration::from_secs(2);
+/// After a drift target proves unreachable (same geometry didn't move after
+/// the last re-assert), wait this long before retrying it once, so a transient
+/// tmux failure still recovers without spinning the 2s repaint loop.
+const STUCK_REASSERT_RETRY: Duration = Duration::from_secs(30);
+
+/// The owner loop's view of a size drift: the grid the client wants versus the
+/// pane tmux currently yields. Two identical tuples across re-asserts mean the
+/// last resize changed nothing, i.e. the target is unreachable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct DriftGeometry {
+    want_cols: u16,
+    want_rows: u16,
+    pane_cols: u16,
+    pane_rows: u16,
+}
+
+/// Suppresses re-asserting a drift target that has proven unreachable.
+/// Re-asserting an identical resize only repaints the pane (#2766); recovery is
+/// preserved because any genuine geometry change is a different tuple and a
+/// stuck tuple is retried once after [`STUCK_REASSERT_RETRY`].
+struct ReassertGuard {
+    last: Option<(DriftGeometry, Instant)>,
+    retry_after: Duration,
+}
+
+impl ReassertGuard {
+    fn new(retry_after: Duration) -> Self {
+        Self {
+            last: None,
+            retry_after,
+        }
+    }
+
+    /// True when this drift geometry should trigger a re-assert. Suppresses an
+    /// identical geometry seen within `retry_after` of the last re-assert (the
+    /// previous resize changed nothing, so repeating it can't help); allows a
+    /// changed geometry immediately and an unchanged one again after the retry
+    /// window elapses.
+    fn should_reassert(&mut self, geom: DriftGeometry, now: Instant) -> bool {
+        match self.last {
+            Some((last, at)) if last == geom && now.duration_since(at) < self.retry_after => false,
+            _ => {
+                self.last = Some((geom, now));
+                true
+            }
+        }
+    }
+
+    /// Forget the last target so the next drift re-asserts immediately. Called
+    /// when the pane reaches the requested grid.
+    fn reset(&mut self) {
+        self.last = None;
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -316,10 +370,19 @@ async fn handle_live_ws(
     // Acquire the shared vt100 channel for this pane (armed once, shared with
     // the native TUI preview and any other web viewer). `Some` => render from
     // the in-process grid and inject input over the socket; `None` (tmux < 3.4,
-    // arm failure, or non-unix) => fall back to the capture-pane loop and
-    // send-keys. Held for the whole connection so the channel stays alive.
+    // arm failure, non-unix, or `[tmux] vt_live` off) => fall back to the
+    // capture-pane loop and send-keys. Held for the whole connection so the
+    // channel stays alive. The setting is read per connection and gates
+    // *arming*, not *reuse*: while other holders keep a channel alive it is
+    // the pane's single input writer, so a new connection must join it (or
+    // its send-keys would race the socket); the fallback only becomes real
+    // once the last holder drops and the channel dies.
     #[cfg(unix)]
-    let vt = crate::tmux::vt::VtChannel::acquire(&tmux_name);
+    let vt = if crate::session::config::vt_live_enabled() {
+        crate::tmux::vt::VtChannel::acquire(&tmux_name)
+    } else {
+        crate::tmux::vt::VtChannel::reuse(&tmux_name)
+    };
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
@@ -344,6 +407,7 @@ async fn handle_live_ws(
         let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
         let mut dead_probes: u32 = 0;
         let mut last_reassert = std::time::Instant::now() - REASSERT_MIN_INTERVAL;
+        let mut reassert_guard = ReassertGuard::new(STUCK_REASSERT_RETRY);
         let mut last_heartbeat = std::time::Instant::now() - SIZE_OWNER_HEARTBEAT;
         loop {
             let sample_started = std::time::Instant::now();
@@ -359,7 +423,14 @@ async fn handle_live_ws(
             #[cfg(unix)]
             {
                 outcome = match &capture_vt {
-                    Some(ch) if ch.is_alive() => {
+                    // The VT grid intentionally retains tmux's default
+                    // 2,000-line scrollback for fast live-edge snapshots.
+                    // The web protocol permits a bounded 4,000-line reading
+                    // window, though, so never let that smaller cache make
+                    // retained tmux history disappear. Deep reads take the
+                    // authoritative capture-pane path below; the normal
+                    // screen-sized live tail stays on the event-driven grid.
+                    Some(ch) if ch.is_alive() && lines <= crate::tmux::vt::SCROLLBACK_LINES => {
                         let ch = ch.clone();
                         match tokio::task::spawn_blocking(move || ch.sample(lines)).await {
                             Ok((content, cursor)) => CaptureOutcome::Frame(content, cursor),
@@ -453,7 +524,24 @@ async fn handle_live_ws(
                                 && want_rows > 0
                                 && c.pane_width > 0
                                 && (c.pane_width != want_cols || c.pane_height != want_rows);
-                            if drifted && last_reassert.elapsed() >= REASSERT_MIN_INTERVAL {
+                            let geom = DriftGeometry {
+                                want_cols,
+                                want_rows,
+                                pane_cols: c.pane_width,
+                                pane_rows: c.pane_height,
+                            };
+                            // Re-assert only for a genuine, not-yet-proven-stuck
+                            // drift. Once a target proves unreachable (the pane
+                            // didn't move after the last re-assert of the same
+                            // geometry) the guard suppresses the repeat, so an
+                            // off-by-one that survives the resize can't spin the
+                            // 2s repaint loop forever (#2766). A real geometry
+                            // change is a new tuple and re-asserts at once; the
+                            // pane reaching target resets the guard below.
+                            if drifted
+                                && last_reassert.elapsed() >= REASSERT_MIN_INTERVAL
+                                && reassert_guard.should_reassert(geom, std::time::Instant::now())
+                            {
                                 last_reassert = std::time::Instant::now();
                                 warn!(
                                     target: "terminal.ws",
@@ -492,6 +580,11 @@ async fn handle_live_ws(
                                         .send(Message::Text(size_owner_json(false).into()))
                                         .await;
                                 }
+                            }
+                            if !drifted {
+                                // Pane matches the grid; drop any stuck target so
+                                // the next genuine drift re-asserts immediately.
+                                reassert_guard.reset();
                             }
                         }
                     }
@@ -656,6 +749,15 @@ async fn handle_live_ws(
                             let bytes = data.to_vec();
                             // Off-runtime: send-keys forks a subprocess.
                             let _ = tokio::task::spawn_blocking(move || {
+                                // A live channel armed by another holder (the
+                                // TUI, an older connection) is the pane's
+                                // single input writer; route through it
+                                // rather than racing it with send-keys.
+                                // Mirrors the TUI's `dispatch_via_fork`.
+                                #[cfg(unix)]
+                                if crate::tmux::vt::try_send_input(&name, &bytes) {
+                                    return;
+                                }
                                 let session = crate::tmux::Session::from_name(&name);
                                 if let Err(e) = session.send_raw_bytes(&bytes) {
                                     warn!(target: "terminal.ws", tmux = %name, kind = "live", "send_raw_bytes failed: {}", e);
@@ -832,6 +934,65 @@ fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>) -> String
 mod tests {
     use super::*;
 
+    fn geom(want: (u16, u16), pane: (u16, u16)) -> DriftGeometry {
+        DriftGeometry {
+            want_cols: want.0,
+            want_rows: want.1,
+            pane_cols: pane.0,
+            pane_rows: pane.1,
+        }
+    }
+
+    #[test]
+    fn reassert_guard_suppresses_identical_stuck_target() {
+        // #2766: an unreachable target (pane stuck one row short) must not
+        // re-assert on a loop. First sight fires; the identical tuple is then
+        // suppressed within the retry window.
+        let mut g = ReassertGuard::new(STUCK_REASSERT_RETRY);
+        let stuck = geom((115, 67), (115, 66));
+        let t0 = Instant::now();
+        assert!(g.should_reassert(stuck, t0), "first drift re-asserts");
+        assert!(
+            !g.should_reassert(stuck, t0 + Duration::from_secs(2)),
+            "identical stuck target is suppressed"
+        );
+        assert!(
+            !g.should_reassert(stuck, t0 + Duration::from_secs(20)),
+            "still suppressed within the retry window"
+        );
+    }
+
+    #[test]
+    fn reassert_guard_allows_genuine_geometry_change() {
+        let mut g = ReassertGuard::new(STUCK_REASSERT_RETRY);
+        let t0 = Instant::now();
+        assert!(g.should_reassert(geom((115, 67), (115, 66)), t0));
+        // A real resize (new grid) is a different tuple: re-assert at once.
+        assert!(
+            g.should_reassert(geom((120, 70), (115, 66)), t0 + Duration::from_secs(1)),
+            "changed target re-asserts immediately"
+        );
+    }
+
+    #[test]
+    fn reassert_guard_retries_after_window_and_after_reset() {
+        let mut g = ReassertGuard::new(STUCK_REASSERT_RETRY);
+        let stuck = geom((115, 67), (115, 66));
+        let t0 = Instant::now();
+        assert!(g.should_reassert(stuck, t0));
+        assert!(!g.should_reassert(stuck, t0 + Duration::from_secs(10)));
+        // Transient recovery: the same target is retried once past the window.
+        assert!(
+            g.should_reassert(stuck, t0 + STUCK_REASSERT_RETRY + Duration::from_secs(1)),
+            "stuck target retries after the window"
+        );
+        // Reaching target resets the guard, so a later drift fires immediately.
+        g.reset();
+        // Without reset, t0+35s is 4s after the t0+31s re-assert (inside the
+        // 30s window) and would be suppressed; reset clears it so it fires.
+        assert!(g.should_reassert(stuck, t0 + Duration::from_secs(35)));
+    }
+
     #[test]
     fn frame_json_includes_geometry_and_cursor() {
         let cursor = crate::tmux::PaneCursor {
@@ -844,6 +1005,7 @@ mod tests {
             alternate_on: false,
             mouse_tracking: false,
             mouse_sgr: false,
+            mouse_all: false,
             position_reliable: true,
         };
         let json = frame_json("hello\nworld", Some(&cursor));
@@ -871,6 +1033,7 @@ mod tests {
             alternate_on: true,
             mouse_tracking: true,
             mouse_sgr: false,
+            mouse_all: false,
             position_reliable: true,
         };
         let v: serde_json::Value = serde_json::from_str(&frame_json("x", Some(&cursor))).unwrap();
@@ -891,6 +1054,7 @@ mod tests {
             alternate_on: false,
             mouse_tracking: false,
             mouse_sgr: false,
+            mouse_all: false,
             position_reliable: true,
         };
         let v: serde_json::Value = serde_json::from_str(&frame_json("x", Some(&cursor))).unwrap();

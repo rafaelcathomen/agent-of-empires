@@ -44,6 +44,7 @@ pub enum ActionId {
     AttachTerminal,
     ToggleView,
     SendMessage,
+    RespondToPermission,
     Stop,
     Delete,
     Rename,
@@ -303,13 +304,11 @@ pub fn parse_chord(s: &str) -> Option<Chord> {
             c.to_ascii_lowercase()
         };
         KeyCode::Char(c)
-    } else if let Some(n) = key
-        .strip_prefix(['F', 'f'])
-        .and_then(|n| n.parse::<u8>().ok())
-    {
-        KeyCode::F(n)
     } else {
-        return None;
+        let n = key
+            .strip_prefix(['F', 'f'])
+            .and_then(|n| n.parse::<u8>().ok())?;
+        KeyCode::F(n)
     };
     Some(Chord { code, ctrl })
 }
@@ -554,6 +553,22 @@ pub static BINDINGS: &[Binding] = &[
         palette: Some(PaletteMeta {
             title: "Send message to agent",
             keywords: &["prompt", "tell", "say"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
+    Binding {
+        id: ActionId::RespondToPermission,
+        non_strict: &[k('a')],
+        strict: &[k('A')],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Respond to permission prompt",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Respond to permission prompt",
+            keywords: &["allow", "deny", "approve", "permission"],
             group: PaletteGroup::Actions,
             serve_only: false,
         }),
@@ -957,6 +972,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::AttachTerminal => "attach-terminal",
         ActionId::ToggleView => "toggle-view",
         ActionId::SendMessage => "send-message",
+        ActionId::RespondToPermission => "respond-to-permission",
         ActionId::Stop => "stop",
         ActionId::Delete => "delete",
         ActionId::Rename => "rename",

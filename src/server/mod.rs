@@ -290,6 +290,17 @@ pub struct AppState {
     /// (`"tunnel"` / `"tailscale"` / `"local"`), fed to the telemetry snapshot.
     /// Never a tunnel name, hostname, or `.ts.net` URL, only the mode.
     pub serve_mode: &'static str,
+    /// DNS-rebinding gate: accepted `Host` values, port-stripped,
+    /// ASCII-lowercased, IPv6 unbracketed. Resolved once at launch by
+    /// `resolve_access_policy` from the bind host, `--allowed-host`, and any
+    /// auto-injected tunnel host. `access_policy` rejects an unlisted `Host`
+    /// with 403, before auth. See #2735.
+    pub allowed_hosts: Vec<String>,
+    /// DNS-rebinding gate: accepted `Origin` values (scheme + host [+ port],
+    /// ASCII-lowercased). A request whose `Origin` is unlisted is rejected
+    /// with 403; a request with no `Origin` (curl, native TUI, non-browser
+    /// WS) is exempt. Resolved alongside `allowed_hosts`. See #2735.
+    pub allowed_origins: Vec<String>,
     /// Per-instance mutex guarding mutations that must not interleave
     /// (e.g. `ensure_session` decide-and-restart). Entries are created on
     /// first use and live for the lifetime of the process — there are only
@@ -311,6 +322,18 @@ pub struct AppState {
     /// up to `ONESHOT_TIMEOUT`. Held only across the child spawn + wait. See
     /// `session::smart_rename` and #2348.
     pub smart_rename_semaphore: tokio::sync::Semaphore,
+    /// Session ids with an in-flight conversation-summary one-shot, so the
+    /// automatic trigger and the on-demand endpoint cannot spawn concurrent
+    /// summaries for the same session (which would also race on the
+    /// last-summary seq). Synchronous mutex; tiny critical sections. See
+    /// `session::conversation_summary` and #2808.
+    pub summary_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Global cap on concurrent conversation-summary one-shots. Separate from
+    /// `smart_rename_semaphore` (permits=2) and sized to 1: a summary runs the
+    /// agent over the whole transcript, so it is slower and costlier than a
+    /// title call; a dedicated single slot keeps heavy background summaries
+    /// from starving the snappy first-prompt rename. See #2808.
+    pub summary_semaphore: tokio::sync::Semaphore,
     /// Suppression set for the startup-recovery cascade. While an entry is
     /// present and younger than `recovery::RECENTLY_RESTARTED_TTL`, the
     /// `status_poll_loop` skips `update_status_with_metadata` for that
@@ -584,6 +607,12 @@ pub struct ServerConfig<'a> {
     /// same surface as `remote`, without spawning a tunnel.
     pub behind_proxy: bool,
     pub open_browser: bool,
+    /// Operator-supplied `--allowed-host` entries, merged with the derived
+    /// loopback/bind/tunnel set by `resolve_access_policy`. See #2735.
+    pub extra_allowed_hosts: Vec<String>,
+    /// Operator-supplied `--allowed-origin` entries (normalized to the browser
+    /// `Origin` form), for reverse proxies on nonstandard ports. See #2735.
+    pub extra_allowed_origins: Vec<String>,
 }
 
 /// Resolve the coarse auth-mode label the same way `/api/about` reports it, so
@@ -617,6 +646,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         passphrase,
         behind_proxy,
         open_browser,
+        extra_allowed_hosts,
+        extra_allowed_origins,
     } = config;
 
     raise_fd_limit();
@@ -802,6 +833,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local_port = listener.local_addr()?.port();
 
+    crate::acp::version_probe::warn_for_structured_sessions(&instances, !is_daemon).await;
+
     // Start tunnel if remote mode. Preference order:
     //  1. User-specified named Cloudflare tunnel (stable, explicit choice).
     //  2. Tailscale Funnel if tailscale is installed and logged in
@@ -985,6 +1018,26 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         .map(|h| h.mode_label())
         .unwrap_or("local");
 
+    // DNS-rebinding gate (#2735). Auto-inject the tunnel/Tailscale public host
+    // so remote dashboards and their live-terminal WS upgrade (which carries
+    // `Origin: https://<tunnel-host>`) pass without any operator flag; the URL
+    // rotates on quick tunnels and the bind is forced to loopback, so
+    // `--allowed-host` cannot cover this path.
+    let tunnel_host: Option<String> = tunnel_handle.as_ref().and_then(|h| host_from_url(&h.url));
+    let (allowed_hosts, allowed_origins) = resolve_access_policy(
+        host,
+        local_port,
+        &extra_allowed_hosts,
+        &extra_allowed_origins,
+        tunnel_host.as_deref(),
+    );
+    tracing::info!(
+        target: "http.access",
+        ?allowed_hosts,
+        ?allowed_origins,
+        "resolved DNS-rebinding allowlist"
+    );
+
     let state = Arc::new(AppState {
         profile: profile.to_string(),
         read_only,
@@ -995,11 +1048,17 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         behind_tunnel: remote || behind_proxy,
         auth_mode,
         serve_mode,
+        allowed_hosts,
+        allowed_origins,
         instance_locks: RwLock::new(std::collections::HashMap::new()),
         smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         smart_rename_semaphore: tokio::sync::Semaphore::new(
             crate::session::smart_rename::MAX_CONCURRENT,
+        ),
+        summary_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        summary_semaphore: tokio::sync::Semaphore::new(
+            crate::session::conversation_summary::MAX_CONCURRENT,
         ),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
@@ -1530,6 +1589,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             patch(api::set_worktree_name),
         )
         .route("/api/sessions/{id}/pin", patch(api::update_session_pin))
+        .route("/api/sessions/{id}/color", patch(api::update_session_color))
         .route(
             "/api/sessions/{id}/archive",
             patch(api::update_session_archive),
@@ -1549,6 +1609,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/smart-rename",
             post(api::force_smart_rename),
         )
+        .route("/api/sessions/{id}/summarize", post(api::summarize_session))
         .route("/api/sessions/{id}/start", post(api::start_session))
         .route(
             "/api/sessions/{id}/terminal",
@@ -1787,6 +1848,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             state.clone(),
             auth::auth_middleware,
         ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            access_policy,
+        ))
         .layer(axum::middleware::from_fn(security_headers))
         .layer(axum::middleware::from_fn(http_request_span))
         .layer(axum::extract::DefaultBodyLimit::max(1024 * 1024))
@@ -1840,6 +1905,315 @@ async fn http_request_span(
         response.headers_mut().insert("x-request-id", value);
     }
     response
+}
+
+/// True when `host` is a wildcard bind ("all interfaces") rather than a
+/// concrete, routable name a browser would send back as `Host`.
+pub(crate) fn is_wildcard_bind(host: &str) -> bool {
+    matches!(host, "0.0.0.0" | "::" | "[::]")
+}
+
+/// Strip an optional `:port` and IPv6 brackets from a `Host`/authority value,
+/// yielding the canonical bare host. `localhost:8080` -> `localhost`,
+/// `[::1]:8080` -> `::1`, `127.0.0.1` -> `127.0.0.1`. A bare (unbracketed)
+/// IPv6 literal has multiple colons and no port, so it is returned unchanged.
+fn strip_host_port(host: &str) -> &str {
+    let host = host.trim();
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match host.rfind(':') {
+        Some(idx) if !host[..idx].contains(':') => &host[..idx],
+        _ => host,
+    }
+}
+
+/// Canonical host key for the allowlist and for `Host` comparison: bare host,
+/// ASCII-lowercased (DNS is case-insensitive), with a single trailing FQDN
+/// root dot stripped so `example.com.` and `example.com` compare equal. Runs
+/// on both the incoming `Host` and every allowlist entry, so the two stay
+/// symmetric. `pub(crate)` so the CLI `--allowed-host` validator can reject an
+/// entry that normalizes to nothing (e.g. `:8080`).
+pub(crate) fn norm_host(host: &str) -> String {
+    let bare = strip_host_port(host);
+    bare.strip_suffix('.').unwrap_or(bare).to_ascii_lowercase()
+}
+
+/// True when a `norm_host`'d value is a routable IP literal we trust
+/// unconditionally. An IP literal is dialed directly and never DNS-resolved, so
+/// it cannot be the target of DNS rebinding: a browser only sends an IP as
+/// `Host`/`Origin` when the user navigated straight to that address. Trusting
+/// it restores `aoe serve --host 0.0.0.0` reachability by LAN/tailnet IP with
+/// no `--allowed-host` (Vite's "Pattern A"). Hostnames are NOT trusted here and
+/// still require an explicit allowlist entry. See #2735.
+///
+/// The excluded ranges are hygiene, not rebinding-necessity (IPs can't be
+/// rebound): the unspecified address (`0.0.0.0` / `::`, also a Linux/macOS
+/// rebinding bypass), multicast, and link-local (v4 `169.254.0.0/16`, which
+/// contains the `169.254.169.254` cloud-metadata address; v6 `fe80::/10`) are
+/// never a legitimate dashboard endpoint. Routable IPs (LAN, tailnet
+/// `100.64.0.0/10`, ULA, global unicast) are trusted. IPv4-mapped IPv6 forms
+/// (`::ffff:a.b.c.d`) are canonicalized first so those exclusions also cover
+/// e.g. `::ffff:169.254.169.254`.
+fn is_trusted_ip_literal(host: &str) -> bool {
+    use std::net::IpAddr;
+    let Ok(ip) = host.parse::<IpAddr>() else {
+        return false;
+    };
+    let ip = ip.to_canonical();
+    if ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        IpAddr::V4(v4) => !v4.is_link_local(),
+        // `Ipv6Addr::is_unicast_link_local` is unstable; match `fe80::/10` by
+        // hand (top 10 bits `1111111010`).
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) != 0xfe80,
+    }
+}
+
+/// True when a `norm_host`'d value parses as an IP literal the gate refuses to
+/// trust: unspecified (`0.0.0.0` / `::`), link-local, or multicast. A hostname
+/// is not an IP literal and returns false, so the CLI validators still accept
+/// `aoe.example.com`. This is the inverse of `is_trusted_ip_literal` over the
+/// values that actually parse as an IP; sharing the one predicate keeps the
+/// `--allowed-host` / `--allowed-origin` validators from ever admitting an entry
+/// that the gate's trust check excludes (the exact ordering bypass where an
+/// allowlist match wins before `is_trusted_ip_literal` runs). See #2735.
+pub(crate) fn is_untrusted_ip_literal(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok() && !is_trusted_ip_literal(host)
+}
+
+/// Wrap an IPv6 literal in brackets for use inside an origin authority;
+/// hostnames and IPv4 literals pass through unchanged.
+fn bracket_if_ipv6(host: &str) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
+}
+
+fn push_unique(list: &mut Vec<String>, item: String) {
+    if !item.is_empty() && !list.contains(&item) {
+        list.push(item);
+    }
+}
+
+/// Canonicalize an `Origin` to the exact form a browser serializes: trimmed,
+/// ASCII-lowercased, no trailing slash, and with the scheme's default port
+/// elided (`https://x:443` -> `https://x`, `http://x:80` -> `http://x`). Runs
+/// on both the allowlist build and the incoming header so the two never drift;
+/// without it a copy-pasted `https://x/` or `https://x:443` would silently 403
+/// every request. See #2735.
+fn norm_origin(origin: &str) -> String {
+    let o = origin.trim().trim_end_matches('/').to_ascii_lowercase();
+    // Strip a single trailing FQDN root dot from the host so
+    // `https://example.com.` == `https://example.com`, mirroring `norm_host`.
+    // The dot sits at the authority end or just before `:port`; IPv6
+    // authorities are bracketed (`]` precedes any port), so a `.` / `.:` here
+    // is only ever the root dot. A trailing dot (the `Some` arm) ends the
+    // authority, so no `:port` follows and `.:` cannot also be present; the two
+    // arms are mutually exclusive, which is why the dot arm skips the `replacen`
+    // that only the `.:port` form needs.
+    let o = match o.strip_suffix('.') {
+        Some(rest) => rest.to_string(),
+        None => o.replacen(".:", ":", 1),
+    };
+    for (scheme, default_port) in [("http://", ":80"), ("https://", ":443")] {
+        if let Some(host) = o
+            .strip_prefix(scheme)
+            .and_then(|r| r.strip_suffix(default_port))
+        {
+            return format!("{scheme}{host}");
+        }
+    }
+    o
+}
+
+fn push_origin(list: &mut Vec<String>, raw: String) {
+    push_unique(list, norm_origin(&raw));
+}
+
+/// Extract the bare host from a tunnel URL like `https://x.trycloudflare.com`.
+fn host_from_url(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = norm_host(authority);
+    (!host.is_empty()).then_some(host)
+}
+
+/// Resolve the `(allowed_hosts, allowed_origins)` pair the DNS-rebinding gate
+/// enforces. Pure so the defaulting, wildcard handling, and tunnel
+/// auto-injection are unit-testable without a live server (#2735).
+///
+/// - Loopback trio (`localhost`, `127.0.0.1`, `::1`) is always trusted, plus
+///   the concrete bind `host` (wildcards excluded: they mean "all interfaces",
+///   not a routable Host).
+/// - Each local host gets `http`/`https` origins on the actual bind `port`.
+/// - Operator `--allowed-host` entries are trusted for direct access on the
+///   bind port and for standard-port (proxy) access.
+/// - A `tunnel_host` (Cloudflare/Tailscale public name) is auto-injected with
+///   its portless `https` origin, so tunnels work with no operator flag.
+/// - Operator `--allowed-origin` entries are normalized to the browser's
+///   `Origin` form (lowercased, no trailing slash, default port elided) for
+///   reverse proxies on nonstandard ports.
+fn resolve_access_policy(
+    host: &str,
+    port: u16,
+    extra_hosts: &[String],
+    extra_origins: &[String],
+    tunnel_host: Option<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let mut hosts: Vec<String> = Vec::new();
+    let mut origins: Vec<String> = Vec::new();
+
+    let mut local: Vec<String> = vec![
+        "localhost".to_string(),
+        "127.0.0.1".to_string(),
+        "::1".to_string(),
+    ];
+    if !is_wildcard_bind(host) {
+        push_unique(&mut local, norm_host(host));
+    }
+    for h in &local {
+        push_unique(&mut hosts, h.clone());
+        let hb = bracket_if_ipv6(h);
+        push_origin(&mut origins, format!("http://{hb}:{port}"));
+        push_origin(&mut origins, format!("https://{hb}:{port}"));
+    }
+
+    for h in extra_hosts {
+        let nh = norm_host(h);
+        if nh.is_empty() {
+            continue;
+        }
+        push_unique(&mut hosts, nh.clone());
+        let hb = bracket_if_ipv6(&nh);
+        push_origin(&mut origins, format!("http://{hb}:{port}"));
+        push_origin(&mut origins, format!("https://{hb}:{port}"));
+        push_origin(&mut origins, format!("http://{hb}"));
+        push_origin(&mut origins, format!("https://{hb}"));
+    }
+
+    if let Some(th) = tunnel_host {
+        let nh = norm_host(th);
+        if !nh.is_empty() {
+            push_unique(&mut hosts, nh.clone());
+            push_origin(&mut origins, format!("https://{}", bracket_if_ipv6(&nh)));
+        }
+    }
+
+    for o in extra_origins {
+        push_origin(&mut origins, o.clone());
+    }
+
+    (hosts, origins)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AccessDecision {
+    Allow,
+    DenyMissingHost,
+    DenyHost,
+    DenyOrigin,
+}
+
+/// Pure DNS-rebinding decision: reject a missing `Host`; accept a `Host` that
+/// is allowlisted or a routable IP literal (IPs can't be rebound, see
+/// `is_trusted_ip_literal`); exempt requests with no `Origin` (curl / native
+/// TUI / non-browser WS); reject a present `Origin` that is neither allowlisted
+/// nor a routable IP literal. Comparisons are case-insensitive on the host and
+/// on the whole origin. See #2735.
+fn evaluate_access(
+    host_header: Option<&str>,
+    origin_header: Option<&str>,
+    allowed_hosts: &[String],
+    allowed_origins: &[String],
+) -> AccessDecision {
+    let Some(raw_host) = host_header else {
+        return AccessDecision::DenyMissingHost;
+    };
+    let host = norm_host(raw_host);
+    if !allowed_hosts.contains(&host) && !is_trusted_ip_literal(&host) {
+        return AccessDecision::DenyHost;
+    }
+    if let Some(origin) = origin_header {
+        let origin = norm_origin(origin);
+        // A by-IP dashboard (`http://<ip>:port`) sends `Origin: http://<ip>:port`
+        // on its own fetch/WS, so trust an IP-literal origin on the same basis
+        // as the Host. This is a deliberate relaxation: a cross-origin page
+        // served from a bare IP would also pass this check, but it cannot read
+        // the auth token, so auth remains the backstop; a per-origin allowlist
+        // is the deferred stricter posture. `host_from_url` strips
+        // scheme/port/brackets.
+        let origin_is_trusted_ip =
+            host_from_url(&origin).is_some_and(|h| is_trusted_ip_literal(&h));
+        if !allowed_origins.contains(&origin) && !origin_is_trusted_ip {
+            return AccessDecision::DenyOrigin;
+        }
+    }
+    AccessDecision::Allow
+}
+
+/// Uniform 403 for every DNS-rebinding rejection. Names both gates but not
+/// which one tripped, so it is accurate for a missing/unlisted `Host` and an
+/// unlisted `Origin` alike without handing a prober a which-check oracle; the
+/// specific reason stays in the `http.access` debug log. See #2735.
+fn access_denied() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        "forbidden: host or origin not allowed",
+    )
+        .into_response()
+}
+
+/// DNS-rebinding gate. Runs before `auth_middleware` (layered outside it) so a
+/// rejected request never reaches auth: the 403 short-circuits here. HTTP/1.1
+/// always carries `Host`; for HTTP/2 the `:authority` pseudo-header maps to it,
+/// with the URI authority as a fallback. See #2735.
+async fn access_policy(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let host_header = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| request.uri().authority().map(|a| a.as_str().to_string()));
+    let origin_header = request
+        .headers()
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    match evaluate_access(
+        host_header.as_deref(),
+        origin_header.as_deref(),
+        &state.allowed_hosts,
+        &state.allowed_origins,
+    ) {
+        AccessDecision::Allow => next.run(request).await,
+        AccessDecision::DenyMissingHost => {
+            tracing::debug!(target: "http.access", "rejected: missing Host header");
+            access_denied()
+        }
+        AccessDecision::DenyHost => {
+            tracing::debug!(target: "http.access", host = ?host_header, "rejected: host not in allowlist");
+            access_denied()
+        }
+        AccessDecision::DenyOrigin => {
+            tracing::debug!(target: "http.access", origin = ?origin_header, "rejected: origin not in allowlist");
+            access_denied()
+        }
+    }
 }
 
 /// Content-Security-Policy for the dashboard.
@@ -2252,6 +2626,30 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     fresh
 }
 
+/// Carry the previous tick's Unknown-escalation tracking fields
+/// (`ever_confirmed_present`, `unknown_since`) onto a freshly disk-loaded
+/// instance, keyed by id. `load_all_instances` unconditionally resets both
+/// `#[serde(skip)]` fields to their defaults on every call, so
+/// `status_poll_loop` must call this BEFORE running
+/// `update_status_with_metadata` on the fresh instance: otherwise
+/// `unknown_since` restarts at `Instant::now()` every 2s tick and the
+/// bounded Unknown->Error escalation window in
+/// `update_status_with_metadata_inner` can never elapse (#2865). The
+/// counterpart carry for the opposite direction, after the status decision
+/// has run, lives in `reload_state_instances_from_disk`'s per-`StatusSource`
+/// handling.
+fn seed_unknown_tracking(
+    instances: &mut [Instance],
+    prev: &std::collections::HashMap<String, (bool, Option<std::time::Instant>)>,
+) {
+    for inst in instances {
+        if let Some(&(ever_confirmed_present, unknown_since)) = prev.get(&inst.id) {
+            inst.ever_confirmed_present = ever_confirmed_present;
+            inst.unknown_since = unknown_since;
+        }
+    }
+}
+
 // INVARIANTS for `reload_state_instances_from_disk` (do not break without
 // revisiting `tests/serve_disk_reload_helper_equivalence.rs`):
 // 1. Both call sites (`status_poll_loop` and `disk_watcher_consumer`) must
@@ -2259,13 +2657,22 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
 //    calling it (tmux scrape lives only in `status_poll_loop`), and in
 //    the StatusSource they pass.
 // 2. `merge_runtime_fields` is mandatory per-id. Skipping it wipes the
-//    five #[serde(skip)] runtime fields (`last_error_check`,
+//    #[serde(skip)] runtime fields (`last_error_check`,
 //    `last_start_time`, `last_error`, `session_id_poller`,
 //    `retroactive_capture_excludes`) that disk reload zeroes by design.
 // 3. `merge_runtime_fields` does NOT carry `status`, `last_accessed_at`,
-//    or `idle_entered_at`. Those three are handled per StatusSource:
-//    DiskOnly takes prior.status and `prior.idle_entered_at.or(fresh.idle_entered_at)`,
-//    TmuxApplied takes fresh's. `last_accessed_at` is monotonic-max
+//    `idle_entered_at`, `ever_confirmed_present`, or `unknown_since`.
+//    Those are handled per StatusSource: DiskOnly takes prior.status,
+//    `prior.idle_entered_at.or(fresh.idle_entered_at)`, and prior's
+//    Unknown-tracking pair verbatim (its `fresh` never went through
+//    `update_status_with_metadata`, so both fields are still at their
+//    zeroed defaults). TmuxApplied takes fresh's status and Unknown-tracking
+//    pair: the caller (`status_poll_loop`) already seeded `fresh` from the
+//    prior tick's tracking pair before running the tmux scrape and status
+//    decision, so `fresh` already holds this tick's authoritative values;
+//    restoring the pre-decision prior snapshot here would erase that
+//    decision every tick and re-freeze the Unknown->Error escalation window
+//    at zero elapsed time (#2865). `last_accessed_at` is monotonic-max
 //    regardless.
 // 4. The acp overlay filter is `inst.is_structured()`, never the lazy
 //    ACP session id. The latter is set lazily by the ACP handshake
@@ -2338,17 +2745,28 @@ pub(crate) async fn reload_state_instances_from_disk(
             let prior_status = prior.status;
             let prior_last_accessed = prior.last_accessed_at;
             let prior_idle_entered = prior.idle_entered_at;
+            let prior_ever_confirmed_present = prior.ever_confirmed_present;
+            let prior_unknown_since = prior.unknown_since;
             row = merge_runtime_fields(prior, row);
             match status_source {
                 StatusSource::DiskOnly => {
                     row.status = prior_status;
                     row.idle_entered_at = prior_idle_entered.or(row.idle_entered_at);
+                    // `row` here is a raw disk load (no tmux scrape ran), so
+                    // both `#[serde(skip)]` tracking fields are still at
+                    // their zeroed defaults; restore the prior tick's.
+                    row.ever_confirmed_present = prior_ever_confirmed_present;
+                    row.unknown_since = prior_unknown_since;
                 }
                 StatusSource::TmuxApplied => {
                     // Caller already applied tmux scrape to fresh.status;
                     // that is the authoritative value. idle_entered_at is
                     // recomputed by upstream status-transition logic;
-                    // trust fresh.
+                    // trust fresh. Likewise `ever_confirmed_present` /
+                    // `unknown_since`: the caller seeded them from the
+                    // prior tick before running the status decision, so
+                    // `row` already carries this tick's advanced values.
+                    // See #2865.
                 }
             }
             row.last_accessed_at = prior_last_accessed.max(row.last_accessed_at);
@@ -3287,12 +3705,110 @@ fn decide_passive_transition(
 #[derive(Default)]
 struct PassiveTransitionWrites {
     /// Keyed by instance id for O(1) lookup inside the persist closure.
-    /// [`crate::session::PassiveStatusPatch::from_instance`] keeps
-    /// `patch.id == inst.id`, so the map key and the value's `id` field
-    /// stay in sync by construction; the redundancy is intentional and
-    /// used by the closure's `.get(&inst.id)` at the flush site below.
+    /// The patch value carries no id of its own; the flush site reads the
+    /// map key (via `get_key_value`) and threads it into
+    /// [`crate::session::Instance::merge_passive_status_patch`].
     patches: std::collections::HashMap<String, crate::session::PassiveStatusPatch>,
     unread_ids: Vec<String>,
+}
+
+/// Flush one tick's per-profile passive-status writes: persist each bundle,
+/// then mirror its unread marks into the live `instances` slice ONLY for the
+/// bundles whose durable write returned `Ok`.
+///
+/// The ordering is load-bearing. `instances` is the vec that
+/// `reload_state_instances_from_disk` folds straight into `state.instances`,
+/// so a mark applied here is what makes the unread indicator visible this
+/// tick. Marking before the flock write landed stranded that mark on a failed
+/// persist: disk stayed unmarked, the next tick reloaded the unmarked row,
+/// and the `prev == inst.status` short-circuit blocked any re-mark, so a
+/// Running -> Idle transition whose write failed silently lost its unread
+/// indicator with no user-visible recovery path. Deferring the in-memory mark
+/// to a persisted `Ok` keeps memory and disk in lockstep: on failure neither
+/// is marked. See #2755 (follow-up to #2729).
+async fn flush_passive_transition_writes(
+    file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
+    instances: &mut [Instance],
+    bundles: std::collections::HashMap<String, PassiveTransitionWrites>,
+) {
+    for (
+        profile,
+        PassiveTransitionWrites {
+            patches,
+            unread_ids,
+        },
+    ) in bundles
+    {
+        // The closure moves `unread_ids`; keep a copy to mirror into the live
+        // vec once the write is durable.
+        let unread_ids_for_local = unread_ids.clone();
+        let patch_count = patches.len();
+        let unread_count = unread_ids.len();
+        let persisted = api::persist_session_update(
+            profile.clone(),
+            "passive-status",
+            file_watch.clone(),
+            move |insts| {
+                for inst in insts.iter_mut() {
+                    if let Some((id, patch)) = patches.get_key_value(&inst.id) {
+                        inst.merge_passive_status_patch(id, patch);
+                    }
+                    if unread_ids.contains(&inst.id) {
+                        inst.mark_unread();
+                    }
+                }
+            },
+        )
+        .await;
+        // Per-tick roll-up of the passive-status batch this flush persisted.
+        // `merge_passive_status_patch` only logs when it drops a stale
+        // `last_accessed_at`, so without this there is no per-tick anchor for
+        // "why did N rows change on this tick". `ok` reports the durable
+        // write's outcome; on a failure the counts are what was attempted, not
+        // what landed, and the unread mirror below is skipped. See #2760.
+        tracing::debug!(
+            target: "session.store",
+            profile = %profile,
+            patches = patch_count,
+            unread = unread_count,
+            ok = persisted.is_ok(),
+            "persisted passive-status batch"
+        );
+        if persisted.is_ok() {
+            for inst in instances.iter_mut() {
+                if unread_ids_for_local.contains(&inst.id) {
+                    inst.mark_unread();
+                }
+            }
+        }
+    }
+}
+
+/// Drop entries whose session id is no longer live from the persistent
+/// per-session reconciler maps the status loop owns. Without this sweep a
+/// long-uptime daemon accumulates one entry per ever-observed instance id in
+/// each map, so the footprint grows with lifetime-observed sessions rather than
+/// with the live-session count (#2758).
+///
+/// The reconciler also retains these maps, but against its resume-eligible
+/// subset (structured, not archived / snoozed / trashed / idle-dormant) and
+/// only when the tmux scrape succeeds and the reconciler runs. This sweep runs
+/// at the top of every tick against the full live-instance set, so deletion GC
+/// is guaranteed even on a tick whose scrape fails, and entries for a session
+/// that is merely paused (archived / snoozed / idle-dormant) are not needed to
+/// be re-derived here.
+#[cfg(feature = "serve")]
+fn gc_reconciler_session_maps(
+    live_ids: &std::collections::HashSet<&str>,
+    attempted: &mut std::collections::HashSet<String>,
+    respawn_history: &mut std::collections::HashMap<String, Vec<std::time::Instant>>,
+    parked: &mut std::collections::HashSet<String>,
+    capacity_deferred: &mut std::collections::HashSet<String>,
+) {
+    attempted.retain(|id| live_ids.contains(id.as_str()));
+    respawn_history.retain(|id, _| live_ids.contains(id.as_str()));
+    parked.retain(|id| live_ids.contains(id.as_str()));
+    capacity_deferred.retain(|id| live_ids.contains(id.as_str()));
 }
 
 /// Background task that periodically refreshes session statuses. On each
@@ -3326,12 +3842,55 @@ async fn status_poll_loop(state: Arc<AppState>) {
         std::collections::HashMap::new();
     #[cfg(feature = "serve")]
     let mut acp_parked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Per-session capacity-deferred marker (#1027). A structured session
+    // refused by `CapacityFull` is re-armed for retry every tick; this set
+    // gates the capacity banner to publish once per transition and is cleared
+    // once the session's worker comes online or leaves the live set.
+    #[cfg(feature = "serve")]
+    let mut acp_capacity_deferred: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     loop {
         interval.tick().await;
 
         let prev: std::collections::HashMap<String, crate::session::Status> = {
             let instances = state.instances.read().await;
             instances.iter().map(|i| (i.id.clone(), i.status)).collect()
+        };
+
+        // GC the reconciler's persistent per-session maps against the live
+        // instance set (keyed by `prev`, the full snapshot above) so a
+        // long-uptime daemon's footprint stays bounded by live-session count,
+        // not by lifetime-observed sessions (#2758). Above the scrape guard so
+        // the sweep still runs on a tick whose tmux scrape fails.
+        #[cfg(feature = "serve")]
+        {
+            let live_ids: std::collections::HashSet<&str> =
+                prev.keys().map(String::as_str).collect();
+            gc_reconciler_session_maps(
+                &live_ids,
+                &mut attempted_acp_spawns,
+                &mut acp_respawn_history,
+                &mut acp_parked,
+                &mut acp_capacity_deferred,
+            );
+        }
+        // Snapshot of the prior tick's Unknown-escalation tracking fields,
+        // taken from the same in-memory `state.instances` this tick's
+        // `load_all_instances()` call is about to reset to defaults. Fed to
+        // `seed_unknown_tracking` below, before `update_status_with_metadata`
+        // runs, so the escalation window in
+        // `update_status_with_metadata_inner` can actually accumulate
+        // elapsed time across ticks instead of restarting at zero every
+        // 2s (#2865).
+        let prev_unknown_tracking: std::collections::HashMap<
+            String,
+            (bool, Option<std::time::Instant>),
+        > = {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .map(|i| (i.id.clone(), (i.ever_confirmed_present, i.unknown_since)))
+                .collect()
         };
 
         // Snapshot suppression BEFORE `batch_pane_metadata()` so a worker
@@ -3353,6 +3912,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
         let prev_for_poll = prev.clone();
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
+            seed_unknown_tracking(&mut instances, &prev_unknown_tracking);
             crate::tmux::refresh_session_cache();
             let pane_metadata = crate::tmux::batch_pane_metadata().unwrap_or_default();
             for inst in &mut instances {
@@ -3384,7 +3944,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
             // #2690.
             let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
                 std::collections::HashMap::new();
-            for inst in &mut instances {
+            for inst in &instances {
                 let Some(old) = prev.get(&inst.id) else {
                     continue;
                 };
@@ -3404,43 +3964,18 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 }
                 let bundle = bundles.entry(inst.source_profile.clone()).or_default();
                 if let Some(patch) = decision.patch {
-                    bundle.patches.insert(patch.id.clone(), patch);
+                    bundle.patches.insert(inst.id.clone(), patch);
                 }
                 if decision.mark_unread {
-                    inst.mark_unread();
+                    // Record the id only; the in-memory mark on `instances`
+                    // is deferred to `flush_passive_transition_writes` so it
+                    // fires only after the durable write returns Ok. See
+                    // #2755.
                     bundle.unread_ids.push(inst.id.clone());
                 }
             }
-            for (
-                profile,
-                PassiveTransitionWrites {
-                    patches,
-                    unread_ids,
-                },
-            ) in bundles
-            {
-                let _ = api::persist_session_update(
-                    profile,
-                    "passive-status",
-                    state.file_watch.clone(),
-                    move |insts| {
-                        for inst in insts.iter_mut() {
-                            if let Some(patch) = patches.get(&inst.id) {
-                                debug_assert_eq!(
-                                    patch.id, inst.id,
-                                    "PassiveStatusPatch::from_instance keeps `patch.id == inst.id`; \
-                                     if this fires, the map key or the patch's `id` field has drifted"
-                                );
-                                inst.merge_passive_status_patch(patch);
-                            }
-                            if unread_ids.contains(&inst.id) {
-                                inst.mark_unread();
-                            }
-                        }
-                    },
-                )
+            flush_passive_transition_writes(state.file_watch.clone(), &mut instances, bundles)
                 .await;
-            }
 
             reload_state_instances_from_disk(
                 &state,
@@ -3450,51 +3985,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
             )
             .await;
 
-            // Drain poller observations into sessions.json so daemon-only
-            // sessions (no attached TUI) persist post-`/clear` sids (#2291).
-            // Snapshot + spawn_blocking + reapply, never holding AppState
-            // across the flock or tmux exec, per storage.rs:46.
-            let snapshot = state.instances.read().await.clone();
-            let drain_state = state.clone();
-            match tokio::task::spawn_blocking(move || {
-                let mut snapshot = snapshot;
-                let outcome = crate::session::sync::drain_and_persist_session_ids(
-                    &mut snapshot,
-                    &drain_state.file_watch,
-                );
-                (outcome, snapshot)
-            })
-            .await
-            {
-                Ok((outcome, mutated)) if outcome.touched() => {
-                    // Reapply only for ids the helper actually touched, so a
-                    // peer that wrote `agent_session_id` (e.g. the restart-
-                    // completion path) on the live state during the
-                    // spawn_blocking window is not silently reverted.
-                    let touched: std::collections::HashSet<&str> = outcome
-                        .applied
-                        .iter()
-                        .chain(outcome.rolled_back.iter())
-                        .map(String::as_str)
-                        .collect();
-                    if !touched.is_empty() {
-                        let mut guard = state.instances.write().await;
-                        for src in mutated.iter().filter(|i| touched.contains(i.id.as_str())) {
-                            if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
-                                dst.agent_session_id = src.agent_session_id.clone();
-                                dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
-                            }
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::error!(
-                        target: "session.sync",
-                        "drain_and_persist task failed: {e}",
-                    );
-                }
-            }
+            drain_session_id_updates_in_state(&state).await;
 
             #[cfg(feature = "serve")]
             acp_reconciler::reconcile_acp_workers(
@@ -3504,6 +3995,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 &mut last_rate_limit_reap,
                 &mut acp_respawn_history,
                 &mut acp_parked,
+                &mut acp_capacity_deferred,
             )
             .await;
 
@@ -4116,6 +4608,33 @@ async fn acp_event_listener(state: Arc<AppState>) {
             }
         };
 
+        // Imported history is persisted and broadcast for rendering, but it is
+        // not live work. Suppress status and notification side effects until
+        // the explicit replay boundary lands. Errors and session assignment
+        // still pass so a failed import surfaces and a successful one clears
+        // `import_pending`.
+        let suppress_import_side_effects = {
+            let instances = state.instances.read().await;
+            instances
+                .iter()
+                .find(|instance| instance.id == frame.session_id)
+                .is_some_and(|instance| {
+                    suppress_import_replay_side_effects(
+                        instance.import_pending == Some(true),
+                        frame.event.as_ref(),
+                    )
+                })
+        };
+        if suppress_import_side_effects {
+            tracing::trace!(
+                target: "acp.event_listener",
+                session = %frame.session_id,
+                seq = frame.seq,
+                "suppressing live side effects for imported history"
+            );
+            continue;
+        }
+
         // Detect wake-fire: a `UserPromptSent` arriving at-or-after a
         // `WakeupScheduled`'s `at` timestamp means the agent's pending
         // wake just fired. Push opt-in to the user's phone so /loop
@@ -4304,15 +4823,27 @@ async fn acp_event_listener(state: Arc<AppState>) {
             )
         };
         if should_rename {
-            if let Some(first_message) = state.acp_event_store.first_user_prompt(&frame.session_id)
+            if let Some((first_user_prompt, agent_prose)) =
+                state.acp_event_store.first_turn_context(
+                    &frame.session_id,
+                    crate::session::smart_rename::FIRST_TURN_AGENT_BYTES,
+                )
             {
                 let state_for_rename = state.clone();
                 let session_id = frame.session_id.clone();
+                let context = crate::session::smart_rename::render_first_turn(
+                    &first_user_prompt,
+                    &agent_prose,
+                );
                 tokio::spawn(async move {
                     crate::session::smart_rename::try_smart_rename(
                         state_for_rename,
                         session_id,
-                        first_message,
+                        crate::session::smart_rename::SmartRenameInput {
+                            first_user_prompt,
+                            context,
+                        },
+                        crate::session::smart_rename::RenameTrigger::TurnEnd,
                     )
                     .await;
                 });
@@ -4327,9 +4858,41 @@ async fn acp_event_listener(state: Arc<AppState>) {
                 tracing::debug!(
                     target: "smart_rename",
                     session = %frame.session_id,
-                    "trigger fired but event store has no first_user_prompt; skipping"
+                    "trigger fired but event store has no first-turn context; skipping"
                 );
             }
+        }
+
+        // Conversation-summary defer: same clean-turn-boundary discipline as
+        // smart-rename. Fast-path on the event variant before the inflight
+        // lock so streaming frames skip it; the spawned task re-checks the
+        // setting, eligibility, and the byte/turn delta threshold (all of
+        // which need config + the event store). See #2808.
+        let should_summarize = matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::Stopped { .. }
+        ) && {
+            let inflight = state
+                .summary_inflight
+                .lock()
+                .expect("summary_inflight poisoned");
+            crate::session::conversation_summary::should_trigger_summary(
+                frame.event.as_ref(),
+                &frame.session_id,
+                &inflight,
+            )
+        };
+        if should_summarize {
+            let state_for_summary = state.clone();
+            let session_id = frame.session_id.clone();
+            tokio::spawn(async move {
+                crate::session::conversation_summary::try_conversation_summary(
+                    state_for_summary,
+                    session_id,
+                    crate::session::conversation_summary::SummaryTrigger::Auto,
+                )
+                .await;
+            });
         }
 
         let status_intent = derive_acp_status(frame.event.as_ref());
@@ -4678,6 +5241,67 @@ pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusInten
     }
 }
 
+#[cfg(feature = "serve")]
+fn suppress_import_replay_side_effects(import_pending: bool, event: &crate::acp::Event) -> bool {
+    use crate::acp::Event;
+    import_pending
+        && !matches!(
+            event,
+            Event::Stopped { reason } if reason == "history_replay_complete"
+        )
+        && !matches!(
+            event,
+            Event::AcpSessionAssigned { .. }
+                | Event::AgentStartupError { .. }
+                | Event::IncompatibleAgent { .. }
+                | Event::SessionContextReset { .. }
+        )
+}
+
+async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
+    // Drain poller observations into sessions.json so daemon-only sessions
+    // persist post-`/clear` sids (#2291). Snapshot + spawn_blocking + reapply,
+    // never holding AppState across the flock or tmux exec, per storage.rs:46.
+    let snapshot = state.instances.read().await.clone();
+    let file_watch = state.file_watch.clone();
+    match tokio::task::spawn_blocking(move || {
+        let mut snapshot = snapshot;
+        let outcome =
+            crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &file_watch);
+        (outcome, snapshot)
+    })
+    .await
+    {
+        Ok((outcome, mutated)) if outcome.touched() => {
+            // Reapply only for ids the helper actually touched, so a peer that
+            // wrote `agent_session_id` on the live state during spawn_blocking
+            // is not silently reverted.
+            let touched: std::collections::HashSet<&str> = outcome
+                .applied
+                .iter()
+                .chain(outcome.rolled_back.iter())
+                .map(String::as_str)
+                .collect();
+            if !touched.is_empty() {
+                let mut guard = state.instances.write().await;
+                for src in mutated.iter().filter(|i| touched.contains(i.id.as_str())) {
+                    if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
+                        dst.agent_session_id = src.agent_session_id.clone();
+                        dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+                    }
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::error!(
+                target: "session.sync",
+                "drain_and_persist task failed: {e}",
+            );
+        }
+    }
+}
+
 /// Test-only constructors that integration tests in `tests/` need to drive
 /// `reload_state_instances_from_disk` and the dynamic-profile-rewire helpers
 /// without going through the full daemon. Mirrors the pattern at
@@ -4696,6 +5320,18 @@ pub mod test_support {
     /// `recently_restarted`, and the file-watch trio are real. Acp
     /// fields are stubbed because the helper's acp overlay reads them.
     pub fn build_test_app_state(prior: Vec<Instance>) -> Arc<AppState> {
+        build_test_app_state_with_policy(prior, Vec::new(), Vec::new(), None)
+    }
+
+    /// Like [`build_test_app_state`] but seeds the DNS-rebinding allowlist and,
+    /// optionally, a real auth token so tests can exercise `access_policy` and
+    /// the router layering, including the before-auth ordering (#2735).
+    pub fn build_test_app_state_with_policy(
+        prior: Vec<Instance>,
+        allowed_hosts: Vec<String>,
+        allowed_origins: Vec<String>,
+        token: Option<String>,
+    ) -> Arc<AppState> {
         let app_dir = tempfile::tempdir().expect("tempdir");
         let acp_db = app_dir.path().join("acp_events.db");
         let event_store =
@@ -4711,17 +5347,23 @@ pub mod test_support {
             profile: "test".to_string(),
             read_only: false,
             instances: RwLock::new(prior),
-            token_manager: Arc::new(TokenManager::new(None, Duration::from_secs(3600))),
+            token_manager: Arc::new(TokenManager::new(token, Duration::from_secs(3600))),
             login_manager: Arc::new(login::LoginManager::new(None)),
             rate_limiter: Arc::new(RateLimiter::new()),
             behind_tunnel: false,
             auth_mode: "none",
             serve_mode: "local",
+            allowed_hosts,
+            allowed_origins,
             instance_locks: RwLock::new(HashMap::new()),
             smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
             smart_rename_semaphore: tokio::sync::Semaphore::new(
                 crate::session::smart_rename::MAX_CONCURRENT,
+            ),
+            summary_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            summary_semaphore: tokio::sync::Semaphore::new(
+                crate::session::conversation_summary::MAX_CONCURRENT,
             ),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
@@ -4754,8 +5396,39 @@ pub mod test_support {
         })
     }
 
+    pub async fn drain_session_id_updates_for_test(state: &Arc<AppState>) {
+        super::drain_session_id_updates_in_state(state).await;
+    }
+
+    pub fn attach_session_id_update_for_test(inst: &mut Instance, sid: &str) {
+        let poller = crate::session::poller::SessionPoller::new(format!("test-tmux-{}", inst.id));
+        poller.inject_test_update(&inst.id, sid);
+        inst.session_id_poller = Some(Arc::new(std::sync::Mutex::new(poller)));
+    }
+
+    pub fn seed_instances_on_disk_for_test(profile: &str, insts: Vec<Instance>) {
+        let storage = Storage::new_unwatched(profile).expect("storage");
+        storage
+            .update(move |instances, _groups| {
+                *instances = insts;
+                Ok(())
+            })
+            .expect("seed sessions.json");
+    }
+
+    pub fn load_instances_from_disk_for_test(profile: &str) -> Vec<Instance> {
+        Storage::new_unwatched(profile)
+            .expect("storage")
+            .load()
+            .expect("load sessions.json")
+    }
+
     pub async fn has_disk_watch_handle(state: &Arc<AppState>, profile: &str) -> bool {
         state.disk_watch_handles.lock().await.contains_key(profile)
+    }
+
+    pub fn build_router_for_test(state: Arc<AppState>) -> axum::Router {
+        super::build_router(state)
     }
 
     pub async fn disk_watch_handle_count(state: &Arc<AppState>) -> usize {
@@ -4825,6 +5498,712 @@ pub mod test_support {
 mod tests {
     use super::*;
 
+    fn vecs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn strip_host_port_variants() {
+        assert_eq!(strip_host_port("localhost:8080"), "localhost");
+        assert_eq!(strip_host_port("localhost"), "localhost");
+        assert_eq!(strip_host_port("127.0.0.1:8080"), "127.0.0.1");
+        assert_eq!(strip_host_port("[::1]:8080"), "::1");
+        assert_eq!(strip_host_port("[::1]"), "::1");
+        assert_eq!(strip_host_port("::1"), "::1");
+        assert_eq!(strip_host_port("example.com"), "example.com");
+    }
+
+    #[test]
+    fn host_from_url_extracts_bare_host() {
+        assert_eq!(
+            host_from_url("https://x.trycloudflare.com").as_deref(),
+            Some("x.trycloudflare.com")
+        );
+        assert_eq!(
+            host_from_url("https://foo.ts.net/path?x=1").as_deref(),
+            Some("foo.ts.net")
+        );
+        assert_eq!(
+            host_from_url("https://Foo.TS.net").as_deref(),
+            Some("foo.ts.net")
+        );
+        assert_eq!(host_from_url(""), None);
+    }
+
+    #[test]
+    fn host_in_allowlist_passes() {
+        assert_eq!(
+            evaluate_access(Some("localhost"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn host_not_in_allowlist_403() {
+        assert_eq!(
+            evaluate_access(Some("evil.com"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::DenyHost
+        );
+    }
+
+    #[test]
+    fn host_port_stripped_before_match() {
+        assert_eq!(
+            evaluate_access(Some("localhost:8080"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn host_ipv6_bracketed_port_stripped() {
+        assert_eq!(
+            evaluate_access(Some("[::1]:8080"), None, &vecs(&["::1"]), &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn host_match_is_case_insensitive() {
+        assert_eq!(
+            evaluate_access(Some("LOCALHOST"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn missing_host_denied() {
+        assert_eq!(
+            evaluate_access(None, None, &vecs(&["localhost"]), &[]),
+            AccessDecision::DenyMissingHost
+        );
+    }
+
+    #[test]
+    fn origin_absent_is_exempt() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                None,
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn origin_in_allowlist_passes() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("http://localhost:8080"),
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn origin_not_in_allowlist_403() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("https://evil.com"),
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::DenyOrigin
+        );
+    }
+
+    #[test]
+    fn origin_match_is_case_insensitive() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("https://X.TryCloudflare.com"),
+                &vecs(&["localhost"]),
+                &vecs(&["https://x.trycloudflare.com"])
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn null_origin_is_denied() {
+        assert_eq!(
+            evaluate_access(
+                Some("localhost"),
+                Some("null"),
+                &vecs(&["localhost"]),
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::DenyOrigin
+        );
+    }
+
+    #[test]
+    fn userinfo_host_is_denied() {
+        assert_eq!(
+            evaluate_access(Some("user@localhost"), None, &vecs(&["localhost"]), &[]),
+            AccessDecision::DenyHost
+        );
+    }
+
+    #[test]
+    fn wildcard_bind_defaults_to_localhost_trio() {
+        let (h, _o) = resolve_access_policy("0.0.0.0", 8080, &[], &[], None);
+        // The static allowlist is still just the trio; a wildcard bind adds no
+        // routable *name*. A HOSTNAME is still denied without --allowed-host.
+        assert_eq!(h, vecs(&["localhost", "127.0.0.1", "::1"]));
+        assert_eq!(
+            evaluate_access(Some("my-box.local"), None, &h, &[]),
+            AccessDecision::DenyHost
+        );
+        // But a LAN IP literal is trusted unconditionally (Pattern A: an IP
+        // cannot be DNS-rebound), so by-IP access works with no flag.
+        assert_eq!(
+            evaluate_access(Some("192.168.1.5"), None, &h, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn is_trusted_ip_literal_accepts_routable_rejects_special() {
+        for good in [
+            "127.0.0.1",
+            "192.168.1.5",
+            "10.0.0.9",
+            "100.68.123.45", // tailnet CGNAT
+            "::1",
+            "2001:db8::1",
+            "fd00::1",            // ULA
+            "::ffff:192.168.1.5", // IPv4-mapped routable: canonicalized, then trusted
+        ] {
+            assert!(is_trusted_ip_literal(good), "{good} should be trusted");
+        }
+        for bad in [
+            "0.0.0.0",
+            "::",
+            "169.254.169.254", // cloud metadata (v4 link-local)
+            "fe80::1",         // v6 link-local
+            "224.0.0.1",       // multicast
+            "ff02::1",
+            "::ffff:169.254.169.254", // IPv4-mapped metadata: canonicalized, then excluded
+            "::ffff:0.0.0.0",         // IPv4-mapped unspecified
+            "::ffff:224.0.0.1",       // IPv4-mapped multicast
+            "example.com",
+            "my-box",
+            "",
+        ] {
+            assert!(!is_trusted_ip_literal(bad), "{bad} must not be trusted");
+        }
+    }
+
+    #[test]
+    fn is_untrusted_ip_literal_flags_only_excluded_literals() {
+        for excluded in [
+            "0.0.0.0",
+            "::",
+            "169.254.169.254",
+            "fe80::1",
+            "224.0.0.1",
+            "ff02::1",
+            "::ffff:169.254.169.254",
+        ] {
+            assert!(
+                is_untrusted_ip_literal(excluded),
+                "{excluded} is an IP literal the gate excludes"
+            );
+        }
+        // Routable/loopback literals pass, and hostnames are not IP literals at
+        // all, so both must clear the validators.
+        for allowed in [
+            "127.0.0.1",
+            "::1",
+            "192.168.1.5",
+            "100.68.123.45",
+            "2001:db8::1",
+            "aoe.example.com",
+            "my-box",
+            "",
+        ] {
+            assert!(
+                !is_untrusted_ip_literal(allowed),
+                "{allowed} must not be flagged as an untrusted IP literal"
+            );
+        }
+    }
+
+    #[test]
+    fn ip_literal_host_allowed_without_flag() {
+        let allow = vecs(&["localhost"]);
+        assert_eq!(
+            evaluate_access(Some("192.168.1.5:8080"), None, &allow, &[]),
+            AccessDecision::Allow
+        );
+        assert_eq!(
+            evaluate_access(Some("[2001:db8::5]:8080"), None, &allow, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn ip_literal_origin_allowed_without_flag() {
+        let allow = vecs(&["localhost"]);
+        assert_eq!(
+            evaluate_access(
+                Some("192.168.1.5:8080"),
+                Some("http://192.168.1.5:8080"),
+                &allow,
+                &[]
+            ),
+            AccessDecision::Allow
+        );
+        assert_eq!(
+            evaluate_access(
+                Some("[2001:db8::5]:8080"),
+                Some("http://[2001:db8::5]:8080"),
+                &allow,
+                &[]
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn excluded_ip_literals_still_denied() {
+        let allow = vecs(&["localhost"]);
+        for bad in ["0.0.0.0", "169.254.169.254", "fe80::1"] {
+            assert_eq!(
+                evaluate_access(Some(bad), None, &allow, &[]),
+                AccessDecision::DenyHost,
+                "{bad}"
+            );
+        }
+        // An unlisted hostname origin must not slip through the IP exemption.
+        assert_eq!(
+            evaluate_access(
+                Some("192.168.1.5"),
+                Some("https://evil.com"),
+                &allow,
+                &vecs(&["http://localhost:8080"])
+            ),
+            AccessDecision::DenyOrigin
+        );
+    }
+
+    #[test]
+    fn concrete_bind_host_is_allowed() {
+        let (h, o) = resolve_access_policy("192.168.1.5", 8080, &[], &[], None);
+        assert!(h.contains(&"192.168.1.5".to_string()));
+        assert!(o.contains(&"http://192.168.1.5:8080".to_string()));
+    }
+
+    #[test]
+    fn explicit_host_flag_extends_allowlist() {
+        let (h, o) = resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com"]), &[], None);
+        assert!(h.contains(&"aoe.example.com".to_string()));
+        assert!(o.contains(&"https://aoe.example.com".to_string()));
+        assert!(o.contains(&"https://aoe.example.com:8080".to_string()));
+    }
+
+    #[test]
+    fn remote_tunnel_host_auto_injected() {
+        let (h, _o) =
+            resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("x.trycloudflare.com"));
+        assert!(h.contains(&"x.trycloudflare.com".to_string()));
+        assert_eq!(
+            evaluate_access(Some("x.trycloudflare.com"), None, &h, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn tunnel_origin_auto_injected() {
+        let (h, o) =
+            resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("x.trycloudflare.com"));
+        assert!(o.contains(&"https://x.trycloudflare.com".to_string()));
+        assert_eq!(
+            evaluate_access(
+                Some("x.trycloudflare.com"),
+                Some("https://x.trycloudflare.com"),
+                &h,
+                &o
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn tailscale_host_auto_injected() {
+        let (h, o) =
+            resolve_access_policy("127.0.0.1", 8080, &[], &[], Some("host.tailnet.ts.net"));
+        assert!(h.contains(&"host.tailnet.ts.net".to_string()));
+        assert!(o.contains(&"https://host.tailnet.ts.net".to_string()));
+    }
+
+    #[test]
+    fn explicit_origin_flag_normalized() {
+        let (_h, o) = resolve_access_policy(
+            "127.0.0.1",
+            8080,
+            &[],
+            &vecs(&[
+                "https://aoe.example.com:8443",
+                "https://trail.example.com/",
+                "https://std.example.com:443",
+            ]),
+            None,
+        );
+        assert!(o.contains(&"https://aoe.example.com:8443".to_string()));
+        assert!(o.contains(&"https://trail.example.com".to_string()));
+        assert!(!o.contains(&"https://trail.example.com/".to_string()));
+        assert!(o.contains(&"https://std.example.com".to_string()));
+    }
+
+    #[test]
+    fn norm_origin_canonicalizes_to_browser_form() {
+        assert_eq!(norm_origin("https://x/"), "https://x");
+        assert_eq!(norm_origin("https://x:443"), "https://x");
+        assert_eq!(norm_origin("http://x:80"), "http://x");
+        assert_eq!(norm_origin("https://x:8443"), "https://x:8443");
+        assert_eq!(norm_origin("http://x:443"), "http://x:443");
+        assert_eq!(norm_origin("HTTPS://X"), "https://x");
+        assert_eq!(norm_origin("https://[::1]:443"), "https://[::1]");
+    }
+
+    #[test]
+    fn norm_origin_strips_trailing_fqdn_dot() {
+        assert_eq!(norm_origin("https://example.com."), "https://example.com");
+        assert_eq!(
+            norm_origin("https://example.com.:443"),
+            "https://example.com"
+        );
+        assert_eq!(norm_origin("http://example.com.:80"), "http://example.com");
+        assert_eq!(
+            norm_origin("https://example.com.:8443"),
+            "https://example.com:8443"
+        );
+        // Symmetric with the Host gate.
+        assert_eq!(
+            norm_origin("https://example.com."),
+            format!("https://{}", norm_host("example.com."))
+        );
+    }
+
+    #[test]
+    fn origin_default_port_matches_portless_allowlist() {
+        let (_h, o) =
+            resolve_access_policy("127.0.0.1", 8080, &vecs(&["proxy.example.com"]), &[], None);
+        assert_eq!(
+            evaluate_access(
+                Some("proxy.example.com"),
+                Some("https://proxy.example.com:443"),
+                &vecs(&["proxy.example.com"]),
+                &o
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn norm_host_strips_trailing_dot() {
+        assert_eq!(norm_host("example.com."), "example.com");
+        assert_eq!(norm_host("example.com.:8080"), "example.com");
+        assert_eq!(norm_host("[::1]:8080"), "::1");
+    }
+
+    #[test]
+    fn trailing_dot_host_matches_allowlist() {
+        let (h, _o) =
+            resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com."]), &[], None);
+        assert!(h.contains(&"aoe.example.com".to_string()));
+        assert_eq!(
+            evaluate_access(Some("aoe.example.com."), None, &h, &[]),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn trailing_dot_origin_matches_allowlist() {
+        let (h, o) = resolve_access_policy("0.0.0.0", 8080, &vecs(&["aoe.example.com"]), &[], None);
+        assert_eq!(
+            evaluate_access(
+                Some("aoe.example.com."),
+                Some("https://aoe.example.com."),
+                &h,
+                &o
+            ),
+            AccessDecision::Allow
+        );
+    }
+
+    #[test]
+    fn wildcard_bind_ipv6_forms_default_to_trio() {
+        for wild in ["::", "[::]"] {
+            let (h, _o) = resolve_access_policy(wild, 8080, &[], &[], None);
+            assert_eq!(
+                h,
+                vecs(&["localhost", "127.0.0.1", "::1"]),
+                "wildcard {wild}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn access_policy_rejects_unlisted_host_at_router() {
+        use tower::ServiceExt;
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            vecs(&["http://localhost:8080"]),
+            None,
+        );
+        let app = test_support::build_router_for_test(state);
+        let req = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn access_policy_runs_before_auth() {
+        use tower::ServiceExt;
+        let remote: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
+        let make_state = || {
+            test_support::build_test_app_state_with_policy(
+                Vec::new(),
+                vecs(&["localhost"]),
+                vecs(&["http://localhost:8080"]),
+                Some("secret-token".to_string()),
+            )
+        };
+
+        let app = test_support::build_router_for_test(make_state());
+        let mut bad = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        bad.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(bad).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::FORBIDDEN,
+            "an unlisted Host must 403 before auth can 401"
+        );
+
+        let app = test_support::build_router_for_test(make_state());
+        let mut good = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        good.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(good).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "a listed Host passes the gate and reaches auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_body_is_generic_for_host_and_origin() {
+        use tower::ServiceExt;
+        async fn body_of(resp: axum::response::Response) -> String {
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            String::from_utf8(bytes.to_vec()).unwrap()
+        }
+        let make_state = || {
+            test_support::build_test_app_state_with_policy(
+                Vec::new(),
+                vecs(&["localhost"]),
+                vecs(&["http://localhost:8080"]),
+                None,
+            )
+        };
+
+        let app = test_support::build_router_for_test(make_state());
+        let host_deny = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let host_body = body_of(app.oneshot(host_deny).await.unwrap()).await;
+
+        let app = test_support::build_router_for_test(make_state());
+        let origin_deny = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("origin", "https://evil.com")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let origin_body = body_of(app.oneshot(origin_deny).await.unwrap()).await;
+
+        assert_eq!(host_body, "forbidden: host or origin not allowed");
+        assert_eq!(
+            host_body, origin_body,
+            "both deny reasons must return an identical, non-leaking body"
+        );
+    }
+
+    #[tokio::test]
+    async fn listed_origin_passes_gate_to_auth() {
+        use tower::ServiceExt;
+        let remote: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            vecs(&["http://localhost:8080"]),
+            Some("secret-token".to_string()),
+        );
+        let app = test_support::build_router_for_test(state);
+        let mut req = axum::http::Request::builder()
+            .uri("/api/sessions")
+            .header("host", "localhost")
+            .header("origin", "http://localhost:8080")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "a listed Origin must pass the gate and reach auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_policy_authority_fallback_allows_listed() {
+        use tower::ServiceExt;
+        let remote: std::net::SocketAddr = "203.0.113.7:5555".parse().unwrap();
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["x.trycloudflare.com"]),
+            Vec::new(),
+            Some("secret-token".to_string()),
+        );
+        let app = test_support::build_router_for_test(state);
+        // Absolute-form URI + no Host header: access_policy falls back to
+        // request.uri().authority() (the HTTP/2 :authority path).
+        let mut req = axum::http::Request::builder()
+            .uri("http://x.trycloudflare.com/api/sessions")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(req.headers().get(axum::http::header::HOST).is_none());
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(remote));
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::UNAUTHORIZED,
+            "an :authority in the allowlist passes the gate and reaches auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn access_policy_authority_fallback_rejects_unlisted() {
+        use tower::ServiceExt;
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            Vec::new(),
+            None,
+        );
+        let app = test_support::build_router_for_test(state);
+        let req = axum::http::Request::builder()
+            .uri("http://evil.trycloudflare.com/api/sessions")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// #2758: the reconciler's persistent per-session maps must be swept
+    /// against the live instance set every tick, so a deleted session's id
+    /// does not linger and grow the daemon's footprint over its uptime.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn gc_reconciler_session_maps_drops_deleted_session_ids() {
+        use std::collections::{HashMap, HashSet};
+        use std::time::Instant;
+
+        let mut attempted: HashSet<String> = HashSet::new();
+        let mut respawn_history: HashMap<String, Vec<Instant>> = HashMap::new();
+        let mut parked: HashSet<String> = HashSet::new();
+        let mut capacity_deferred: HashSet<String> = HashSet::new();
+
+        // A session that has been spawn-attempted, parked (crash-loop), has
+        // respawn history, and is capacity-deferred.
+        let doomed = "sess-deleted".to_string();
+        let kept = "sess-live".to_string();
+        for id in [&doomed, &kept] {
+            attempted.insert(id.clone());
+            respawn_history.insert(id.clone(), vec![Instant::now()]);
+            parked.insert(id.clone());
+            capacity_deferred.insert(id.clone());
+        }
+
+        // Tick with both sessions live: nothing is swept.
+        let mut live: HashSet<&str> = HashSet::new();
+        live.insert(doomed.as_str());
+        live.insert(kept.as_str());
+        gc_reconciler_session_maps(
+            &live,
+            &mut attempted,
+            &mut respawn_history,
+            &mut parked,
+            &mut capacity_deferred,
+        );
+        assert!(attempted.contains(&doomed) && attempted.contains(&kept));
+        assert!(parked.contains(&doomed) && parked.contains(&kept));
+
+        // Delete the session (drops out of the live set), then tick: every
+        // map must forget it while the surviving session's entries remain.
+        live.remove(doomed.as_str());
+        gc_reconciler_session_maps(
+            &live,
+            &mut attempted,
+            &mut respawn_history,
+            &mut parked,
+            &mut capacity_deferred,
+        );
+
+        assert!(
+            !attempted.contains(&doomed),
+            "attempted must forget the deleted session id"
+        );
+        assert!(
+            !respawn_history.contains_key(&doomed),
+            "respawn_history must forget the deleted session id"
+        );
+        assert!(
+            !parked.contains(&doomed),
+            "parked must forget the deleted session id"
+        );
+        assert!(
+            !capacity_deferred.contains(&doomed),
+            "capacity_deferred must forget the deleted session id"
+        );
+
+        // The still-live session is untouched.
+        assert!(attempted.contains(&kept));
+        assert!(respawn_history.contains_key(&kept));
+        assert!(parked.contains(&kept));
+        assert!(capacity_deferred.contains(&kept));
+    }
+
     #[test]
     fn decide_passive_transition_skips_patch_for_structured_session() {
         // Locks the CI regression from #2697: structured/ACP sessions
@@ -4853,7 +6232,6 @@ mod tests {
         let decision = decide_passive_transition(&inst, Status::Running, false);
 
         let patch = decision.patch.expect("plain tmux session must get a patch");
-        assert_eq!(patch.id, inst.id);
         assert_eq!(patch.status, Status::Idle);
         assert_eq!(patch.idle_entered_at, inst.idle_entered_at);
         assert_eq!(patch.last_accessed_at, inst.last_accessed_at);
@@ -4898,6 +6276,112 @@ mod tests {
         );
     }
 
+    // #2755 (follow-up to #2729): the poller must not strand an in-memory
+    // unread mark on a persist that never landed. `flush_passive_transition_writes`
+    // applies the mark to the live vec only after `persist_session_update`
+    // returns Ok; on failure the row stays unmarked so memory and disk agree,
+    // rather than showing a phantom unread that the next reload silently drops.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flush_passive_transition_defers_unread_until_persist_ok() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let profile = "flush-persist-failure";
+        // Force the flock write to fail: making `sessions.json` a directory
+        // makes the store's read-modify-write error out during `update`.
+        let dir = crate::session::get_profile_dir(profile).expect("profile dir");
+        std::fs::create_dir_all(dir.join("sessions.json")).expect("sessions.json dir");
+
+        let mut inst = Instance::new("idle-session", "/tmp/idle");
+        inst.source_profile = profile.to_string();
+        let id = inst.id.clone();
+        let mut instances = vec![inst];
+
+        let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
+            std::collections::HashMap::new();
+        bundles
+            .entry(profile.to_string())
+            .or_default()
+            .unread_ids
+            .push(id.clone());
+
+        flush_passive_transition_writes(
+            crate::file_watch::FileWatchService::noop(),
+            &mut instances,
+            bundles,
+        )
+        .await;
+
+        assert!(
+            !instances[0].unread,
+            "a failed persist must not leave a phantom in-memory unread mark (see #2755)"
+        );
+    }
+
+    // The success path: once the write is durable, the mark lands on both the
+    // live vec (which feeds `state.instances`) and disk.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flush_passive_transition_applies_unread_after_persist_ok() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let profile = "flush-persist-success";
+        let mut inst = Instance::new("idle-session", "/tmp/idle");
+        inst.source_profile = profile.to_string();
+        let id = inst.id.clone();
+
+        // Seed the row on disk so the persist closure has a matching id to mark.
+        let seed = inst.clone();
+        crate::session::Storage::new_unwatched(profile)
+            .expect("storage")
+            .update(move |instances, _groups| {
+                *instances = vec![seed];
+                Ok(())
+            })
+            .expect("seed write");
+
+        let mut instances = vec![inst];
+        let mut bundles: std::collections::HashMap<String, PassiveTransitionWrites> =
+            std::collections::HashMap::new();
+        bundles
+            .entry(profile.to_string())
+            .or_default()
+            .unread_ids
+            .push(id.clone());
+
+        flush_passive_transition_writes(
+            crate::file_watch::FileWatchService::noop(),
+            &mut instances,
+            bundles,
+        )
+        .await;
+
+        assert!(
+            instances[0].unread,
+            "a durable persist must mirror the unread mark into the live vec"
+        );
+        let disk = crate::session::Storage::new_unwatched(profile)
+            .expect("storage")
+            .load()
+            .expect("load");
+        assert!(
+            disk.iter().find(|i| i.id == id).expect("seeded row").unread,
+            "the unread mark must be durable on disk"
+        );
+    }
+
     #[test]
     fn extract_web_build_id_finds_entry_bundle() {
         let html = r#"<head><script type="module" crossorigin src="/assets/index-DKenwdW0.js"></script>
@@ -4939,6 +6423,45 @@ mod tests {
         assert_eq!(cache_control_for("assets/logo.svg"), "no-cache");
         assert_eq!(cache_control_for("assets/readme"), "no-cache");
         assert_eq!(cache_control_for("assets/short-a1.js"), "no-cache");
+    }
+
+    #[test]
+    fn seed_unknown_tracking_carries_prior_tick_fields_onto_fresh_instance() {
+        // `load_all_instances` always resets both `#[serde(skip)]` fields to
+        // their defaults, mimicking status_poll_loop's fresh disk load.
+        let mut fresh = vec![Instance::new("sess-1", "/tmp/seed")];
+        assert!(!fresh[0].ever_confirmed_present);
+        assert_eq!(fresh[0].unknown_since, None);
+
+        let confirmed_at = std::time::Instant::now() - std::time::Duration::from_secs(3);
+        let mut prev = std::collections::HashMap::new();
+        prev.insert(fresh[0].id.clone(), (true, Some(confirmed_at)));
+
+        seed_unknown_tracking(&mut fresh, &prev);
+
+        assert!(
+            fresh[0].ever_confirmed_present,
+            "prior tick's ever_confirmed_present must seed the fresh instance \
+             before update_status_with_metadata runs on it"
+        );
+        assert_eq!(
+            fresh[0].unknown_since,
+            Some(confirmed_at),
+            "prior tick's unknown_since must seed the fresh instance so the \
+             Unknown->Error escalation window can actually accumulate elapsed \
+             time across ticks (#2865)"
+        );
+    }
+
+    #[test]
+    fn seed_unknown_tracking_leaves_unknown_ids_untouched() {
+        let mut fresh = vec![Instance::new("sess-unseen", "/tmp/seed")];
+        let prev = std::collections::HashMap::new();
+
+        seed_unknown_tracking(&mut fresh, &prev);
+
+        assert!(!fresh[0].ever_confirmed_present);
+        assert_eq!(fresh[0].unknown_since, None);
     }
 
     #[test]
@@ -5804,6 +7327,44 @@ mod tests {
             }),
             Some(StatusIntent::HealError)
         );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn import_replay_suppresses_live_side_effects_until_boundary() {
+        use crate::acp::Event;
+
+        assert!(suppress_import_replay_side_effects(
+            true,
+            &Event::UserPromptSent {
+                text: "historical prompt".into(),
+                attachments: Vec::new(),
+            }
+        ));
+        assert!(suppress_import_replay_side_effects(
+            true,
+            &Event::AgentMessageChunk {
+                text: "historical reply".into(),
+            }
+        ));
+        assert!(!suppress_import_replay_side_effects(
+            true,
+            &Event::Stopped {
+                reason: "history_replay_complete".into(),
+            }
+        ));
+        assert!(!suppress_import_replay_side_effects(
+            true,
+            &Event::AcpSessionAssigned {
+                acp_session_id: "session-id".into(),
+            }
+        ));
+        assert!(!suppress_import_replay_side_effects(
+            false,
+            &Event::AgentMessageChunk {
+                text: "live reply".into(),
+            }
+        ));
     }
 
     #[cfg(feature = "serve")]

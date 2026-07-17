@@ -535,7 +535,8 @@ export type AcpEvent =
   | { WakeupScheduled: { at: string; reason: string | null } }
   | { MonitorArmed: { description: string | null } }
   | { PromptRejected: { reason: string; text: string } }
-  | { AgentSwitched: { from: string; to: string; reason: string } };
+  | { AgentSwitched: { from: string; to: string; reason: string } }
+  | { ConversationSummary: { text: string; summarized_until_seq: number } };
 
 /** Metadata-only attachment ref as it rides on a `UserPromptSent`
  *  event from the server (mirrors Rust `PromptAttachmentRef`). The
@@ -732,6 +733,9 @@ export interface AcpState {
    *  transient "Restarting…" banner appears without a reconnect button;
    *  cleared on AcpSessionAssigned or UserPromptSent. */
   workerRestarting: boolean;
+  /** True while a prompt deferred during history import is waiting for the
+   *  successful session assignment that closes the replay. */
+  importWaiting: boolean;
   /** Set true when the daemon publishes `Stopped { reason: "idle_auto_stop" }`,
    *  meaning the reconciler reaped the worker for inactivity
    *  (`acp.auto_stop_idle_secs`) and marked the session dormant. Unlike
@@ -938,8 +942,13 @@ export interface ActivityRow {
     | "empty_output"
     | "context_reset"
     | "session_cleared"
-    | "compacted";
+    | "compacted"
+    | "summary";
   text: string;
+  /** True while a locally rendered user prompt is waiting for its
+   *  authoritative UserPromptSent echo. Replay completion must leave these
+   *  rows active because their live turn begins after imported history. */
+  optimistic?: boolean;
   toolCallId?: string;
   /** Full ToolCall payload, present on tool_start rows so the UI can
    *  pick a per-kind renderer without needing to look the call up by
@@ -1026,6 +1035,7 @@ export function emptyAcpState(): AcpState {
     turnHasOutput: false,
     workerStopped: false,
     workerRestarting: false,
+    importWaiting: false,
     workerIdleStopped: false,
     queuedPrompts: [],
     nextWakeupAt: null,
@@ -1425,6 +1435,17 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // raw; only `cost` is rebased. clamp to zero defensively in case
     // an upstream restart ever reports a smaller cumulative. See #1354.
     const incoming = event.UsageUpdated.usage;
+    // Bandaid for upstream claude-agent-acp #596: mid-turn usage_update
+    // reports the 200k DEFAULT_CONTEXT_WINDOW for models whose real
+    // window is 1M (the `sonnet` / `default` aliases miss its `\b1m\b`
+    // heuristic), and only snaps to the authoritative window at the
+    // turn's `result`. Rendering each frame verbatim makes the footer
+    // flicker 200k <-> 1M every turn. Latch the largest window learned
+    // this session; a real context boundary (clear / compact /
+    // agent-switch / context-reset / model change) nulls sessionUsage,
+    // which resets the latch to the next raw value. Drop once upstream
+    // stops emitting the downgraded mid-turn guess.
+    const size = Math.max(incoming.size, next.sessionUsage?.size ?? 0);
     if (next.usageBaseline && incoming.cost) {
       const rebasedAmount = Math.max(0, incoming.cost.amount - next.usageBaseline.cost);
       const rebasedCost = {
@@ -1433,11 +1454,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       };
       next.sessionUsage = {
         used: incoming.used,
-        size: incoming.size,
+        size,
         cost: rebasedCost,
       };
     } else {
-      next.sessionUsage = incoming;
+      next.sessionUsage = { used: incoming.used, size, cost: incoming.cost };
     }
     return next;
   }
@@ -1474,6 +1495,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ConfigOptionsUpdated" in event) {
     const options = event.ConfigOptionsUpdated.options;
+    // A model change moves the context window, so drop the latched
+    // usage window (see the UsageUpdated arm) and relearn it for the
+    // new model instead of holding the prior model's larger window.
+    const priorModel = next.configOptions.find((o) => o.category === "model")?.current_value;
+    const nextModel = options.find((o) => o.category === "model")?.current_value;
+    if (priorModel !== undefined && nextModel !== undefined && priorModel !== nextModel) {
+      next.sessionUsage = null;
+    }
     next.configOptions = options;
     // The snapshot is authoritative, so any in-flight pending click
     // resolves here regardless of whether the adapter applied the
@@ -1519,6 +1548,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("Stopped" in event) {
+    const historyReplayComplete = event.Stopped.reason === "history_replay_complete";
     // Final marker; nothing to mutate, but reset the inflight tool just
     // in case the agent forgot to emit a completion.
     //
@@ -1541,7 +1571,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // clear the "Stopping..." state regardless of reason. See #1727.
     next.cancelling = false;
     next.cancelEscalatesAt = null;
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
+    if (historyReplayComplete) {
+      const pendingOptimisticPrompts = next.activity.filter(
+        (row) => row.kind === "user_prompt" && row.optimistic === true,
+      ).length;
+      next.lastStoppedSeq = Math.max(next.lastStoppedSeq, next.pendingUserPromptSeq - pendingOptimisticPrompts);
+    } else {
+      next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
+    }
     next.turnActive = isTurnActive(next);
     // Clear the "monitoring" badge once the monitor has fired and that turn
     // ends. The monitor firing makes the agent act (a tool call after the
@@ -1640,7 +1677,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // retiring. In the race case, `turnHasOutput` still reflects the
     // turn being retired because UserPromptSent (which resets it) for
     // the follow-up hasn't been applied yet.
-    if (state.turnActive && !state.turnHasOutput) {
+    if (!historyReplayComplete && state.turnActive && !state.turnHasOutput) {
       next.activity = pushActivity(next.activity, {
         id: `empty-${frame.seq}`,
         kind: "empty_output",
@@ -1718,7 +1755,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // first server echo must promote the first optimistic row, not
     // the second, so the seq order matches the submission order.
     const matchIdx = next.activity.findIndex(
-      (r) => r.kind === "user_prompt" && r.text === text && !r.id.startsWith("user-seq-"),
+      (r) => r.kind === "user_prompt" && r.text === text && !r.id.startsWith("user-seq-") && r.optimistic !== false,
     );
     if (matchIdx >= 0) {
       // Optimistic-match path: promote the placeholder's id. The
@@ -1736,6 +1773,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
         updated[matchIdx] = {
           ...match,
           id: `user-seq-${frame.seq}`,
+          optimistic: undefined,
           attachments:
             match.attachments && match.attachments.length > 0
               ? match.attachments
@@ -1811,6 +1849,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // is online; clear both transient worker banners.
     next.workerStopped = false;
     next.workerRestarting = false;
+    next.importWaiting = false;
     // The respawn may have been triggered by waking an idle-dormant
     // worker; the fresh handshake means it is no longer dormant.
     next.workerIdleStopped = false;
@@ -1858,6 +1897,18 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       resetSeq: frame.seq,
       reason: event.SessionContextReset.reason || "Conversation context reset; agent transcript was unavailable.",
     };
+    return next;
+  }
+  if ("ConversationSummary" in event) {
+    // aoe-generated recap of the conversation so far (see #2808). Not a
+    // model/session state change; append a callout row the renderer maps
+    // to a summary block.
+    next.activity = pushActivity(next.activity, {
+      id: `summary-${frame.seq}`,
+      kind: "summary",
+      text: event.ConversationSummary.text,
+      at: new Date().toISOString(),
+    });
     return next;
   }
   if ("WakeupScheduled" in event) {

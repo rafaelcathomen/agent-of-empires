@@ -157,7 +157,8 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/mobile-live-scrollback-buffer.spec.ts"],
-      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"]
+      "components": ["web/src/components/MobileLiveTerminal.tsx", "web/src/hooks/useLiveTerminal.ts"],
+      "reason": "Covers the server-backed capture fallback when the requested browser history exceeds the VT cache."
     },
     {
       "id": "terminal.live-size-owner",
@@ -503,6 +504,7 @@
       "components": [
         "web/src/components/TerminalSettings.tsx",
         "web/src/components/TerminalSessionStack.tsx",
+        "web/src/components/WorkspaceSidebar.tsx",
         "web/src/lib/fontDetect.ts"
       ]
     },
@@ -928,6 +930,13 @@
       "kind": "vitest",
       "risk": "high",
       "specs": ["src/components/__tests__/ForkSessionAction.test.tsx"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.session-color",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/__tests__/SessionRowTriage.test.tsx"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
@@ -1715,6 +1724,13 @@
       "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/recallNav.ts"]
     },
     {
+      "id": "acp.composer-usage-tooltip",
+      "kind": "vitest",
+      "risk": "low",
+      "specs": ["src/components/acp/Composer.usageHint.test.tsx"],
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/Tooltip.tsx"]
+    },
+    {
       "id": "acp.config-pickers",
       "kind": "live-playwright",
       "risk": "medium",
@@ -1766,6 +1782,13 @@
         "web/src/components/acp/ContextPrimerBanner.tsx",
         "web/src/components/acp/useFilesIndex.ts"
       ]
+    },
+    {
+      "id": "acp.mode-switch-tmux-teardown",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/mode-switch-kills-tmux.spec.ts"],
+      "components": ["src/server/api/acp.rs"]
     },
     {
       "id": "acp.tool-output-media",
@@ -2158,7 +2181,12 @@
       "kind": "mocked-playwright",
       "risk": "low",
       "specs": ["tests/shortcuts.spec.ts"],
-      "components": ["web/src/components/ContentSplit.tsx", "web/src/hooks/useKeyboardShortcuts.ts"]
+      "components": [
+        "web/src/App.tsx",
+        "web/src/lib/paneLayout.ts",
+        "web/src/components/ContentSplit.tsx",
+        "web/src/hooks/useKeyboardShortcuts.ts"
+      ]
     },
     {
       "id": "story.shortcut-escape-closes-palette",
@@ -2901,6 +2929,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.summarize-action",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/sidebar-summarize.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.multi-select-logic",
       "kind": "vitest",
       "risk": "high",
@@ -3056,7 +3091,11 @@
       "kind": "mocked-playwright",
       "risk": "high",
       "specs": ["tests/desktop-live-input.spec.ts"],
-      "components": ["web/src/components/LiveTerminalView.tsx", "web/src/components/MobileLiveTerminal.tsx"]
+      "components": [
+        "web/src/components/LiveTerminalView.tsx",
+        "web/src/components/MobileLiveTerminal.tsx",
+        "web/src/hooks/useLiveTerminal.ts"
+      ]
     },
     {
       "id": "plugins.ui-slots",
@@ -3068,6 +3107,16 @@
         "src/hooks/usePluginUiState.test.tsx"
       ],
       "components": ["web/src/components/plugin/PluginSlots.tsx"]
+    },
+    {
+      "id": "plugins.composer-actions",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/plugin/__tests__/PluginSlots.test.tsx",
+        "src/components/acp/Composer.pluginComposerActions.test.tsx"
+      ],
+      "components": ["web/src/components/plugin/PluginSlots.tsx", "web/src/components/acp/Composer.tsx"]
     }
   ]
 }

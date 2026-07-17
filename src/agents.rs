@@ -307,6 +307,39 @@ pub struct AgentDef {
     pub send_keys_enter_delay_ms: u64,
     /// One-line install command shown when the agent is missing from PATH.
     pub install_hint: &'static str,
+    /// Static keystroke sequences for answering this agent's own interactive
+    /// permission prompt from the sidebar, without attaching to the pane.
+    /// `None` for every agent whose prompt shape hasn't been mapped yet; the
+    /// respond-to-prompt action is a no-op for those agents. See
+    /// `docs/development/adding-agents.md` for how to determine these
+    /// sequences for a new agent.
+    pub permission_response: Option<PermissionResponse>,
+}
+
+/// A tmux keystroke: either literal text sent verbatim (e.g. a menu digit) or
+/// a named tmux key (e.g. `"Enter"`, `"Right"`). See `TmuxSession::send_key_tokens`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyToken {
+    /// Sent as `tmux send-keys -l -- <text>` (literal, no key-name interpretation).
+    Literal(&'static str),
+    /// Sent as `tmux send-keys <name>`, e.g. `"Enter"`, `"Right"`.
+    Named(&'static str),
+}
+
+/// The three keystroke sequences that answer an agent's own interactive
+/// permission prompt, mapped once by hand per agent and never derived from
+/// pane content. The user visually confirms a prompt is actually showing
+/// before invoking the respond-to-prompt action; the software does not detect
+/// or verify it.
+#[derive(Clone, Copy, Debug)]
+pub struct PermissionResponse {
+    /// Keystrokes that select "allow once" / "yes" for this single request.
+    pub allow: &'static [KeyToken],
+    /// Keystrokes that select "allow always" / "don't ask again" for the
+    /// remainder of the session.
+    pub allow_always: &'static [KeyToken],
+    /// Keystrokes that select "deny" / "no".
+    pub deny: &'static [KeyToken],
 }
 
 /// Claude Code hook events. `SessionStart` and `UserPromptSubmit` carry
@@ -318,12 +351,23 @@ pub struct AgentDef {
 ///
 /// `idle` has two sources, not just `Stop`. `Stop` does not fire on every
 /// turn-end path: a turn killed by an API error fires `StopFailure` instead,
-/// and a user interrupt fires nothing. Without a second idle signal the status
-/// file stays on the last `running` write and the session sticks on Running.
-/// `Notification` with matcher `idle_prompt` is Claude's explicit "done
-/// working, waiting for the user" signal and fires whenever Claude parks at the
-/// prompt regardless of why the turn ended, so it backstops `Stop`;
-/// `StopFailure` covers the API-error path deterministically.
+/// and a user interrupt fires nothing. Newer Claude Code has a further gap: a
+/// "silent tool stop" (a tool result followed by no text) parks at the prompt
+/// firing neither `Stop` nor `idle_prompt`. Without a second idle signal the
+/// status file stays on the last `running` write and the session sticks on
+/// Running. `Notification` with matcher `idle_prompt` is Claude's explicit
+/// "done working, waiting for the user" signal and fires whenever Claude parks
+/// at the prompt regardless of why the turn ended, so it backstops `Stop`;
+/// `StopFailure` covers the API-error path deterministically. The remaining
+/// gap (silent tool stop) has no hook, so it is recovered pane-side by
+/// `reconcile_claude_hook_status`.
+///
+/// The `Notification` matchers also carry the agent-view identifiers added in
+/// Claude Code 2.1.198: `agent_needs_input` (background session blocked on the
+/// user → Waiting) rides the permission group, and `agent_completed`
+/// (background session finished/failed → Idle) rides the `idle_prompt` group.
+/// They only fire while Claude's agent view is open, so they are best-effort
+/// extra coverage for that surface, not a substitute for the pane fallback.
 const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
@@ -357,13 +401,13 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     },
     HookEvent {
         name: "Notification",
-        matcher: Some("permission_prompt|elicitation_dialog"),
+        matcher: Some("permission_prompt|elicitation_dialog|agent_needs_input"),
         status: Some(HookStatus::Waiting),
         session_id_capture: false,
     },
     HookEvent {
         name: "Notification",
-        matcher: Some("idle_prompt"),
+        matcher: Some("idle_prompt|agent_completed"),
         status: Some(HookStatus::Idle),
         session_id_capture: false,
     },
@@ -574,6 +618,11 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @anthropic-ai/claude-code",
+        permission_response: Some(PermissionResponse {
+            allow: &[KeyToken::Literal("1")],
+            allow_always: &[KeyToken::Literal("2")],
+            deny: &[KeyToken::Literal("3")],
+        }),
     },
     AgentDef {
         name: "opencode",
@@ -594,6 +643,19 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://opencode.ai/install | bash",
+        permission_response: Some(PermissionResponse {
+            allow: &[KeyToken::Named("Enter")],
+            allow_always: &[
+                KeyToken::Named("Right"),
+                KeyToken::Named("Enter"),
+                KeyToken::Named("Enter"),
+            ],
+            deny: &[
+                KeyToken::Named("Right"),
+                KeyToken::Named("Right"),
+                KeyToken::Named("Enter"),
+            ],
+        }),
     },
     AgentDef {
         name: "vibe",
@@ -614,6 +676,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "pip install mistral-vibe",
+        permission_response: None,
     },
     AgentDef {
         name: "codex",
@@ -646,6 +709,7 @@ pub const AGENTS: &[AgentDef] = &[
         // swallowed as newlines instead of triggering submit. 150ms > 120ms.
         send_keys_enter_delay_ms: 150,
         install_hint: "npm install -g @openai/codex",
+        permission_response: None,
     },
     AgentDef {
         name: "gemini",
@@ -696,6 +760,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @google/gemini-cli",
+        permission_response: None,
     },
     AgentDef {
         name: "cursor",
@@ -721,6 +786,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "see https://docs.cursor.com/cli",
+        permission_response: None,
     },
     AgentDef {
         name: "copilot",
@@ -747,6 +813,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "see https://docs.github.com/en/copilot/github-copilot-in-the-cli",
+        permission_response: None,
     },
     AgentDef {
         name: "pi",
@@ -768,6 +835,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @earendil-works/pi-coding-agent",
+        permission_response: None,
     },
     AgentDef {
         name: "droid",
@@ -788,6 +856,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g droid",
+        permission_response: None,
     },
     AgentDef {
         name: "settl",
@@ -820,6 +889,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: true,
         send_keys_enter_delay_ms: 0,
         install_hint: "brew install --cask mozilla-ai/tap/settl",
+        permission_response: None,
     },
     AgentDef {
         name: "hermes",
@@ -859,6 +929,7 @@ pub const AGENTS: &[AgentDef] = &[
         send_keys_enter_delay_ms: 0,
         install_hint:
             "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash",
+        permission_response: None,
     },
     AgentDef {
         name: "kiro",
@@ -904,6 +975,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://cli.kiro.dev/install | bash",
+        permission_response: None,
     },
     AgentDef {
         name: "qwen",
@@ -932,6 +1004,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @qwen-code/qwen-code",
+        permission_response: None,
     },
     AgentDef {
         name: "antigravity",
@@ -952,6 +1025,7 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+        permission_response: None,
     },
 ];
 

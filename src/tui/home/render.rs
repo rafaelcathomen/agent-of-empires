@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 use rattles::presets::prelude as spinners;
 
 use super::{
-    get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING,
-    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN, ICON_UNREAD,
+    get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_ARCHIVED_SECTION, ICON_COLLAPSED,
+    ICON_DELETING, ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED,
+    ICON_TRASH_SECTION, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, RowTagMode, SortOrder};
@@ -132,24 +133,31 @@ fn truncate_to_width(text: &str, max_width: usize) -> String {
 /// Map a tmux pane cursor onto the preview's output rect for live-send.
 ///
 /// `output` is the rect the captured pane text paints into; `visible_rows` is
-/// its height in rows; `cursor` carries the pane's `(x, y)` (counted from the
-/// top of the visible screen) plus `pane_height`. Assumes the preview is at
-/// the live tail, where the bottom captured line pins to the bottom of
-/// `output`, so a screen row maps to `output.y + (visible_rows - pane_height)
-/// + cursor.y`. When the pane is sized to the output area (the live-send
-/// resize) the delta is zero and this is just `output.y + cursor.y`; the delta
-/// only bites for the frame or two after a resize. A hidden cursor, or one
-/// that maps outside `output` (e.g. a pane taller than the output area clips
-/// its top rows), yields `None` so nothing is painted.
+/// its height in rows; `line_count` is the parsed capture's line count (the
+/// same value the renderer feeds to `compute_scroll`); `cursor` carries the
+/// pane's `(x, y)` (counted from the top of the visible screen) plus
+/// `pane_height`. The renderer bottom-anchors the capture ONLY when it
+/// overflows `output`; a capture shorter than `output` paints from the top
+/// (`compute_scroll` returns 0). Anchor the cursor the same way so it tracks
+/// the text: a screen row maps to `output.y + (min(line_count, visible_rows) -
+/// pane_height) + cursor.y`. With the pane sized to the output area and a
+/// full-height capture the delta is zero and this is just `output.y +
+/// cursor.y`. When the pane is a row or more shorter than `output` and the
+/// capture doesn't overflow (an alt-screen prompt, or the frame after a
+/// resize), using the bare `visible_rows` here would paint the cursor a row
+/// BELOW the text the user typed (#2742); clamping to `line_count` keeps them
+/// aligned. A hidden cursor, or one that maps outside `output`, yields `None`.
 fn map_live_preview_cursor(
     output: Rect,
     visible_rows: usize,
+    line_count: usize,
     cursor: crate::tmux::PaneCursor,
 ) -> Option<Position> {
     if !cursor.visible {
         return None;
     }
-    let row = output.y as i32 + (visible_rows as i32 - cursor.pane_height as i32) + cursor.y as i32;
+    let anchor = line_count.min(visible_rows) as i32;
+    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + cursor.y as i32;
     let col = output.x as i32 + cursor.x as i32;
     if row < output.y as i32
         || row >= output.y as i32 + output.height as i32
@@ -633,6 +641,7 @@ impl HomeView {
             // collapse button rect, and the strip sets its own.
             self.list_area = Rect::default();
             self.list_inner_area = Rect::default();
+            self.shelf_inner_area = Rect::default();
             self.render_collapsed_strip(frame, chunks[0], theme);
             self.render_preview(frame, chunks[1], theme, PaneLayout::Collapsed);
         } else if available_width < responsive::STACKED_BREAKPOINT {
@@ -754,6 +763,7 @@ impl HomeView {
             command_palette,
             tool_picker_dialog,
             send_message_dialog,
+            permission_response_dialog,
             update_confirm_dialog,
             // context_menu renders last so its small popup sits on top of
             // any underlying dialog (e.g. an info dialog opened by a
@@ -855,6 +865,15 @@ impl HomeView {
             }
         };
         let borders = layout.list_borders();
+        // The Trash / Archived sections render in a pinned bottom shelf rather
+        // than scrolling with the workspace list. They are a contiguous suffix
+        // of `flat_items`; `list_len` is where that suffix begins. A divider
+        // sits between the list and the shelf, and when it's shown the sort
+        // indicator moves onto it (matching the user-facing mock), so the
+        // bottom-border copy is suppressed to avoid showing it twice.
+        let shelf_start = self.shelf_start();
+        let list_len = shelf_start.unwrap_or(self.flat_items.len());
+        let show_divider = shelf_start.is_some() && list_len > 0;
         // Sort indicator rides `title_bottom`; ratatui only renders it when the
         // BOTTOM border exists, so it yields in stacked mode (still reachable via `s`).
         let sort_indicator = format!(" sort: {} ", self.sort_order.label());
@@ -865,7 +884,7 @@ impl HomeView {
             .title(title)
             .title_style(Style::default().fg(title_color).bold())
             .padding(Padding::horizontal(1));
-        if borders.contains(Borders::BOTTOM) {
+        if borders.contains(Borders::BOTTOM) && !show_divider {
             block = block.title_bottom(
                 Line::from(Span::styled(
                     sort_indicator,
@@ -877,6 +896,10 @@ impl HomeView {
 
         let inner = block.inner(area);
         self.list_inner_area = inner;
+        // Zeroed by default; the shelf branch below sets it when a shelf is
+        // drawn, so the early-return paths (collapsed strip, empty list) leave
+        // no stale rect that could resolve a click to an undrawn shelf row.
+        self.shelf_inner_area = Rect::default();
         frame.render_widget(block, area);
 
         // Collapse affordance on the top-right border. Clicking it shrinks
@@ -920,29 +943,69 @@ impl HomeView {
             return;
         }
 
-        let visible_height = if self.search_active {
-            (inner.height as usize).saturating_sub(1)
+        // Split the inner area into the scrolling workspace list, an optional
+        // divider carrying the sort indicator, and the pinned bottom shelf that
+        // holds the Trash / Archived sections. With no shelf this reduces to the
+        // list filling `inner`, identical to the pre-shelf layout.
+        const SHELF_MIN_ROWS: usize = 2;
+        let inner_h = inner.height as usize;
+        let (list_region, divider_y, shelf_region) = if shelf_start.is_some() {
+            let shelf_len = self.flat_items.len() - list_len;
+            let divider_rows = if show_divider { 1 } else { 0 };
+            // Keep the shelf near 40% of the pane at most so an expanded Trash
+            // can't crowd out the workspace list, but always leave room for the
+            // two section headers.
+            let shelf_cap = ((inner_h * 2) / 5).max(SHELF_MIN_ROWS);
+            let shelf_budget = inner_h.saturating_sub(divider_rows);
+            let shelf_visible = shelf_len.min(shelf_cap).min(shelf_budget);
+            let list_h = inner_h.saturating_sub(shelf_visible + divider_rows);
+            let list_region = Rect {
+                x: inner.x,
+                y: inner.y,
+                width: inner.width,
+                height: list_h as u16,
+            };
+            let divider_y = show_divider.then_some(inner.y + list_h as u16);
+            let shelf_region = Rect {
+                x: inner.x,
+                y: inner.y + (list_h + divider_rows) as u16,
+                width: inner.width,
+                height: shelf_visible as u16,
+            };
+            (list_region, divider_y, shelf_region)
         } else {
-            inner.height as usize
+            (inner, None, Rect::default())
         };
+        self.list_inner_area = list_region;
+        self.shelf_inner_area = shelf_region;
+
+        let hover_idx = self.hovered_index();
+
+        // --- Workspace list (every row before the shelf) ---
+        let list_visible_height = if self.search_active {
+            (list_region.height as usize).saturating_sub(1)
+        } else {
+            list_region.height as usize
+        };
+        // The cursor may be parked in the shelf; clamp it to the last list row
+        // for scroll purposes so the list keeps a stable offset instead of
+        // trying to scroll to a shelf index. No list row ends up selected in
+        // that case, because the real `self.cursor` never matches a list index.
+        let list_cursor = self.cursor.min(list_len.saturating_sub(1));
         let scroll = crate::tui::components::scroll::calculate_scroll(
-            self.flat_items.len(),
-            self.cursor,
-            visible_height,
+            list_len,
+            list_cursor,
+            list_visible_height,
         );
 
         let mut lines: Vec<Line> = Vec::new();
-
         if scroll.has_more_above {
             lines.push(Line::from(Span::styled(
                 format!("  [{} more above]", scroll.scroll_offset),
                 Style::default().fg(theme.dimmed),
             )));
         }
-
-        let hover_idx = self.hovered_index();
-        for (i, item) in self
-            .flat_items
+        for (i, item) in self.flat_items[..list_len]
             .iter()
             .skip(scroll.scroll_offset)
             .take(scroll.list_visible)
@@ -971,23 +1034,99 @@ impl HomeView {
             }
             lines.push(line);
         }
-
         if scroll.has_more_below {
-            let remaining = self.flat_items.len() - scroll.scroll_offset - scroll.list_visible;
+            let remaining = list_len - scroll.scroll_offset - scroll.list_visible;
             lines.push(Line::from(Span::styled(
                 format!("  [{} more below]", remaining),
                 Style::default().fg(theme.dimmed),
             )));
         }
+        frame.render_widget(Paragraph::new(lines), list_region);
 
-        frame.render_widget(Paragraph::new(lines), inner);
+        // --- Divider carrying the sort indicator (between list and shelf) ---
+        if let Some(dy) = divider_y {
+            let label = format!(" sort: {} ", self.sort_order.label());
+            let dw = list_region.width as usize;
+            let label_w = label.chars().count().min(dw);
+            let fill = dw.saturating_sub(label_w);
+            let divider = Line::from(vec![
+                Span::styled("─".repeat(fill), Style::default().fg(theme.border)),
+                Span::styled(label, Style::default().fg(theme.dimmed)),
+            ]);
+            frame.render_widget(
+                Paragraph::new(divider),
+                Rect {
+                    x: list_region.x,
+                    y: dy,
+                    width: list_region.width,
+                    height: 1,
+                },
+            );
+        }
+
+        // --- Pinned shelf (Trash / Archived sections), scrolled on its own ---
+        if shelf_start.is_some() && shelf_region.height > 0 {
+            let shelf_items = &self.flat_items[list_len..];
+            let shelf_visible = shelf_region.height as usize;
+            let shelf_cursor = self
+                .cursor
+                .saturating_sub(list_len)
+                .min(shelf_items.len().saturating_sub(1));
+            let sscroll = crate::tui::components::scroll::calculate_scroll(
+                shelf_items.len(),
+                shelf_cursor,
+                shelf_visible,
+            );
+            let mut slines: Vec<Line> = Vec::new();
+            if sscroll.has_more_above {
+                slines.push(Line::from(Span::styled(
+                    format!("  [{} more above]", sscroll.scroll_offset),
+                    Style::default().fg(theme.dimmed),
+                )));
+            }
+            for (i, item) in shelf_items
+                .iter()
+                .skip(sscroll.scroll_offset)
+                .take(sscroll.list_visible)
+                .enumerate()
+            {
+                let abs_idx = list_len + sscroll.scroll_offset + i;
+                let is_selected = abs_idx == self.cursor;
+                let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
+                let is_match =
+                    !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
+                let mut line =
+                    self.render_item_line(item, is_selected, is_match, theme, inner.width);
+                if is_selected || is_hovered {
+                    let pad = (inner.width as usize).saturating_sub(line.width());
+                    if pad > 0 {
+                        line.spans.push(Span::raw(" ".repeat(pad)));
+                    }
+                    let bg = if is_selected {
+                        theme.session_selection
+                    } else {
+                        theme.selection
+                    };
+                    line = line.style(Style::default().bg(bg));
+                }
+                slines.push(line);
+            }
+            if sscroll.has_more_below {
+                let remaining = shelf_items.len() - sscroll.scroll_offset - sscroll.list_visible;
+                slines.push(Line::from(Span::styled(
+                    format!("  [{} more below]", remaining),
+                    Style::default().fg(theme.dimmed),
+                )));
+            }
+            frame.render_widget(Paragraph::new(slines), shelf_region);
+        }
 
         // Render search bar if active
         if self.search_active {
             let search_area = Rect {
-                x: inner.x,
-                y: inner.y + inner.height.saturating_sub(1),
-                width: inner.width,
+                x: list_region.x,
+                y: list_region.y + list_region.height.saturating_sub(1),
+                width: list_region.width,
                 height: 1,
             };
 
@@ -1109,7 +1248,19 @@ impl HomeView {
                     && !crate::session::is_within_archived_section(path)
                     && !crate::session::is_within_trash_section(path)
                     && self.is_project_label_pinned(name);
-                let text = if pinned {
+                // The top-level shelf section headers get a leading type glyph
+                // so they read as system shelves, not user groups. Project
+                // sub-folders nested under Archived keep the plain label.
+                let section_glyph = if crate::session::is_trash_section_path(path) {
+                    Some(ICON_TRASH_SECTION)
+                } else if crate::session::is_archived_section_path(path) {
+                    Some(ICON_ARCHIVED_SECTION)
+                } else {
+                    None
+                };
+                let text = if let Some(glyph) = section_glyph {
+                    Cow::Owned(format!("{} {} ({})", glyph, name, session_count))
+                } else if pinned {
                     Cow::Owned(format!("{} ({}) {}", name, session_count, ICON_PINNED))
                 } else {
                     Cow::Owned(format!("{} ({})", name, session_count))
@@ -1653,15 +1804,21 @@ impl HomeView {
             return;
         }
         if self.preview_capture_worker.is_none() {
-            self.preview_capture_worker = Some(live_send::LiveCaptureWorker::spawn(
-                self.preview_wake.clone(),
-            ));
+            let worker = live_send::LiveCaptureWorker::spawn(self.preview_wake.clone());
+            // The worker spawns VT-enabled; hand it the real `[tmux] vt_live`
+            // value (cached on the view, refreshed with the config) before it
+            // can arm a channel.
+            worker.set_vt_enabled(self.vt_live_enabled);
+            self.preview_capture_worker = Some(worker);
         }
         if self.preview_capture_target != desired {
             if let Some(worker) = self.preview_capture_worker.as_ref() {
                 worker.set_target(desired.clone().unwrap_or_default());
             }
             self.preview_capture_target = desired;
+            // New pane under the pointer: drop the hover dedup cell so a
+            // stationary pointer still reports its cell to the new agent.
+            self.hover_forward_cell = None;
         }
         // Fast cadence only when the displayed pane IS the live-send target.
         // Viewing the agent while live-send points at a terminal (or vice
@@ -1724,6 +1881,26 @@ impl HomeView {
     }
 
     pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
+        // Forward an agent's OSC 52 copy to the host clipboard (#2420). The
+        // VT reader extracts it from the raw pane stream (the vt100 grid
+        // drops the escape, and with no attached tmux client `set-clipboard`
+        // has nobody to forward to), the capture worker relays it here, and
+        // `copy_to_clipboard` delivers it the same way preview drag-select
+        // copies do: platform helper + OSC 52 re-emitted to the user's real
+        // terminal. Applied on the render thread so the re-emitted escape
+        // can't interleave with a frame flush. Drained unconditionally and
+        // gated at the forward: a copy that arrives while the setting is
+        // disabled must be discarded, not parked in the slot to clobber the
+        // user's clipboard whenever the setting is later re-enabled.
+        if let Some(text) = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|worker| worker.take_agent_clipboard())
+        {
+            if self.agent_clipboard_forward {
+                crate::tui::clipboard::copy_to_clipboard(&text);
+            }
+        }
         // The off-thread `LiveCaptureWorker` (retargeted to this pane by
         // `sync_preview_capture_worker` in `render_preview`) keeps fresh
         // content flowing on its own thread; `apply_worker_capture` below
@@ -1894,7 +2071,22 @@ impl HomeView {
         );
     }
 
-    fn refresh_tool_preview_cache_if_needed(&mut self, width: u16, height: u16, tool_name: &str) {
+    pub(super) fn refresh_tool_preview_cache_if_needed(
+        &mut self,
+        width: u16,
+        height: u16,
+        tool_name: &str,
+    ) {
+        // Symmetric with `refresh_terminal_preview_cache_if_needed` /
+        // `refresh_container_terminal_preview_cache_if_needed`: when live-send
+        // is pointed at this tool pane (lazygit, yazi, etc.), keep its tmux
+        // pane sized to the visible output area so a window resize or
+        // info-header toggle reflows immediately.
+        self.resize_live_pane_if_target(
+            live_send::LiveSendTarget::Tool(tool_name.to_string()),
+            width,
+            height,
+        );
         if self.apply_worker_capture(width, height, |s| &mut s.tool_preview_cache) {
             return;
         }
@@ -2488,7 +2680,16 @@ impl HomeView {
         if !cursor.position_reliable {
             return None;
         }
-        map_live_preview_cursor(self.preview_pane_area, self.preview_visible_rows, cursor)
+        // `total_lines` is the parsed line count of the capture painted this
+        // frame (set by `set_preview_text_view` right before this), matching
+        // what the renderer fed to `compute_scroll`, so the cursor anchors the
+        // same way the text did.
+        map_live_preview_cursor(
+            self.preview_pane_area,
+            self.preview_visible_rows,
+            self.preview_text_view.total_lines,
+            cursor,
+        )
     }
 
     /// Apply the drag-select highlight to cells inside the preview
@@ -2801,7 +3002,7 @@ impl HomeView {
             // Surface which pane keystrokes are landing on; the shared
             // formatter keeps this label in lockstep with the compose
             // dialog's title.
-            let raw_title = live_send::format_target_label(base_title, state.target);
+            let raw_title = live_send::format_target_label(base_title, &state.target);
             let chip = " \u{25CF} LIVE \u{2192} ";
             let chip_style = Style::default()
                 .fg(theme.background)
@@ -2940,6 +3141,7 @@ impl HomeView {
         let kc = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         let kctrl = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
         let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let ktab = Some(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
 
         // (priority, click-key, spans). `click-key` is `None` for the
         // non-actionable status indicators (Serve / watching), which render
@@ -3000,16 +3202,38 @@ impl HomeView {
             }
         }
 
-        if let Some(enter_action_text) = match self.flat_items.get(self.cursor) {
+        // On a session row Enter and Tab are complements: `default_attach_mode`
+        // routes Enter to live-send or tmux attach, and Tab does the other one.
+        // Both labels resolve here so they can never advertise the same action
+        // twice. Acp rows ignore the setting entirely (Enter opens the
+        // structured view; Tab mirrors it or no-ops), so they keep the plain
+        // "Attach" label and advertise no complement. Mirrors the wording
+        // `HelpOverlay` uses for the same pairing (`src/tui/components/help.rs`).
+        let (enter_action_text, tab_action_text) = match self.flat_items.get(self.cursor) {
             Some(Item::Group {
                 collapsed: true, ..
-            }) => Some("Expand"),
+            }) => (Some("Expand"), None),
             Some(Item::Group {
                 collapsed: false, ..
-            }) => Some("Collapse"),
-            Some(Item::Session { .. }) => Some("Attach"),
-            None => None,
-        } {
+            }) => (Some("Collapse"), None),
+            Some(Item::Session { id, .. }) => {
+                if self
+                    .get_instance(id)
+                    .is_some_and(|inst| inst.is_structured())
+                {
+                    (Some("Attach"), None)
+                } else if matches!(
+                    self.default_attach_mode(id),
+                    Some(crate::session::NewSessionAttachMode::LiveSend)
+                ) {
+                    (Some("Live"), Some("Attach"))
+                } else {
+                    (Some("Attach"), Some("Live"))
+                }
+            }
+            None => (None, None),
+        };
+        if let Some(enter_action_text) = enter_action_text {
             // U+21B5 (↵) renders Enter/Return in one cell across most fonts;
             // saves 4 cols vs the literal word and matches k9s/lazygit/fzf
             // conventions. Trailing space inside the key string adds a second
@@ -3017,6 +3241,9 @@ impl HomeView {
             // glyph fills its cell tightly and a single mk-internal space
             // looks too close to the desc.
             groups.push((0, kenter, mk("↵ ", enter_action_text)));
+        }
+        if let Some(tab_action_text) = tab_action_text {
+            groups.push((1, ktab, mk("⇥ ", tab_action_text)));
         }
 
         groups.push((
@@ -3292,6 +3519,7 @@ mod tests {
             alternate_on: false,
             mouse_tracking: false,
             mouse_sgr: false,
+            mouse_all: false,
             position_reliable: true,
         }
     }
@@ -3299,25 +3527,56 @@ mod tests {
     #[test]
     fn live_cursor_maps_directly_when_pane_matches_output() {
         // Pane sized to the output area (the steady-state live-send case): the
-        // delta is zero, so cursor (x, y) maps onto output.{x,y} + (x, y).
+        // delta is zero, so cursor (x, y) maps onto output.{x,y} + (x, y). A
+        // full-height capture (line_count >= visible_rows) bottom-anchors.
         let output = Rect::new(40, 5, 80, 24);
-        let pos = map_live_preview_cursor(output, 24, pane_cursor(3, 2, true, 24));
+        let pos = map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, true, 24));
         assert_eq!(pos, Some(Position::new(43, 7)));
     }
 
     #[test]
     fn live_cursor_anchored_to_bottom_when_pane_taller_than_output() {
-        // Pane is 24 rows but only 10 are visible (top clipped). The bottom 10
-        // pin to the output, so a cursor on the last screen row (y=23) lands on
-        // the output's last row; a cursor in the clipped top maps out and drops.
+        // Pane is 24 rows but only 10 are visible (top clipped). The capture
+        // overflows the output, so the bottom 10 pin to the output: a cursor on
+        // the last screen row (y=23) lands on the output's last row; a cursor in
+        // the clipped top maps out and drops.
         let output = Rect::new(0, 0, 80, 10);
         assert_eq!(
-            map_live_preview_cursor(output, 10, pane_cursor(0, 23, true, 24)),
+            map_live_preview_cursor(output, 10, 100, pane_cursor(0, 23, true, 24)),
             Some(Position::new(0, 9)),
         );
         assert_eq!(
-            map_live_preview_cursor(output, 10, pane_cursor(0, 5, true, 24)),
+            map_live_preview_cursor(output, 10, 100, pane_cursor(0, 5, true, 24)),
             None,
+        );
+    }
+
+    #[test]
+    fn live_cursor_tracks_top_anchored_short_capture() {
+        // #2742: the pane is a row shorter than the output (status-bar chrome, or
+        // the frame after a resize) and its capture does not overflow, so the
+        // renderer paints from the top (`compute_scroll` returns 0). The cursor
+        // must anchor to the same top, not to `visible_rows` as if the capture
+        // filled the output; otherwise it paints one row below the typed text.
+        let output = Rect::new(0, 0, 80, 24);
+        // 23-row alt-screen pane, capture is exactly its 23 lines (no scrollback
+        // to overflow the 24-row output). Cursor on the pane's last row (y=22).
+        let short = pane_cursor(5, 22, true, 23);
+        assert_eq!(
+            map_live_preview_cursor(output, 24, 23, short),
+            Some(Position::new(5, 22)),
+            "top-anchored capture must not drift the cursor down a row",
+        );
+        // The buggy formula (`visible_rows - pane_height`) would place it at
+        // row 23; assert the fix does not.
+        assert_ne!(
+            map_live_preview_cursor(output, 24, 23, short),
+            Some(Position::new(5, 23)),
+        );
+        // Cursor on the pane's top row lands on the output's top row.
+        assert_eq!(
+            map_live_preview_cursor(output, 24, 23, pane_cursor(0, 0, true, 23)),
+            Some(Position::new(0, 0)),
         );
     }
 
@@ -3326,12 +3585,12 @@ mod tests {
         let output = Rect::new(0, 0, 80, 24);
         // DECTCEM-hidden cursor: nothing to paint.
         assert_eq!(
-            map_live_preview_cursor(output, 24, pane_cursor(3, 2, false, 24)),
+            map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, false, 24)),
             None,
         );
         // Column past the output width is dropped rather than clamped.
         assert_eq!(
-            map_live_preview_cursor(output, 24, pane_cursor(80, 2, true, 24)),
+            map_live_preview_cursor(output, 24, 200, pane_cursor(80, 2, true, 24)),
             None,
         );
     }

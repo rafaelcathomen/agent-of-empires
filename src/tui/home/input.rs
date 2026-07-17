@@ -7,7 +7,9 @@ use tui_input::Input;
 
 use super::bindings::{self, ActionId};
 use super::{live_send, DragKind, HomeView, PreviewSelection, TerminalMode, ViewMode};
-use crate::session::config::{load_config, save_config, GroupByMode, SortOrder};
+use crate::session::config::{
+    load_config, update_app_state, update_config, GroupByMode, SortOrder,
+};
 use crate::session::{list_profiles, repo_config, resolve_config_or_warn, Item, Status};
 use crate::tui::app::Action;
 #[cfg(feature = "serve")]
@@ -30,6 +32,16 @@ use crate::tui::settings::{SettingsAction, SettingsView};
 /// fast for trackpads or too slow on remote sessions.
 const DOUBLE_CLICK_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// The two synthetic bottom-of-sidebar sections. Their headers look like
+/// groups in `flat_items` but carry sentinel paths, so the section-scoped
+/// context-menu actions (Restore All, collapse) resolve which one the cursor
+/// is on through this rather than duplicating the path checks per call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SidebarSection {
+    Trash,
+    Archived,
+}
+
 /// Persist the user's picks from the first-run intro wizard. Theme name goes
 /// to `config.theme.name`; attach mode is mirrored to both
 /// `new_session_attach_mode` (post-create) and `default_attach_mode`
@@ -43,23 +55,27 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
     {
         return;
     }
-    let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) else {
-        tracing::warn!(target: "tui.input", "intro outcome: load_config failed; not persisting");
-        return;
-    };
-    if let Some(theme) = &outcome.final_theme {
-        config.theme.name = theme.clone();
-    }
-    if let Some(mode) = outcome.final_attach_mode {
-        config.session.new_session_attach_mode = mode;
-        config.session.default_attach_mode = mode;
-    }
-    if let Some(opt_in) = outcome.telemetry_opt_in {
-        config.telemetry.enabled = opt_in;
-        config.app_state.has_responded_to_telemetry = true;
-    }
-    if let Err(e) = save_config(&config) {
+    let result = update_config(|config| {
+        if let Some(theme) = &outcome.final_theme {
+            config.theme.name = theme.clone();
+        }
+        if let Some(mode) = outcome.final_attach_mode {
+            config.session.new_session_attach_mode = mode;
+            config.session.default_attach_mode = mode;
+        }
+        if let Some(opt_in) = outcome.telemetry_opt_in {
+            config.telemetry.enabled = opt_in;
+        }
+    });
+    if let Err(e) = result {
         tracing::warn!(target: "tui.input", "Failed to persist intro outcome: {e}");
+    }
+    if outcome.telemetry_opt_in.is_some() {
+        if let Err(e) = update_app_state(|state| {
+            state.has_responded_to_telemetry = true;
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to persist intro outcome: {e}");
+        }
     }
     // Sync the install id with the saved opt-in choice (no-op under
     // DO_NOT_TRACK). Done after save so telemetry.json matches config.
@@ -72,13 +88,14 @@ fn apply_intro_outcome(outcome: &IntroOutcome) {
 /// Sets the opt-in flag, marks the prompt answered so it never re-appears,
 /// and reconciles the install id (no-op under `DO_NOT_TRACK`).
 fn persist_telemetry_consent(opt_in: bool) {
-    let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) else {
-        tracing::warn!(target: "tui.input", "telemetry consent: load_config failed; not persisting");
-        return;
-    };
-    config.telemetry.enabled = opt_in;
-    config.app_state.has_responded_to_telemetry = true;
-    if let Err(e) = save_config(&config) {
+    if let Err(e) = update_config(|config| {
+        config.telemetry.enabled = opt_in;
+    }) {
+        tracing::warn!(target: "tui.input", "Failed to persist telemetry consent: {e}");
+    }
+    if let Err(e) = update_app_state(|state| {
+        state.has_responded_to_telemetry = true;
+    }) {
         tracing::warn!(target: "tui.input", "Failed to persist telemetry consent: {e}");
     }
     crate::telemetry::apply_opt_in_change(opt_in);
@@ -260,6 +277,25 @@ fn mouse_event_bytes(
     }
 }
 
+/// The bare mouse-motion (hover) bytes to forward to the previewed pane, or
+/// `None` when the app didn't ask for them. Only a full-screen app in
+/// any-event tracking (DEC 1003, tmux `#{mouse_all_flag}`) gets bare motion:
+/// a button-tracking (1000/1002) app never expects a no-button motion report.
+/// The report is the button-agnostic code 3 plus the motion bit (SGR `35`),
+/// which is what a real terminal emits for hover, so an app that highlights
+/// content under the pointer (Claude Code's expandable-block hover) reacts in
+/// the live preview the way it does over a direct tmux attach. Pure so the
+/// gate is asserted directly in tests, mirroring `wheel_forward_key`.
+fn hover_forward_bytes(
+    cursor: &crate::tmux::PaneCursor,
+    pane: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Option<Vec<u8>> {
+    (cursor.alternate_on && cursor.mouse_all)
+        .then(|| mouse_event_bytes(3, false, true, cursor.mouse_sgr, pane, col, row))
+}
+
 /// Page presses delivered per wheel notch for a no-mouse full-screen app.
 /// One page per notch: full-screen apps that scroll on `PageUp`/`PageDown`
 /// (Claude Code's fullscreen renderer is the motivating case) have no finer
@@ -432,6 +468,56 @@ impl HomeView {
         self.tool_picker_dialog = Some(crate::tui::dialogs::ToolPickerDialog::new(
             &self.tool_configs,
         ));
+    }
+
+    fn activate_tool(&mut self, tool_name: String, toggle_current: bool) -> Option<Action> {
+        let (background, command_is_empty) = self
+            .tool_configs
+            .get(&tool_name)
+            .map(|config| (config.background, config.command.trim().is_empty()))
+            .unwrap_or((false, false));
+
+        if !background {
+            if toggle_current
+                && matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name)
+            {
+                self.view_mode = ViewMode::Structured;
+                return None;
+            } else {
+                self.view_mode = ViewMode::Tool(tool_name);
+                self.preview_scroll_offset = 0;
+                self.tool_preview_cache = super::PreviewCache::default();
+            }
+            return self.maybe_auto_start_live_send();
+        }
+
+        if command_is_empty {
+            self.info_dialog = Some(InfoDialog::new(
+                "Tool command missing",
+                &format!("Tool '{}' has no command configured", tool_name),
+            ));
+            return None;
+        }
+
+        let Some(session_id) = self.selected_session.clone() else {
+            self.info_dialog = Some(InfoDialog::new(
+                "No session selected",
+                "Select a session before running a background tool.",
+            ));
+            return None;
+        };
+
+        if let Some(inst) = self.get_instance(&session_id) {
+            if matches!(inst.status, Status::Creating | Status::Deleting) {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Session not ready",
+                    "This session is still being created or deleted.",
+                ));
+                return None;
+            }
+        }
+
+        Some(Action::RunBackgroundToolSession(session_id, tool_name))
     }
 
     /// Check if the key event matches any configured tool session hotkey.
@@ -973,6 +1059,10 @@ impl HomeView {
                 }
                 None
             }
+            "empty_trash" => {
+                self.empty_trash_all();
+                None
+            }
             "pull_sandbox_image" => self.pending_image_pull.take().map(Action::SpawnImagePull),
             "quit_during_creation" => Some(Action::Quit),
             "quit" => Some(Action::Quit),
@@ -999,6 +1089,28 @@ impl HomeView {
             )
             .neutral(),
         );
+    }
+
+    /// Confirm before permanently purging every trashed session (the Trash
+    /// section's "Empty Trash" bulk action). The purge is irreversible, so it
+    /// keeps the destructive red tone rather than the neutral archive one. A
+    /// no-op info dialog when the trash is already empty avoids a confirm that
+    /// would delete nothing.
+    pub(super) fn prompt_empty_trash(&mut self) {
+        let count = self.instances.values().filter(|i| i.is_trashed()).count();
+        if count == 0 {
+            self.info_dialog = Some(InfoDialog::new(
+                "Trash is empty",
+                "There are no trashed sessions to delete.",
+            ));
+            return;
+        }
+        let noun = if count == 1 { "session" } else { "sessions" };
+        self.confirm_dialog = Some(ConfirmDialog::new(
+            "Empty Trash",
+            &format!("Permanently delete {count} trashed {noun}? This cannot be undone."),
+            "empty_trash",
+        ));
     }
 
     /// Confirm before archiving every active session under the focused group.
@@ -1276,9 +1388,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(tool_name) => {
                     self.tool_picker_dialog = None;
-                    self.view_mode = ViewMode::Tool(tool_name);
-                    self.preview_scroll_offset = 0;
-                    self.tool_preview_cache = super::PreviewCache::default();
+                    self.pending_dialog_click_action = self.activate_tool(tool_name, false);
                 }
             }
             return true;
@@ -1391,13 +1501,10 @@ impl HomeView {
                     }
                     DialogResult::Submit(_) => {
                         self.hooks_install_dialog = None;
-                        if let Ok(mut config) =
-                            crate::session::config::load_config().map(|c| c.unwrap_or_default())
-                        {
-                            config.app_state.has_acknowledged_agent_hooks = true;
-                            if let Err(e) = crate::session::config::save_config(&config) {
-                                tracing::warn!(target: "tui.input", "Failed to save config: {e}");
-                            }
+                        if let Err(e) = crate::session::config::update_app_state(|state| {
+                            state.has_acknowledged_agent_hooks = true;
+                        }) {
+                            tracing::warn!(target: "tui.input", "Failed to save config: {e}");
                         }
                         if let Some(data) = self.pending_hooks_install_data.take() {
                             self.pending_dialog_click_action =
@@ -1773,10 +1880,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(tool_name) => {
                     self.tool_picker_dialog = None;
-                    self.view_mode = ViewMode::Tool(tool_name);
-                    self.preview_scroll_offset = 0;
-                    self.tool_preview_cache = super::PreviewCache::default();
-                    return None;
+                    return self.activate_tool(tool_name, false);
                 }
             }
         }
@@ -1843,13 +1947,10 @@ impl HomeView {
                 DialogResult::Submit(_) => {
                     self.hooks_install_dialog = None;
                     // Persist the acknowledgment
-                    if let Ok(mut config) =
-                        crate::session::config::load_config().map(|c| c.unwrap_or_default())
-                    {
-                        config.app_state.has_acknowledged_agent_hooks = true;
-                        if let Err(e) = crate::session::config::save_config(&config) {
-                            tracing::warn!(target: "tui.input", "Failed to save config: {e}");
-                        }
+                    if let Err(e) = crate::session::config::update_app_state(|state| {
+                        state.has_acknowledged_agent_hooks = true;
+                    }) {
+                        tracing::warn!(target: "tui.input", "Failed to save config: {e}");
                     }
                     // Resume session creation
                     if let Some(data) = self.pending_hooks_install_data.take() {
@@ -2334,6 +2435,24 @@ impl HomeView {
             return None;
         }
 
+        // Permission response dialog
+        if let Some(dialog) = &mut self.permission_response_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.permission_response_dialog = None;
+                    self.pending_permission_response_session = None;
+                }
+                DialogResult::Submit(choice) => {
+                    self.permission_response_dialog = None;
+                    if let Some(session_id) = self.pending_permission_response_session.take() {
+                        self.execute_permission_response(&session_id, choice);
+                    }
+                }
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.update_confirm_dialog {
             use crate::tui::dialogs::DialogResult;
             match dialog.handle_key(key) {
@@ -2422,14 +2541,7 @@ impl HomeView {
     ) -> Option<Action> {
         // Dynamic tool session hotkeys (checked before everything else).
         if let Some(tool_name) = self.match_tool_hotkey(&key) {
-            if matches!(&self.view_mode, ViewMode::Tool(current) if current == &tool_name) {
-                self.view_mode = ViewMode::Structured;
-            } else {
-                self.view_mode = ViewMode::Tool(tool_name);
-                self.preview_scroll_offset = 0;
-                self.tool_preview_cache = super::PreviewCache::default();
-            }
-            return None;
+            return self.activate_tool(tool_name, true);
         }
 
         // Context-dependent Esc handling (not a relocatable action).
@@ -2620,8 +2732,14 @@ impl HomeView {
                     ViewMode::Structured => ViewMode::Terminal,
                     ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Structured,
                 };
+                if matches!(self.view_mode, ViewMode::Terminal) {
+                    if let Some(action) = self.maybe_auto_start_live_send() {
+                        return Some(action);
+                    }
+                }
             }
             ActionId::SendMessage => self.open_send_message_dialog(),
+            ActionId::RespondToPermission => self.open_permission_response_dialog(),
             ActionId::Stop => self.stop_selected(),
             ActionId::Delete => self.open_delete_for_selected(),
             ActionId::Rename => self.open_rename_for_selected(),
@@ -3325,9 +3443,14 @@ impl HomeView {
                 .as_deref()
                 .map(|h| format!(" [{}]", h))
                 .unwrap_or_default();
+            let title = if config.background {
+                format!("Run: {}{}", name, hotkey_label)
+            } else {
+                format!("Open tool: {}{}", name, hotkey_label)
+            };
             entries.push(PaletteCommand {
                 id: "tool-session",
-                title: format!("Open tool: {}{}", name, hotkey_label),
+                title,
                 group: PaletteGroup::Actions,
                 keywords: vec!["tool", "session"],
                 hotkey: String::new(),
@@ -3380,12 +3503,7 @@ impl HomeView {
                 }
                 None
             }
-            PaletteAction::ToolSession(tool_name) => {
-                self.view_mode = ViewMode::Tool(tool_name);
-                self.preview_scroll_offset = 0;
-                self.tool_preview_cache = super::PreviewCache::default();
-                None
-            }
+            PaletteAction::ToolSession(tool_name) => self.activate_tool(tool_name, false),
             PaletteAction::Cheat(message) => Some(Action::SetTransientStatus(message)),
         }
     }
@@ -3441,8 +3559,11 @@ impl HomeView {
             if let Some(inst) = self.get_instance(&id) {
                 // Trashed rows are stopped and only surface under the collapsed
                 // Trash section; they never "need attention", so skip them even
-                // when a stale unread flag survived the trash (#2489).
-                let is_actionable = !inst.is_trashed()
+                // when a stale unread flag survived the trash (#2489). Snoozed
+                // and archived rows are likewise explicit "don't bother me"
+                // sink states, same as everywhere else that checks
+                // `is_snoozed()` / `is_archived()`.
+                let is_actionable = !inst.is_dismissed()
                     && (inst.status == Status::Waiting
                         || matches!(inst.idle_age(), Some(age) if age < window)
                         || (crate::session::unread_enabled() && inst.is_unread()));
@@ -3459,8 +3580,7 @@ impl HomeView {
             .find(|inst| {
                 if visible_sessions.contains(&inst.id)
                     || current_session.as_deref() == Some(inst.id.as_str())
-                    || inst.is_archived()
-                    || inst.is_trashed()
+                    || inst.is_dismissed()
                 {
                     return false;
                 }
@@ -3489,7 +3609,7 @@ impl HomeView {
             let Some(inst) = self.get_instance(&id) else {
                 continue;
             };
-            if inst.is_trashed() {
+            if inst.is_dismissed() {
                 continue;
             }
             if inst.status != Status::Idle {
@@ -3522,8 +3642,7 @@ impl HomeView {
         for inst in self.instances.values() {
             if visible_sessions.contains(&inst.id)
                 || current_session.as_deref() == Some(inst.id.as_str())
-                || inst.is_archived()
-                || inst.is_trashed()
+                || inst.is_dismissed()
                 || inst.status != Status::Idle
             {
                 continue;
@@ -3781,11 +3900,11 @@ impl HomeView {
             self.rebuild_flat_items();
             self.reseat_cursor_after_rebuild();
         }
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.sort_order = Some(self.sort_order);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.input", "Failed to save sort order: {}", e);
-            }
+        let sort_order = self.sort_order;
+        if let Err(e) = update_app_state(|state| {
+            state.sort_order = Some(sort_order);
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to save sort order: {}", e);
         }
     }
 
@@ -3793,16 +3912,11 @@ impl HomeView {
         self.group_by = new_mode;
         self.rebuild_flat_items();
         self.reseat_cursor_after_rebuild();
-        match load_config().map(|c| c.unwrap_or_default()) {
-            Ok(mut config) => {
-                config.app_state.group_by = Some(self.group_by);
-                if let Err(e) = save_config(&config) {
-                    tracing::warn!(target: "tui.input", "Failed to save group_by mode: {}", e);
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "tui.input", "Failed to load config for group_by save: {}", e);
-            }
+        let group_by = self.group_by;
+        if let Err(e) = update_app_state(|state| {
+            state.group_by = Some(group_by);
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to save group_by mode: {}", e);
         }
     }
 
@@ -3956,8 +4070,9 @@ impl HomeView {
     /// `Shift` is the escape hatch: a Shift-held event returns `false` so it
     /// falls through to aoe's own preview text-selection. Returns `true` when
     /// the event was forwarded (and should be consumed). Wheel and bare-motion
-    /// events are not handled here (the wheel has its own path; bare motion is
-    /// not forwarded).
+    /// events are not handled here; the wheel has its own path
+    /// (`forward_wheel_to_preview`) and so does bare motion
+    /// (`forward_hover_to_preview`).
     ///
     /// A button held down is tracked in `mouse_forward_btn` so its drag and
     /// release reach the agent even if the pointer leaves the preview rect
@@ -4015,6 +4130,42 @@ impl HomeView {
             col,
             row,
         );
+        self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes))
+    }
+
+    /// Forward a bare mouse-motion event over the preview to a previewed
+    /// agent in any-event tracking (DEC 1003), so its hover-driven UI (e.g.
+    /// Claude Code highlighting an expandable block under the pointer) works
+    /// in the live preview like it does over a direct attach. Active in both
+    /// live-send and passive preview, mirroring the click/wheel forwards.
+    /// Deduped per mapped pane cell: crossterm can re-report a cell, and one
+    /// report per cell crossed is what a real terminal delivers anyway.
+    /// Unlike `forward_mouse_to_preview` this never consumes the event; the
+    /// caller still runs aoe's own hover handling (sidebar, dialogs) for the
+    /// same motion. Returns true when a report was sent.
+    pub fn forward_hover_to_preview(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() || !self.hit_preview(col, row) {
+            // Off-preview (or covered by a modal): drop the dedup cell so
+            // re-entering the preview on the same cell reports again.
+            self.hover_forward_cell = None;
+            return false;
+        }
+        let Some(cursor) = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|w| w.current_cursor())
+        else {
+            return false;
+        };
+        let pane = self.preview_text_view.pane;
+        let Some(bytes) = hover_forward_bytes(&cursor, pane, col, row) else {
+            return false;
+        };
+        let cell = map_pane_cell(pane, col, row);
+        if self.hover_forward_cell == Some(cell) {
+            return false;
+        }
+        self.hover_forward_cell = Some(cell);
         self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes))
     }
 
@@ -4113,11 +4264,45 @@ impl HomeView {
         if self.diff_view.is_some() || self.has_non_live_send_overlay() {
             return None;
         }
-        let inner = self.list_inner_area;
-        if !inner.contains(Position::from((col, row))) {
+        if self.flat_items.is_empty() {
             return None;
         }
-        if self.flat_items.is_empty() {
+        // The list and the pinned shelf render in two separate rects, each with
+        // its own scroll window, so hit-testing mirrors the render split. The
+        // shelf holds the `flat_items` suffix `[list_len..]`; the list holds
+        // `[..list_len]`. Both recompute the same scroll math the renderer used
+        // (identical `calculate_scroll` inputs), so a click resolves to exactly
+        // the row drawn under the pointer.
+        let list_len = self.shelf_start().unwrap_or(self.flat_items.len());
+
+        let shelf = self.shelf_inner_area;
+        if shelf.height > 0 && shelf.contains(Position::from((col, row))) {
+            let shelf_len = self.flat_items.len() - list_len;
+            let shelf_visible = shelf.height as usize;
+            let shelf_cursor = self
+                .cursor
+                .saturating_sub(list_len)
+                .min(shelf_len.saturating_sub(1));
+            let scroll = crate::tui::components::scroll::calculate_scroll(
+                shelf_len,
+                shelf_cursor,
+                shelf_visible,
+            );
+            let row_in = row.saturating_sub(shelf.y) as usize;
+            let row_offset = if scroll.has_more_above { 1 } else { 0 };
+            if row_in < row_offset {
+                return None;
+            }
+            let item_row = row_in - row_offset;
+            if item_row >= scroll.list_visible {
+                return None;
+            }
+            let idx = list_len + scroll.scroll_offset + item_row;
+            return (idx < self.flat_items.len()).then_some(idx);
+        }
+
+        let inner = self.list_inner_area;
+        if !inner.contains(Position::from((col, row))) {
             return None;
         }
         let visible_height = if self.search_active {
@@ -4133,11 +4318,11 @@ impl HomeView {
             return None;
         }
 
-        let scroll = crate::tui::components::scroll::calculate_scroll(
-            self.flat_items.len(),
-            self.cursor,
-            visible_height,
-        );
+        // Cursor may sit in the shelf; clamp it into the list range so the
+        // list's scroll offset matches what the renderer computed.
+        let list_cursor = self.cursor.min(list_len.saturating_sub(1));
+        let scroll =
+            crate::tui::components::scroll::calculate_scroll(list_len, list_cursor, visible_height);
         let row_offset = if scroll.has_more_above { 1 } else { 0 };
         if row_in_inner < row_offset {
             return None;
@@ -4147,10 +4332,7 @@ impl HomeView {
             return None;
         }
         let abs_idx = scroll.scroll_offset + item_row;
-        if abs_idx >= self.flat_items.len() {
-            return None;
-        }
-        Some(abs_idx)
+        (abs_idx < list_len).then_some(abs_idx)
     }
 
     /// Currently hovered `flat_items` index, derived from the last mouse
@@ -4188,6 +4370,30 @@ impl HomeView {
             // Mirror the row-aware menu copy from the web sidebar so a group
             // row reads as "Rename Group / Delete Group" instead of bare
             // "Rename / Delete".
+            // The synthetic Trash / Archived section headers are `Item::Group`
+            // rows but they aren't user groups: a generic "Rename Group /
+            // Delete Group" menu is meaningless on them. Route them to the
+            // dedicated bulk menus instead (Empty Trash / Restore All /
+            // collapse), keyed off the sentinel path and the section's current
+            // collapsed state so the toggle label reads correctly. Only the
+            // exact top-level headers qualify; project sub-folders nested under
+            // Archived (project mode) keep the normal group handling, since
+            // their bulk actions would act on the whole section, not the folder.
+            if let super::Item::Group {
+                path, collapsed, ..
+            } = &self.flat_items[idx]
+            {
+                if crate::session::is_trash_section_path(path) {
+                    self.context_menu =
+                        Some(ContextMenuDialog::for_trash_section(anchor, *collapsed));
+                    return true;
+                }
+                if crate::session::is_archived_section_path(path) {
+                    self.context_menu =
+                        Some(ContextMenuDialog::for_archived_section(anchor, *collapsed));
+                    return true;
+                }
+            }
             let is_group = matches!(self.flat_items[idx], super::Item::Group { .. });
             // A real project header in project view gets the pin menu; the
             // cursor was just moved onto this row, so `project_group_at_cursor`
@@ -4319,6 +4525,38 @@ impl HomeView {
                 // opened for.
                 self.toggle_project_pin_at_cursor();
             }
+            // The three section-header actions read which synthetic section the
+            // cursor is on (the right-click moved it onto the header). Empty
+            // Trash routes through a confirm; the rest act immediately.
+            ContextMenuAction::EmptyTrash => self.prompt_empty_trash(),
+            ContextMenuAction::RestoreAll => match self.section_at_cursor() {
+                Some(SidebarSection::Trash) => self.restore_all_from_trash(),
+                Some(SidebarSection::Archived) => self.unarchive_all(),
+                None => {}
+            },
+            ContextMenuAction::ToggleSectionCollapse => match self.section_at_cursor() {
+                Some(SidebarSection::Trash) => self.toggle_trashed_section(),
+                Some(SidebarSection::Archived) => self.toggle_archived_section(),
+                None => {}
+            },
+        }
+    }
+
+    /// Which synthetic section the cursor's `Item::Group` header belongs to, if
+    /// any. Used by the section context-menu actions, which the right-click has
+    /// already parked the cursor on top of.
+    pub(super) fn section_at_cursor(&self) -> Option<SidebarSection> {
+        match self.flat_items.get(self.cursor) {
+            Some(super::Item::Group { path, .. }) => {
+                if crate::session::is_trash_section_path(path) {
+                    Some(SidebarSection::Trash)
+                } else if crate::session::is_archived_section_path(path) {
+                    Some(SidebarSection::Archived)
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 
@@ -4410,34 +4648,40 @@ impl HomeView {
         if outcome.newly_seen.is_empty() && outcome.disabled.is_none() {
             return;
         }
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            for id in outcome.newly_seen {
-                if !config.app_state.tips_seen.iter().any(|s| s == &id) {
-                    config.app_state.tips_seen.push(id);
+        let newly_seen = outcome.newly_seen;
+        if let Err(e) = update_app_state(|state| {
+            for id in newly_seen {
+                if !state.tips_seen.iter().any(|s| s == &id) {
+                    state.tips_seen.push(id);
                 }
             }
-            if let Some(disabled) = outcome.disabled {
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to persist tips state: {}", e);
+        }
+        if let Some(disabled) = outcome.disabled {
+            if let Err(e) = update_config(|config| {
                 config.session.show_tips = !disabled;
-            }
-            self.tips_unseen = super::tips_unseen_count(&config);
-            if let Err(e) = save_config(&config) {
+            }) {
                 tracing::warn!(target: "tui.input", "Failed to persist tips state: {}", e);
             }
+        }
+        if let Ok(config) = load_config().map(|c| c.unwrap_or_default()) {
+            self.tips_unseen = super::tips_unseen_count(&config);
         }
     }
 
     /// Bump the "opened new-session with a selection" counter that earns the
     /// new-from-selection tip (#2262), persist it, and refresh the badge.
     fn record_new_session_with_selection(&mut self) {
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.new_session_with_selection_count = config
-                .app_state
-                .new_session_with_selection_count
-                .saturating_add(1);
+        if let Err(e) = update_app_state(|state| {
+            state.new_session_with_selection_count =
+                state.new_session_with_selection_count.saturating_add(1);
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
+            return;
+        }
+        if let Ok(config) = load_config().map(|c| c.unwrap_or_default()) {
             self.tips_unseen = super::tips_unseen_count(&config);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
-            }
         }
     }
 
@@ -4449,15 +4693,21 @@ impl HomeView {
         if self.pending_tip_pop.map(|t| t.id) == Some("new-from-selection") {
             self.pending_tip_pop = None;
         }
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            if config.app_state.used_new_from_selection {
-                return;
-            }
-            config.app_state.used_new_from_selection = true;
+        let already_used = load_config()
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.app_state.used_new_from_selection);
+        if already_used {
+            return;
+        }
+        if let Err(e) = update_app_state(|state| {
+            state.used_new_from_selection = true;
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
+            return;
+        }
+        if let Ok(config) = load_config().map(|c| c.unwrap_or_default()) {
             self.tips_unseen = super::tips_unseen_count(&config);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
-            }
         }
     }
 
@@ -5116,11 +5366,12 @@ impl HomeView {
             .map(|(_, key)| *key);
         let footer_changed = prev_footer_hover != self.footer_hover;
 
-        let new_pos = if self.list_inner_area.contains(Position::from((col, row))) {
-            Some((col, row))
-        } else {
-            None
-        };
+        // Hover is live over both the scrolling list and the pinned shelf, so
+        // a shelf row (Trash / Archived) highlights under the pointer the same
+        // way a list row does. `resolve_row_to_index` maps either region.
+        let over_sidebar = self.list_inner_area.contains(Position::from((col, row)))
+            || self.shelf_inner_area.contains(Position::from((col, row)));
+        let new_pos = if over_sidebar { Some((col, row)) } else { None };
         let prev_idx = self.hovered_index();
         self.mouse_pos = new_pos;
         let new_idx = self.hovered_index();
@@ -5230,7 +5481,7 @@ impl HomeView {
         // throw voice text on the floor; losing dictation is worse than
         // silently catching it.
         if let Some((id, title, target)) = self.resolve_send_target() {
-            let label = live_send::format_target_label(&title, target);
+            let label = live_send::format_target_label(&title, &target);
             self.pending_send_session = Some(id);
             self.pending_send_target = target;
             let mut dialog = SendMessageDialog::new(&label);
@@ -5326,9 +5577,8 @@ impl HomeView {
         // currently previewing. Structured view → agent pane (historical
         // default). Terminal view → the paired host or container
         // terminal pane, so 'm'/Tab compose against the same shell
-        // the user sees. Tool view stays out of live-send (no clean
-        // target for lazygit/yazi etc.; let the caller fall back to
-        // AttachToolSession).
+        // the user sees. Tool view → the named tool's paired pane, so
+        // live-send can drive lazygit/yazi/etc. the same way.
         self.pending_live_send_target = match &self.view_mode {
             ViewMode::Structured => live_send::LiveSendTarget::Agent,
             ViewMode::Terminal => {
@@ -5338,9 +5588,24 @@ impl HomeView {
                     live_send::LiveSendTarget::Terminal
                 }
             }
-            ViewMode::Tool(_) => return None,
+            ViewMode::Tool(name) => live_send::LiveSendTarget::Tool(name.clone()),
         };
         Some(Action::EnterLiveSend(id))
+    }
+
+    /// Auto-start live-send after an explicit view switch (`ToggleView`,
+    /// opening a tool session) when the `Auto Live-Send On View Switch`
+    /// setting is on for the selected session's resolved config. `None`
+    /// when there's no selected session or the setting is off; the
+    /// caller then leaves the plain view switch alone. Deliberately not
+    /// wired into list navigation/selection: this only fires from the
+    /// explicit view-switch call sites that invoke it.
+    pub(super) fn maybe_auto_start_live_send(&mut self) -> Option<Action> {
+        let id = self.selected_session.clone()?;
+        if !self.live_send_on_view_switch(&id) {
+            return None;
+        }
+        self.start_live_send()
     }
 
     /// Translate one key event in live-send mode and hand the result to
@@ -5543,7 +5808,7 @@ impl HomeView {
         let Some(inst) = self.get_instance(&state.session_id) else {
             return Some("Session was deleted while live mode was active.");
         };
-        let current_name = match state.target {
+        let current_name = match &state.target {
             live_send::LiveSendTarget::Agent => {
                 crate::tmux::Session::generate_name(&inst.id, &inst.title)
             }
@@ -5553,6 +5818,11 @@ impl HomeView {
             live_send::LiveSendTarget::ContainerTerminal => {
                 crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
             }
+            live_send::LiveSendTarget::Tool(name) => {
+                crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
+                    .session_name()
+                    .to_string()
+            }
         };
         if current_name != state.tmux_name {
             return Some("Session was renamed while live mode was active.");
@@ -5561,6 +5831,44 @@ impl HomeView {
             return Some("tmux pane went away while live mode was active.");
         }
         None
+    }
+
+    /// Open the permission-response dialog for the currently-selected
+    /// session, letting the user answer a permission prompt they can see
+    /// in the pane without attaching. Unlike `open_send_message_dialog`,
+    /// this has no `Status::Waiting` gate: the user has already visually
+    /// confirmed the prompt is showing, and AoE never parses pane content
+    /// to verify it. Silently no-ops when there's no valid session
+    /// selected or it's mid create/delete; shows an info dialog when the
+    /// selected session's agent has no mapped keystroke sequences yet.
+    fn open_permission_response_dialog(&mut self) {
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
+        let Some(inst) = self.get_instance(&id) else {
+            return;
+        };
+        if matches!(inst.status, Status::Creating | Status::Deleting) {
+            return;
+        }
+        if inst.is_structured() {
+            return;
+        }
+        let title = inst.title.clone();
+        let tool = inst.tool.clone();
+        let supported = crate::agents::get_agent(&tool)
+            .and_then(|a| a.permission_response)
+            .is_some();
+        if !supported {
+            self.info_dialog = Some(InfoDialog::new(
+                "Not Supported",
+                &format!("{} doesn't support quick permission responses yet.", tool),
+            ));
+            return;
+        }
+        self.pending_permission_response_session = Some(id);
+        self.permission_response_dialog =
+            Some(crate::tui::dialogs::PermissionResponseDialog::new(&title));
     }
 
     /// Open the send-message dialog for the currently-selected running session.
@@ -5575,7 +5883,7 @@ impl HomeView {
         let Some((id, title, target)) = self.resolve_send_target() else {
             return;
         };
-        let label = live_send::format_target_label(&title, target);
+        let label = live_send::format_target_label(&title, &target);
         self.pending_send_session = Some(id);
         self.pending_send_target = target;
         let mut dialog = SendMessageDialog::new(&label);
@@ -5623,13 +5931,14 @@ impl HomeView {
             return None;
         }
         let target = self.current_send_target();
-        let ready = match target {
+        let ready = match &target {
             live_send::LiveSendTarget::Agent => crate::tmux::Session::new(&inst.id, &inst.title)
                 .map(|s| s.exists())
                 .unwrap_or(false),
             live_send::LiveSendTarget::Terminal | live_send::LiveSendTarget::ContainerTerminal => {
                 true
             }
+            live_send::LiveSendTarget::Tool(_) => true,
         };
         if !ready {
             return None;
@@ -5661,7 +5970,7 @@ impl HomeView {
         }
 
         if let Some((id, title, target)) = self.resolve_send_target() {
-            let label = live_send::format_target_label(&title, target);
+            let label = live_send::format_target_label(&title, &target);
             self.pending_send_session = Some(id);
             self.pending_send_target = target;
             let mut dialog = SendMessageDialog::new(&label);
@@ -5834,11 +6143,10 @@ impl HomeView {
     }
 
     fn persist_volume_ignores_globs_ack(&self) {
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.has_acknowledged_volume_ignores_globs = true;
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.input", "Failed to save volume_ignores ack: {e}");
-            }
+        if let Err(e) = update_app_state(|state| {
+            state.has_acknowledged_volume_ignores_globs = true;
+        }) {
+            tracing::warn!(target: "tui.input", "Failed to save volume_ignores ack: {e}");
         }
     }
 
@@ -6097,8 +6405,42 @@ mod tests {
             alternate_on,
             mouse_tracking,
             mouse_sgr,
+            mouse_all: false,
             position_reliable: true,
         }
+    }
+
+    /// `hover_forward_bytes` only fires for a full-screen app in any-event
+    /// tracking (1003), and then emits the no-button motion report (SGR 35 /
+    /// the X10 equivalent) in the app's encoding. Everything else, including
+    /// a button-tracking (1000/1002) app that never expects bare motion,
+    /// gets `None`.
+    #[test]
+    fn hover_forward_bytes_requires_any_event_tracking() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(0, 0, 80, 24);
+        let mut all = cursor_for(true, true, true);
+        all.mouse_all = true;
+        // Cell (10,5) maps to 1-based (11,6); no-button motion is 3 + 32.
+        assert_eq!(
+            hover_forward_bytes(&all, pane, 10, 5).as_deref(),
+            Some(b"\x1b[<35;11;6M".as_slice())
+        );
+        // Legacy X10 encoding still gets the motion report.
+        all.mouse_sgr = false;
+        assert_eq!(
+            hover_forward_bytes(&all, pane, 10, 5),
+            Some(vec![0x1b, b'[', b'M', 35 + 32, 11 + 32, 6 + 32])
+        );
+        // Button-only tracking: no bare motion.
+        assert_eq!(
+            hover_forward_bytes(&cursor_for(true, true, true), pane, 10, 5),
+            None
+        );
+        // Normal screen: never forwarded, even with 1003 set.
+        let mut normal = cursor_for(false, true, true);
+        normal.mouse_all = true;
+        assert_eq!(hover_forward_bytes(&normal, pane, 10, 5), None);
     }
 
     /// The fix for #2407: a full-screen pane with no mouse tracking must
@@ -6170,15 +6512,15 @@ mod tests {
         // banner route through the same helper so the label can't drift.
         use live_send::{format_target_label, LiveSendTarget};
         assert_eq!(
-            format_target_label("my-session", LiveSendTarget::Agent),
+            format_target_label("my-session", &LiveSendTarget::Agent),
             "my-session",
         );
         assert_eq!(
-            format_target_label("my-session", LiveSendTarget::Terminal),
+            format_target_label("my-session", &LiveSendTarget::Terminal),
             "my-session (terminal)",
         );
         assert_eq!(
-            format_target_label("my-session", LiveSendTarget::ContainerTerminal),
+            format_target_label("my-session", &LiveSendTarget::ContainerTerminal),
             "my-session (container)",
         );
     }
@@ -6276,6 +6618,7 @@ mod tests {
             ToolSessionConfig {
                 command: "lazygit".into(),
                 hotkey: Some("Alt+g".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6283,6 +6626,7 @@ mod tests {
             ToolSessionConfig {
                 command: "yazi".into(),
                 hotkey: Some("Ctrl+f".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6290,6 +6634,7 @@ mod tests {
             ToolSessionConfig {
                 command: "tig".into(),
                 hotkey: Some("Alt+too-long".into()),
+                background: false,
             },
         );
         let warnings = validate_tool_hotkeys(&tools);
@@ -6308,6 +6653,7 @@ mod tests {
             ToolSessionConfig {
                 command: "lazygit".into(),
                 hotkey: Some("Alt+g".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6315,6 +6661,7 @@ mod tests {
             ToolSessionConfig {
                 command: "rg --files".into(),
                 hotkey: None,
+                background: false,
             },
         );
         assert!(validate_tool_hotkeys(&tools).is_empty());
@@ -6328,6 +6675,7 @@ mod tests {
             ToolSessionConfig {
                 command: "z".into(),
                 hotkey: Some("Alt+z".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6335,6 +6683,7 @@ mod tests {
             ToolSessionConfig {
                 command: "lazygit".into(),
                 hotkey: Some("Alt+g".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6342,6 +6691,7 @@ mod tests {
             ToolSessionConfig {
                 command: "x".into(),
                 hotkey: Some("Ctrl+x".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6349,6 +6699,7 @@ mod tests {
             ToolSessionConfig {
                 command: "y".into(),
                 hotkey: None,
+                background: false,
             },
         );
 
@@ -6371,6 +6722,7 @@ mod tests {
             ToolSessionConfig {
                 command: "b".into(),
                 hotkey: Some("Alt+g".into()),
+                background: false,
             },
         );
         tools.insert(
@@ -6378,6 +6730,7 @@ mod tests {
             ToolSessionConfig {
                 command: "a".into(),
                 hotkey: Some("Alt+g".into()),
+                background: false,
             },
         );
         let cache = build_tool_hotkey_cache(&tools);
@@ -6413,10 +6766,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn volume_ignores_glob_confirm_message_fires_only_on_globs() {
+        // `isolate_home` restores HOME/XDG on Drop (the old bare `set_var`
+        // leaked the deleted tempdir into later tests) and holds the
+        // process-global env lock for the guard's lifetime.
         let temp_home = tempfile::TempDir::new().unwrap();
-        std::env::set_var("HOME", temp_home.path());
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+        let _home = crate::session::test_support::isolate_home(temp_home.path());
 
         let project = tempfile::TempDir::new().unwrap();
         std::fs::create_dir_all(project.path().join("src/App/bin")).unwrap();

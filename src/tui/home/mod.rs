@@ -24,7 +24,7 @@ use tui_input::Input;
 
 use crate::session::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
-    config::{load_config, save_config, GroupByMode, SortOrder},
+    config::{load_config, update_app_state, update_config, GroupByMode, SortOrder},
     flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
     DefaultTerminalMode, EnsureReadyOutcome, Group, GroupTree, Instance, Item, Storage,
 };
@@ -391,6 +391,12 @@ pub(super) const ICON_EXPANDED: &str = "▼";
 /// Marks a pinned project header in project view. Geometric per DESIGN.md
 /// (clean readable glyphs, not emoji).
 pub(super) const ICON_PINNED: &str = "◆";
+/// Type glyphs for the two synthetic bottom-shelf section headers, so they read
+/// as system shelves rather than user groups. Single-width geometric glyphs per
+/// DESIGN.md (emoji would break column alignment and the shelf's mouse
+/// hit-testing on terminals that render them double-width or as tofu).
+pub(super) const ICON_TRASH_SECTION: &str = "⊘";
+pub(super) const ICON_ARCHIVED_SECTION: &str = "▤";
 
 /// Hook progress for a session being created in the background
 pub(super) struct CreatingHookProgress {
@@ -453,6 +459,17 @@ pub struct HomeView {
     /// the render layer reads this rather than re-resolving the config on
     /// every paint.
     pub(super) row_tag_mode: crate::session::config::RowTagMode,
+    /// Whether an agent's OSC 52 clipboard write (surfaced by the VT capture
+    /// worker) is forwarded to the host clipboard (#2420). Cached from
+    /// `[tmux] clipboard != disabled` at construction + config refresh. Auto
+    /// forwards too: that mode's "respect the user's tmux config" rationale
+    /// is about tmux server options, which cannot influence this in-process
+    /// path.
+    pub(super) agent_clipboard_forward: bool,
+    /// Whether live previews may use the VT transport (`[tmux] vt_live`).
+    /// Cached at construction + config refresh and pushed into the capture
+    /// worker (`set_vt_enabled`), so a settings toggle applies in place.
+    pub(super) vt_live_enabled: bool,
     /// Active profile's `default_attach_mode`, cached at construction and
     /// refreshed by `refresh_from_config` / `switch_profile`. The help
     /// overlay falls back to this when no session row is selected so the
@@ -541,6 +558,10 @@ pub struct HomeView {
     /// hover highlight like a session row does. Updated by `handle_hover`.
     pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
+    pub(super) permission_response_dialog: Option<super::dialogs::PermissionResponseDialog>,
+    /// Session to receive the permission-response keystrokes once the
+    /// dialog resolves.
+    pub(super) pending_permission_response_session: Option<String>,
     /// Session to receive the message from the send dialog
     pub(super) pending_send_session: Option<String>,
     /// Which pane the pending send-message dialog will target. Set
@@ -661,6 +682,12 @@ pub struct HomeView {
     /// worker reports back via `apply_restart_results`.
     pub(super) restart_in_flight: std::collections::HashSet<String>,
 
+    /// Trashed sessions whose permanent-purge Purge claim (#2541) this TUI won
+    /// before dispatching the teardown. Their delete finalize applies the #2534
+    /// restore-race recheck and releases the claim (ownership-guarded), instead
+    /// of the plain live-session removal.
+    pub(super) purge_claimed: std::collections::HashSet<String>,
+
     // Performance: background session creation (for sandbox)
     pub(super) creation_poller: CreationPoller,
     /// Set to true if user cancelled while creation was pending
@@ -735,6 +762,13 @@ pub struct HomeView {
     /// keep working; clicks use the inner rect so we don't try to select
     /// the border row.
     pub(super) list_inner_area: Rect,
+    /// Inner content rect of the pinned bottom "shelf" that holds the
+    /// synthetic Trash / Archived sections, rendered below the scrolling list
+    /// and its divider. Zeroed on frames with no shelf (nothing trashed or
+    /// archived) or while the sidebar is collapsed, so a stale rect can't
+    /// resolve a click to a shelf row that isn't drawn. Clicks inside it map
+    /// to the `flat_items` shelf suffix; see `resolve_row_to_index`.
+    pub(super) shelf_inner_area: Rect,
     /// Clickable rect of the collapse button drawn on the list block's
     /// top-right border (expanded side-by-side/stacked view). Zeroed on
     /// frames where the button isn't drawn (e.g. while collapsed) so a
@@ -864,6 +898,13 @@ pub struct HomeView {
     /// drag and release reach the agent even after the pointer leaves the
     /// preview rect. `None` when no forwarded button is held.
     pub(super) mouse_forward_btn: Option<u16>,
+
+    /// Last 1-based pane cell reported to the previewed agent as a bare
+    /// mouse-motion (hover) event, so `forward_hover_to_preview` reports each
+    /// cell once, the way a real terminal reports motion once per cell
+    /// crossed. Cleared when the pointer leaves the preview so re-entering
+    /// the same cell reports again.
+    pub(super) hover_forward_cell: Option<(u16, u16)>,
 
     /// Last pointer cell reported during a `PreviewSelect` drag, `None`
     /// outside one. The event-loop ticker reads it (`tick_preview_autoscroll`)
@@ -1929,6 +1970,23 @@ impl HomeView {
                     });
                 }
             }
+            // Self-heal (#2541): clear op_claims left by a purge/restore that
+            // crashed mid-operation. `try_claim` already treats an expired claim
+            // as free, so this is belt-and-suspenders that stops a stranded
+            // claim from lingering on disk after a crash.
+            let ttl = crate::session::Instance::OP_CLAIM_TTL;
+            let now = chrono::Utc::now();
+            for inst in &mut instances {
+                if inst.clear_expired_op_claim(ttl, now) {
+                    let target_id = inst.id.clone();
+                    let _ = storage.update(|disk, _groups| {
+                        if let Some(d) = disk.iter_mut().find(|i| i.id == target_id) {
+                            d.clear_expired_op_claim(ttl, now);
+                        }
+                        Ok(())
+                    });
+                }
+            }
             let tree = GroupTree::new_with_groups(&instances, &groups);
             group_trees.insert(profile_name.clone(), tree);
             all_instances.extend(instances);
@@ -2013,6 +2071,9 @@ impl HomeView {
             sort_order,
             group_by,
             row_tag_mode: resolved.session.row_tag,
+            agent_clipboard_forward: resolved.tmux.clipboard
+                != crate::session::config::TmuxClipboardMode::Disabled,
+            vt_live_enabled: resolved.tmux.vt_live,
             profile_default_attach_mode: resolved.session.default_attach_mode,
             project_group_collapsed: user_config
                 .as_ref()
@@ -2066,6 +2127,8 @@ impl HomeView {
             tips_badge_rect: None,
             tips_badge_hovered: false,
             send_message_dialog: None,
+            permission_response_dialog: None,
+            pending_permission_response_session: None,
             pending_send_session: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
             pending_live_send_target: live_send::LiveSendTarget::Agent,
@@ -2103,6 +2166,7 @@ impl HomeView {
             stop_poller: StopPoller::new(),
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
+            purge_claimed: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
             on_launch_hooks_ran: HashSet::new(),
@@ -2122,6 +2186,7 @@ impl HomeView {
             diff_area: Rect::default(),
             list_area: Rect::default(),
             list_inner_area: Rect::default(),
+            shelf_inner_area: Rect::default(),
             mouse_pos: None,
             last_click: None,
             last_preview_click: None,
@@ -2151,6 +2216,7 @@ impl HomeView {
             main_area_width: 0,
             drag_state: None,
             mouse_forward_btn: None,
+            hover_forward_cell: None,
             preview_drag_pos: None,
             preview_autoscroll_at: None,
             preview_selection: None,
@@ -2665,14 +2731,30 @@ impl HomeView {
     /// Apply any pending status updates from the background poller.
     /// Returns true if updates were applied.
     pub fn apply_status_updates(&mut self) -> bool {
-        if let Some(updates) = self.status_poller.try_recv_updates() {
-            for update in updates {
-                self.apply_one_status_update(update);
+        use std::sync::mpsc::TryRecvError;
+
+        match self.status_poller.try_recv_updates() {
+            Ok(updates) => {
+                for update in updates {
+                    self.apply_one_status_update(update);
+                }
+                self.pending_status_refresh = false;
+                true
             }
-            self.pending_status_refresh = false;
-            return true;
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // The worker thread is gone (a panic in poll_statuses_once).
+                // Without a respawn, pending_status_refresh stays set and
+                // request_status_refresh never fires again, freezing every
+                // session's live status for the rest of the process.
+                tracing::error!(
+                    target: "tui.home",
+                    "status poller worker gone; respawning a fresh poller",
+                );
+                self.reset_status_refresh();
+                true
+            }
         }
-        false
     }
 
     /// Apply a single status update from the poller. Extracted from the
@@ -2832,69 +2914,190 @@ impl HomeView {
 
     pub fn apply_deletion_results(&mut self) -> bool {
         use crate::session::Status;
+        use std::sync::mpsc::TryRecvError;
 
-        if let Some(result) = self.deletion_poller.try_recv_result() {
-            if result.success {
-                // Captured before the remove (the instance is still in
-                // `self.instances`); recorded only after the deletion is
-                // durably saved, so a failed save leaves no tombstone (#2141).
-                let recent_entry = self
+        match self.deletion_poller.try_recv_result() {
+            Ok(result) => {
+                if result.success {
+                    // Captured before the remove (the instance is still in
+                    // `self.instances`); recorded only after the deletion is
+                    // durably saved, so a failed save leaves no tombstone (#2141).
+                    let recent_entry = self
+                        .instances
+                        .get(&result.session_id)
+                        .and_then(crate::session::recent_project_entry_for);
+
+                    // A claimed trashed-purge (#2541) commits under the flock with
+                    // the #2534 restore-race recheck: if a peer restored the session
+                    // mid-purge, keep the restored row and release our claim rather
+                    // than dropping it. Otherwise it removes the row on disk itself,
+                    // so the normal in-memory removal is skipped in favor of a
+                    // reload that converges with disk.
+                    if self.purge_claimed.remove(&result.session_id) {
+                        match self.finalize_claimed_purge(&result.session_id) {
+                            Ok(true) => {
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Session restored",
+                                    "This session was restored while its delete ran; the record was kept, but its worktree, branch, container, or transcript may already be gone. Inspect and repair it.",
+                                ));
+                            }
+                            Ok(false) => {
+                                if let Some(entry) = recent_entry {
+                                    if let Err(e) = crate::session::record_recent_project(entry) {
+                                        tracing::warn!(target: "tui.home",
+                                            "recording recent project after delete failed: {e}");
+                                    }
+                                }
+                            }
+                            Err(()) => {
+                                // Storage failed: the row is untouched on disk (still
+                                // trashed + Purge-claimed by us). Release our claim so
+                                // it is not wedged until the TTL, surface the error,
+                                // and let the reload bring the row back.
+                                self.release_trashed_purge_claim(&result.session_id);
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Delete Failed",
+                                    "Could not finalize the delete under the storage lock. Try again.",
+                                ));
+                            }
+                        }
+                        if let Err(e) = self.reload() {
+                            tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
+                        }
+                        return true;
+                    }
+
+                    self.remove_instance(&result.session_id);
+                    self.rebuild_group_trees();
+
+                    if let Err(e) = self.save() {
+                        tracing::error!(target: "tui.home", "Failed to save after deletion: {}", e);
+                    } else if let Some(entry) = recent_entry {
+                        // Best-effort; keeps the project in the wizard Recent tab.
+                        if let Err(e) = crate::session::record_recent_project(entry) {
+                            tracing::warn!(target: "tui.home",
+                                "recording recent project after delete failed: {e}");
+                        }
+                    }
+                    if let Err(e) = self.reload() {
+                        tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
+                    }
+                } else {
+                    // A claimed trashed-purge whose teardown failed keeps the row
+                    // for retry; release our owned Purge claim so it is not wedged
+                    // (a peer restore is then free to win). See #2541.
+                    if self.purge_claimed.remove(&result.session_id) {
+                        self.release_trashed_purge_claim(&result.session_id);
+                    }
+                    let error = if result.errors.is_empty() {
+                        None
+                    } else {
+                        Some(result.errors.join("; "))
+                    };
+                    self.mutate_instance(&result.session_id, |inst| {
+                        inst.status = Status::Error;
+                        inst.last_error = error;
+                    });
+                }
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // The single worker thread is gone (a panic in
+                // perform_deletion dropped result_tx). Deleting rows are
+                // frozen for the StatusPoller (tier 0), so without this they
+                // would sit on "Deleting" forever. Mirrors the Disconnected
+                // handling in `apply_restart_results`.
+                let stuck: Vec<String> = self
                     .instances
-                    .get(&result.session_id)
-                    .and_then(crate::session::recent_project_entry_for);
-                self.remove_instance(&result.session_id);
-                self.rebuild_group_trees();
-
+                    .values()
+                    .filter(|i| i.status == Status::Deleting)
+                    .map(|i| i.id.clone())
+                    .collect();
+                // The dead worker will never finalize any purge we claimed;
+                // release every owned claim so peers are not wedged until the
+                // claim TTL expires (#2541).
+                let claimed: Vec<String> = self.purge_claimed.drain().collect();
+                for id in &claimed {
+                    self.release_trashed_purge_claim(id);
+                }
+                if stuck.is_empty() && claimed.is_empty() {
+                    return false;
+                }
+                tracing::error!(
+                    target: "tui.home",
+                    rows = stuck.len(),
+                    "deletion poller worker gone; marking stuck Deleting rows Error",
+                );
+                for id in &stuck {
+                    self.mutate_instance(id, |inst| {
+                        inst.status = Status::Error;
+                        inst.last_error =
+                            Some("Deletion worker crashed; session was not deleted".to_string());
+                    });
+                }
                 if let Err(e) = self.save() {
                     tracing::error!(target: "tui.home", "Failed to save after deletion: {}", e);
-                } else if let Some(entry) = recent_entry {
-                    // Best-effort; keeps the project in the wizard Recent tab.
-                    if let Err(e) = crate::session::record_recent_project(entry) {
-                        tracing::warn!(target: "tui.home",
-                            "recording recent project after delete failed: {e}");
-                    }
                 }
-                if let Err(e) = self.reload() {
-                    tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
-                }
-            } else {
-                let error = if result.errors.is_empty() {
-                    None
-                } else {
-                    Some(result.errors.join("; "))
-                };
-                self.mutate_instance(&result.session_id, |inst| {
-                    inst.status = Status::Error;
-                    inst.last_error = error;
-                });
+                true
             }
-            return true;
         }
-        false
     }
 
     /// Apply the result of a background stop. Returns true if an instance was
     /// updated so the caller can trigger a redraw.
     pub fn apply_stop_results(&mut self) -> bool {
         use crate::session::Status;
+        use std::sync::mpsc::TryRecvError;
 
-        if let Some(result) = self.stop_poller.try_recv_result() {
-            if result.success {
-                // Status was already set to Stopped optimistically when the
-                // stop was requested; reassert it in case the disk reload or
-                // a race changed it, and clear any stale error.
-                self.set_instance_error(&result.session_id, None);
-                self.set_instance_status(&result.session_id, Status::Stopped);
-            } else {
-                self.set_instance_error(&result.session_id, result.error);
-                self.set_instance_status(&result.session_id, Status::Error);
+        match self.stop_poller.try_recv_result() {
+            Ok(result) => {
+                if result.success {
+                    // Status was already set to Stopped optimistically when the
+                    // stop was requested; reassert it in case the disk reload or
+                    // a race changed it, and clear any stale error.
+                    self.set_instance_error(&result.session_id, None);
+                    self.set_instance_status(&result.session_id, Status::Stopped);
+                } else {
+                    self.set_instance_error(&result.session_id, result.error);
+                    self.set_instance_status(&result.session_id, Status::Error);
+                }
+                if let Err(e) = self.save() {
+                    tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
+                }
+                true
             }
-            if let Err(e) = self.save() {
-                tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // The single worker thread is gone (a panic in perform_stop
+                // dropped result_tx). Rows were optimistically marked Stopped
+                // at request time and Stopped is frozen for the StatusPoller
+                // (tier 0), so a lost failure result would otherwise show
+                // "Stopped" over a still-running container forever; only the
+                // poller's in-flight set knows which rows those are. Mirrors
+                // the Disconnected handling in `apply_restart_results`.
+                let stuck = self.stop_poller.take_pending();
+                if stuck.is_empty() {
+                    return false;
+                }
+                tracing::error!(
+                    target: "tui.home",
+                    rows = stuck.len(),
+                    "stop poller worker gone; marking in-flight stops Error",
+                );
+                for id in &stuck {
+                    self.set_instance_error(
+                        id,
+                        Some("Stop worker crashed; the session may not have stopped".to_string()),
+                    );
+                    self.set_instance_status(id, Status::Error);
+                }
+                if let Err(e) = self.save() {
+                    tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
+                }
+                true
             }
-            return true;
         }
-        false
     }
 
     /// Apply any pending session ID updates from background pollers.
@@ -3708,23 +3911,10 @@ impl HomeView {
     /// "don't warn me again" in the quit dialog.
     pub(super) fn disable_confirm_before_quit(&mut self) {
         self.confirm_before_quit = false;
-        match load_config() {
-            Ok(Some(mut config)) => {
-                config.session.confirm_before_quit = false;
-                if let Err(e) = save_config(&config) {
-                    tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-                }
-            }
-            Ok(None) => {
-                let mut config = crate::session::config::Config::default();
-                config.session.confirm_before_quit = false;
-                if let Err(e) = save_config(&config) {
-                    tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "tui.home", "Failed to load config: {e}");
-            }
+        if let Err(e) = update_config(|config| {
+            config.session.confirm_before_quit = false;
+        }) {
+            tracing::warn!(target: "tui.home", "Failed to save config: {e}");
         }
     }
 
@@ -3908,6 +4098,7 @@ impl HomeView {
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
+            || self.permission_response_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
             || self.tips_dialog.is_some()
@@ -3950,6 +4141,7 @@ impl HomeView {
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
+            || self.permission_response_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
             || self.tips_dialog.is_some()
@@ -4011,26 +4203,16 @@ impl HomeView {
         self.save_sidebar_collapsed();
     }
 
-    /// Load the persisted config, apply `mutate` to its `app_state`, and write
-    /// it back. Both the load and save failure paths are logged, so a
-    /// UI-preference write never fails silently in one persister while being
-    /// reported in another. Centralizes the load/mutate/save boilerplate the
-    /// home view's preference persisters would otherwise each repeat.
+    /// Apply `mutate` to `state.toml`'s `AppStateConfig` and write it back. The
+    /// failure path is logged, so a UI-preference write never fails silently.
+    /// Centralizes the load/mutate/save boilerplate the home view's preference
+    /// persisters would otherwise each repeat.
     fn persist_app_state(
         what: &str,
         mutate: impl FnOnce(&mut crate::session::config::AppStateConfig),
     ) {
-        match load_config() {
-            Ok(config) => {
-                let mut config = config.unwrap_or_default();
-                mutate(&mut config.app_state);
-                if let Err(e) = save_config(&config) {
-                    tracing::warn!(target: "tui.home", "Failed to save config ({what}): {e}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(target: "tui.home", "Failed to load config for {what} save: {e}");
-            }
+        if let Err(e) = update_app_state(mutate) {
+            tracing::warn!(target: "tui.home", "Failed to save app state ({what}): {e}");
         }
     }
 
@@ -4270,6 +4452,24 @@ impl HomeView {
                 inst.status,
                 Status::Running | Status::Waiting | Status::Starting | Status::Creating
             )
+        })
+    }
+
+    /// Index of the first `flat_items` row that belongs to the pinned bottom
+    /// shelf (the synthetic Archived / Trash sections), or `None` when neither
+    /// section is present. The shelf is always a contiguous suffix: both
+    /// sections are appended last (Archived then Trash) by `build_flat_items`,
+    /// and nothing non-shelf follows them, so the first row whose path sits
+    /// within either section marks where the workspace list ends and the shelf
+    /// begins. The renderer splits the sidebar here and hit-testing maps clicks
+    /// in the shelf region back to this suffix.
+    pub(super) fn shelf_start(&self) -> Option<usize> {
+        self.flat_items.iter().position(|it| match it {
+            Item::Group { path, .. } => {
+                crate::session::is_within_archived_section(path)
+                    || crate::session::is_within_trash_section(path)
+            }
+            Item::Session { .. } => false,
         })
     }
 
@@ -4584,7 +4784,7 @@ impl HomeView {
         // live-send does (see `ensure_pane_ready_with_size`): otherwise it
         // boots at tmux's 80x24 default and runs narrow until something
         // resizes it.
-        match target {
+        match &target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(size).map_err(Into::into)
@@ -4625,6 +4825,16 @@ impl HomeView {
                     return;
                 }
             }
+            live_send::LiveSendTarget::Tool(name) => {
+                let name = name.clone();
+                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, size) {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Send Failed",
+                        &format!("Cannot prepare tool '{}': {}", name, e),
+                    ));
+                    return;
+                }
+            }
         };
         let Some(inst) = self.get_instance(session_id) else {
             self.info_dialog = Some(InfoDialog::new(
@@ -4633,7 +4843,7 @@ impl HomeView {
             ));
             return;
         };
-        let tmux_session = match target {
+        let tmux_session = match &target {
             live_send::LiveSendTarget::Agent => {
                 match crate::tmux::Session::new(&inst.id, &inst.title) {
                     Ok(s) => s,
@@ -4652,13 +4862,18 @@ impl HomeView {
             live_send::LiveSendTarget::ContainerTerminal => crate::tmux::Session::from_name(
                 &crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title),
             ),
+            live_send::LiveSendTarget::Tool(name) => crate::tmux::Session::from_name(
+                crate::tmux::ToolSession::new(&inst.id, &inst.title, name).session_name(),
+            ),
         };
         // Agent gets a tool-specific Enter delay so paste-burst-aware
         // agents (e.g. Codex) don't swallow the final Enter. Shells in
         // the paired terminal panes don't need the delay.
-        let delay = match target {
+        let delay = match &target {
             live_send::LiveSendTarget::Agent => crate::agents::send_keys_enter_delay(&inst.tool),
-            live_send::LiveSendTarget::Terminal | live_send::LiveSendTarget::ContainerTerminal => 0,
+            live_send::LiveSendTarget::Terminal
+            | live_send::LiveSendTarget::ContainerTerminal
+            | live_send::LiveSendTarget::Tool(_) => 0,
         };
         if let Err(e) = tmux_session.send_keys_with_delay(message, delay) {
             self.info_dialog = Some(InfoDialog::new(
@@ -4677,6 +4892,91 @@ impl HomeView {
         }
     }
 
+    /// Send the tmux keystrokes for a permission-prompt decision straight
+    /// to the selected session's agent pane. No pane-readiness wait like
+    /// `execute_send_message` performs: this action only makes sense
+    /// against an already-live pane showing a prompt, so there is nothing
+    /// to revive.
+    pub fn execute_permission_response(
+        &mut self,
+        session_id: &str,
+        choice: crate::tui::dialogs::PermissionResponseChoice,
+    ) {
+        let Some(inst) = self.get_instance(session_id) else {
+            return;
+        };
+        if inst.is_structured() {
+            return;
+        }
+        let Some(response) =
+            crate::agents::get_agent(&inst.tool).and_then(|a| a.permission_response)
+        else {
+            return;
+        };
+        let tokens = permission_response_tokens(&response, choice);
+        let tmux_session = match crate::tmux::Session::new(&inst.id, &inst.title) {
+            Ok(s) => s,
+            Err(e) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Respond Failed",
+                    &format!("Failed to resolve session: {}", e),
+                ));
+                return;
+            }
+        };
+        if let Err(e) = tmux_session.send_key_tokens(tokens) {
+            self.info_dialog = Some(InfoDialog::new(
+                "Respond Failed",
+                &format!("Failed to send response: {}", e),
+            ));
+        }
+    }
+}
+
+/// Map a decision to its agent-defined keystroke sequence. Pure and
+/// tmux-free so the choice-to-field mapping is unit-testable without a
+/// real pane; `execute_permission_response` is the only caller.
+fn permission_response_tokens(
+    response: &crate::agents::PermissionResponse,
+    choice: crate::tui::dialogs::PermissionResponseChoice,
+) -> &'static [crate::agents::KeyToken] {
+    use crate::tui::dialogs::PermissionResponseChoice::*;
+    match choice {
+        Allow => response.allow,
+        AllowAlways => response.allow_always,
+        Deny => response.deny,
+    }
+}
+
+#[cfg(test)]
+mod permission_response_tokens_tests {
+    use super::*;
+    use crate::agents::{KeyToken, PermissionResponse};
+    use crate::tui::dialogs::PermissionResponseChoice;
+
+    #[test]
+    fn maps_each_choice_to_its_own_field() {
+        let response = PermissionResponse {
+            allow: &[KeyToken::Literal("1")],
+            allow_always: &[KeyToken::Literal("2")],
+            deny: &[KeyToken::Literal("3")],
+        };
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::Allow),
+            response.allow
+        );
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
+            response.allow_always
+        );
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::Deny),
+            response.deny
+        );
+    }
+}
+
+impl HomeView {
     /// Size to boot a cold/dead agent pane at on live-send entry: the visible
     /// preview output rect when known, else the full terminal. `preview_pane_area`
     /// is the exact rect `finalize_live_send_resize` resizes to, so seeding the
@@ -4716,8 +5016,10 @@ impl HomeView {
     /// Returns `Err(())` if the pane could not be readied (`info_dialog` is
     /// set with the underlying error so the caller only has to clear its toast).
     pub fn prepare_live_send(&mut self, session_id: &str) -> Result<(), ()> {
-        let target = self.pending_live_send_target;
-        self.pending_live_send_target = live_send::LiveSendTarget::Agent;
+        let target = std::mem::replace(
+            &mut self.pending_live_send_target,
+            live_send::LiveSendTarget::Agent,
+        );
         let size = crate::terminal::get_size();
         // Agent targets revive the agent pane via the full
         // ensure_pane_ready cascade (Docker, splash, resume). Terminal
@@ -4732,7 +5034,7 @@ impl HomeView {
         // lost, leaves the pane pinned at ~50% width until live mode is
         // re-entered. See `Instance::ensure_pane_ready_with_size`.
         let agent_boot_size = self.live_send_boot_size();
-        match target {
+        match &target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(agent_boot_size)
@@ -4774,6 +5076,16 @@ impl HomeView {
                     return Err(());
                 }
             }
+            live_send::LiveSendTarget::Tool(name) => {
+                let name = name.clone();
+                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, size) {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Live send failed",
+                        &format!("Cannot prepare tool '{}': {}", name, e),
+                    ));
+                    return Err(());
+                }
+            }
         };
         let inst = match self.get_instance(session_id) {
             Some(inst) => inst.clone(),
@@ -4791,7 +5103,7 @@ impl HomeView {
         };
         // Resolve the tmux session name up front so the worker thread
         // can reconstruct a Session without re-touching HomeView.
-        let tmux_name = match target {
+        let tmux_name = match &target {
             live_send::LiveSendTarget::Agent => {
                 match crate::tmux::Session::new(&inst.id, &inst.title) {
                     Ok(s) => s.name().to_string(),
@@ -4809,6 +5121,11 @@ impl HomeView {
             }
             live_send::LiveSendTarget::ContainerTerminal => {
                 crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+            }
+            live_send::LiveSendTarget::Tool(name) => {
+                crate::tmux::ToolSession::new(&inst.id, &inst.title, name)
+                    .session_name()
+                    .to_string()
             }
         };
         // Switching live mode from session A to session B (click on a
@@ -4953,25 +5270,19 @@ impl HomeView {
         if pane.width == 0 || pane.height == 0 {
             return;
         }
-        let resize_status = crate::tmux::tmux_command()
-            .args([
-                "resize-window",
-                "-t",
-                &tmux_name,
-                "-x",
-                &pane.width.to_string(),
-                "-y",
-                &pane.height.to_string(),
-            ])
-            .stderr(std::process::Stdio::null())
-            .status();
-        // Only register the dedup if the resize subprocess actually
-        // succeeded. If tmux failed (session died between our state
-        // install and now, tmux binary missing, etc.), leaving
-        // `live_send_last_resize` as None lets the next
-        // `refresh_preview_cache_if_needed` try the resize again
-        // through the worker.
-        if matches!(&resize_status, Ok(s) if s.success()) {
+        // Size through `Session::resize_window` so the pane lands at exactly
+        // `pane.height` after tmux's status-bar chrome (#2766), matching the
+        // worker's Resize arm and the passive preview sync. A raw
+        // `resize-window -y pane.height` leaves a `pane.height - chrome` pane
+        // one row shorter than the preview output area, desyncing the live
+        // preview by a row (#2742).
+        let session = crate::tmux::Session::from_name(&tmux_name);
+        // Only register the dedup if the session still exists (so the resize was
+        // actually attempted). If it died between our state install and now,
+        // leaving `live_send_last_resize` as None lets the next
+        // `refresh_preview_cache_if_needed` retry through the worker.
+        if session.exists() {
+            session.resize_window(pane.width, pane.height);
             self.live_send_last_resize = Some((pane.width, pane.height));
         }
         // Give the agent ~50ms to handle SIGWINCH and re-lay out
@@ -5326,8 +5637,8 @@ impl HomeView {
         };
         let patch = crate::session::PassiveStatusPatch::from_instance(inst);
         if let Err(e) = storage.update(|insts, _groups| {
-            if let Some(disk) = insts.iter_mut().find(|i| i.id == patch.id) {
-                disk.merge_passive_status_patch(&patch);
+            if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
+                disk.merge_passive_status_patch(id, &patch);
                 if mark_unread {
                     disk.mark_unread();
                 }
@@ -5344,7 +5655,7 @@ impl HomeView {
             // `AOE_LOG_LEVEL=debug`.
             tracing::warn!(
                 target: "session.store",
-                session_id = %patch.id,
+                session_id = %id,
                 "persist_passive_status_transition failed: {e}"
             );
         }
@@ -5654,6 +5965,38 @@ impl HomeView {
         Ok(())
     }
 
+    /// Tool-pane counterpart of `ensure_terminal_pane_ready`: mirrors
+    /// `App::attach_tool_session`'s on-demand creation so live-send can
+    /// target a tool (lazygit, yazi, etc.) that hasn't been launched yet.
+    /// Used by `prepare_live_send` when the live target is `Tool(name)`.
+    fn ensure_tool_pane_ready(
+        &mut self,
+        session_id: &str,
+        tool_name: &str,
+        size: Option<(u16, u16)>,
+    ) -> anyhow::Result<()> {
+        let inst = self
+            .get_instance(session_id)
+            .ok_or_else(|| anyhow::anyhow!("session not found: {}", session_id))?
+            .clone();
+        let tool_config = self
+            .tool_configs
+            .get(tool_name)
+            .ok_or_else(|| anyhow::anyhow!("tool '{}' is not configured", tool_name))?
+            .clone();
+        if tool_config.command.is_empty() {
+            anyhow::bail!("Tool '{}' has no command configured", tool_name);
+        }
+        let tool = crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
+        if !tool.exists() || tool.is_pane_dead() {
+            if tool.exists() {
+                let _ = tool.kill();
+            }
+            tool.create_with_size(&inst.project_path, &tool_config.command, size)?;
+        }
+        Ok(())
+    }
+
     pub fn restart_instance_with_size_opts(
         &mut self,
         id: &str,
@@ -5896,6 +6239,15 @@ impl HomeView {
             .map(|s| s.default_attach_mode)
     }
 
+    /// Resolve `live_send_on_view_switch` for an existing session row:
+    /// whether switching into Terminal or Tool view should auto-start
+    /// live-send instead of waiting for a separate Enter/Tab/click. See
+    /// `resolve_session_config_for` for resolution rules.
+    pub(super) fn live_send_on_view_switch(&self, session_id: &str) -> bool {
+        self.resolve_session_config_for(session_id)
+            .is_some_and(|s| s.live_send_on_view_switch)
+    }
+
     /// True when Enter on the *currently selected session row* would
     /// enter live-send mode (and Tab would swap to a tmux attach).
     /// Returns `None` when the cursor is not on a session row (group or
@@ -6026,6 +6378,12 @@ impl HomeView {
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.row_tag_mode = config.session.row_tag;
+        self.agent_clipboard_forward =
+            config.tmux.clipboard != crate::session::config::TmuxClipboardMode::Disabled;
+        self.vt_live_enabled = config.tmux.vt_live;
+        if let Some(worker) = self.preview_capture_worker.as_ref() {
+            worker.set_vt_enabled(self.vt_live_enabled);
+        }
         self.profile_default_attach_mode = config.session.default_attach_mode;
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);

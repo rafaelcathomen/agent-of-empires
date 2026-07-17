@@ -118,6 +118,39 @@ pub(crate) fn capture_claude_session_id(
     anyhow::bail!("No active Claude session found for {}", project_path)
 }
 
+/// Whether we can affirmatively prove Claude has *no* persisted transcript for
+/// `session_id` under `project_path` on the host filesystem.
+///
+/// Claude only writes `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` once a
+/// conversation has real content. A session AoE minted a UUID for but that was
+/// killed before the first prompt (an "empty thread") therefore has a stored
+/// `agent_session_id` that never hit disk, and `claude --resume <uuid>` on it
+/// fails with "No conversation found" every time. Callers use this to launch
+/// such an id as a fresh pinned session (`--session-id <uuid>`) instead of a
+/// guaranteed-to-fail `--resume`.
+///
+/// Returns `true` ONLY when the Claude home resolves and the transcript file is
+/// confirmed missing. Any uncertainty (home dir unresolved) returns `false` so
+/// the caller preserves the existing `--resume` attempt rather than risk
+/// downgrading a real conversation to a fresh start. The check is
+/// existence-only (no mtime freshness gate), so an idle-but-real conversation
+/// whose jsonl is older than the live-capture window is still reported present.
+pub(crate) fn claude_host_transcript_confirmed_absent(
+    project_path: &str,
+    session_id: &str,
+) -> bool {
+    let Ok(claude_home) = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude") else {
+        return false;
+    };
+    let canonical = canonicalize_or_raw(project_path);
+    let dir_name = encode_claude_project_path(&canonical.to_string_lossy());
+    let transcript = claude_home
+        .join("projects")
+        .join(dir_name)
+        .join(format!("{session_id}.jsonl"));
+    !transcript.is_file()
+}
+
 /// Scan `~/.claude/projects/{encoded-path}/` and pick this poller's session.
 ///
 /// Tie-break:
@@ -2284,6 +2317,7 @@ pub(crate) fn hermes_poll_fn_sandboxed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::EnvGuard;
     use serial_test::serial;
 
     #[test]
@@ -2370,6 +2404,50 @@ mod tests {
 
         let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
         assert_eq!(result.unwrap(), uuid_new);
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_claude_host_transcript_confirmed_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let present = "11111111-2222-3333-4444-555555555555";
+        let missing = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let file = project_dir.join(format!("{present}.jsonl"));
+        std::fs::write(&file, "data\n").unwrap();
+        // Existence-only: an old mtime (past the live-capture window) must not
+        // read as absent, or an idle real conversation would lose its resume.
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(hour_ago))
+            .unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        assert!(
+            !claude_host_transcript_confirmed_absent("/tmp/myproject", present),
+            "a transcript on disk (even stale) must not be reported absent"
+        );
+        assert!(
+            claude_host_transcript_confirmed_absent("/tmp/myproject", missing),
+            "an unwritten sid must be reported confirmed-absent"
+        );
+        // A project dir that was never created is also confirmed-absent.
+        assert!(claude_host_transcript_confirmed_absent(
+            "/tmp/never-opened-project",
+            present
+        ));
 
         match old_val {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
@@ -3022,29 +3100,6 @@ mod tests {
         }
     }
 
-    /// Sets `VIBE_HOME` for the test's lifetime and restores it on Drop, so a
-    /// panicking assertion can't leak the override into later serial tests.
-    struct VibeHomeGuard {
-        previous: Option<String>,
-    }
-
-    impl VibeHomeGuard {
-        fn set(value: &Path) -> Self {
-            let previous = std::env::var("VIBE_HOME").ok();
-            std::env::set_var("VIBE_HOME", value);
-            Self { previous }
-        }
-    }
-
-    impl Drop for VibeHomeGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(v) => std::env::set_var("VIBE_HOME", v),
-                None => std::env::remove_var("VIBE_HOME"),
-            }
-        }
-    }
-
     #[test]
     fn test_extract_vibe_meta_nested() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3105,7 +3160,7 @@ mod tests {
         });
         std::fs::write(s2_dir.join("meta.json"), s2_meta.to_string()).unwrap();
 
-        let _guard = VibeHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("VIBE_HOME", tmp.path())]);
 
         let exclusion = HashSet::new();
         let result = capture_vibe_session_id(project_dir.to_str().unwrap(), &exclusion);
@@ -3130,7 +3185,7 @@ mod tests {
         });
         std::fs::write(s1_dir.join("meta.json"), s1_meta.to_string()).unwrap();
 
-        let _guard = VibeHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("VIBE_HOME", tmp.path())]);
 
         let exclusion = HashSet::new();
         let result = capture_vibe_session_id(project_dir.to_str().unwrap(), &exclusion);
@@ -3162,7 +3217,7 @@ mod tests {
         });
         std::fs::write(s1_dir.join("meta.json"), s1_meta.to_string()).unwrap();
 
-        let _guard = VibeHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("VIBE_HOME", tmp.path())]);
 
         let mut extra = HashSet::new();
         extra.insert("stale-sid-cleared-by-cascade".to_string());
@@ -3570,23 +3625,6 @@ mod tests {
         assert_eq!(selected, uuid_new);
     }
 
-    struct CodexHomeGuard(Option<String>);
-    impl CodexHomeGuard {
-        fn set(path: &str) -> Self {
-            let prev = std::env::var("CODEX_HOME").ok();
-            std::env::set_var("CODEX_HOME", path);
-            Self(prev)
-        }
-    }
-    impl Drop for CodexHomeGuard {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(v) => std::env::set_var("CODEX_HOME", v),
-                None => std::env::remove_var("CODEX_HOME"),
-            }
-        }
-    }
-
     #[test]
     #[serial]
     fn test_codex_respects_codex_home_env() {
@@ -3607,7 +3645,7 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = CodexHomeGuard::set(tmp.path().to_str().unwrap());
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
 
         let result = capture_codex_session_id(project_dir.to_str().unwrap(), &HashSet::new());
         assert!(result.is_ok());
@@ -3621,7 +3659,7 @@ mod tests {
         let sessions_dir = tmp.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
 
-        let _guard = CodexHomeGuard::set(tmp.path().to_str().unwrap());
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
 
         let result = capture_codex_session_id("/tmp/some-project", &HashSet::new());
         assert!(result.is_err(), "Empty sessions dir should return error");
@@ -3852,7 +3890,7 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = GeminiHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("GEMINI_CLI_HOME", tmp.path())]);
 
         let result = capture_gemini_session_id(project_path, &HashSet::new());
         assert_eq!(result.unwrap(), "new-id-222");
@@ -3895,7 +3933,7 @@ mod tests {
             .set_times(std::fs::FileTimes::new().set_modified(older))
             .unwrap();
 
-        let _guard = GeminiHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("GEMINI_CLI_HOME", tmp.path())]);
 
         let mut exclusion = HashSet::new();
         exclusion.insert("json-id-AAA".to_string());
@@ -3916,27 +3954,6 @@ mod tests {
             "json-id-AAA",
             "Filename stem in exclusion should have no effect"
         );
-    }
-
-    struct GeminiHomeGuard {
-        previous: Option<String>,
-    }
-
-    impl GeminiHomeGuard {
-        fn set(value: &Path) -> Self {
-            let previous = std::env::var("GEMINI_CLI_HOME").ok();
-            std::env::set_var("GEMINI_CLI_HOME", value);
-            Self { previous }
-        }
-    }
-
-    impl Drop for GeminiHomeGuard {
-        fn drop(&mut self) {
-            match self.previous.take() {
-                Some(v) => std::env::set_var("GEMINI_CLI_HOME", v),
-                None => std::env::remove_var("GEMINI_CLI_HOME"),
-            }
-        }
     }
 
     #[test]
@@ -4030,7 +4047,7 @@ mod tests {
         );
         std::fs::write(&session_file, body).unwrap();
 
-        let _guard = GeminiHomeGuard::set(tmp.path());
+        let _guard = EnvGuard::set(&[("GEMINI_CLI_HOME", tmp.path())]);
 
         let result = capture_gemini_session_id(project_path, &HashSet::new());
         assert_eq!(result.unwrap(), "jsonl-session-id");

@@ -1,6 +1,6 @@
 //! Main TUI application
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
@@ -9,6 +9,7 @@ use crossterm::event::{
 use futures_util::StreamExt;
 use ratatui::prelude::*;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
 
 use super::attached_status_hooks::AttachedStatusHookWatcher;
@@ -16,7 +17,7 @@ use super::home::{HomeView, TerminalMode};
 use super::status_poller::StatusUpdate;
 use super::styles::Theme;
 use crate::containers::image_update::ImageUpdate;
-use crate::session::{get_update_settings, save_config, Config};
+use crate::session::{get_update_settings, update_app_state, Config};
 use crate::tmux::AvailableTools;
 use crate::update::{check_for_update, UpdateInfo};
 
@@ -235,6 +236,80 @@ fn theme_apply_needed(current: (&str, bool), next: (&str, bool)) -> bool {
     current != next
 }
 
+/// RAII guard that ignores `SIGINT` and `SIGQUIT` for as long as it's
+/// alive, restoring whatever disposition was in effect beforehand on drop.
+///
+/// `with_raw_mode_disabled` calls `disable_raw_mode()` before handing the
+/// terminal to a child process (tmux attach, an editor shell-out). With raw
+/// mode off, the kernel goes back to delivering keyboard-generated signals
+/// to aoe's own foreground process group. If the child pane is dead or
+/// hung and the user hits Ctrl+C to escape, that SIGINT lands on aoe
+/// itself, not just the child, and aoe has no handler for it: it dies
+/// immediately with zero cleanup, taking down every tmux session/pane it
+/// was managing. Holding this guard for the duration of the closure closes
+/// that window.
+#[cfg(unix)]
+struct IgnoreSignalsGuard {
+    prev_sigint: Option<nix::sys::signal::SigAction>,
+    prev_sigquit: Option<nix::sys::signal::SigAction>,
+}
+
+#[cfg(unix)]
+impl IgnoreSignalsGuard {
+    fn new() -> Self {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+        let ignore = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+
+        // SAFETY: SIG_IGN is async-signal-safe per POSIX, which is the only
+        // requirement for sigaction calls made outside a signal handler.
+        let prev_sigint = unsafe { sigaction(Signal::SIGINT, &ignore) }
+            .inspect_err(|e| tracing::warn!(target: "tui.input", "Failed to ignore SIGINT: {}", e))
+            .ok();
+        // SAFETY: see above.
+        let prev_sigquit = unsafe { sigaction(Signal::SIGQUIT, &ignore) }
+            .inspect_err(|e| tracing::warn!(target: "tui.input", "Failed to ignore SIGQUIT: {}", e))
+            .ok();
+
+        Self {
+            prev_sigint,
+            prev_sigquit,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for IgnoreSignalsGuard {
+    fn drop(&mut self) {
+        use nix::sys::signal::{sigaction, Signal};
+
+        if let Some(prev) = self.prev_sigint.take() {
+            // SAFETY: restoring a previously-saved disposition is likewise
+            // async-signal-safe; sigaction only mutates process-wide signal
+            // state.
+            let _ = unsafe { sigaction(Signal::SIGINT, &prev) };
+        }
+        if let Some(prev) = self.prev_sigquit.take() {
+            // SAFETY: see above.
+            let _ = unsafe { sigaction(Signal::SIGQUIT, &prev) };
+        }
+    }
+}
+
+/// Whether `draw` should skip its explicit pre-render `cursor::Hide`.
+///
+/// The pre-draw Hide exists only to keep an IME candidate window from being
+/// dragged by the backend's transient cursor moves during the diff paint. In
+/// live-send with no overlay open, the only cursor is the remote preview-pane
+/// caret (no local IME), and the early Hide (flushed before the ~2-3ms widget
+/// build, while ratatui's trailing Show is flushed after it) is what straddles
+/// the vsync boundary and reads as ~30fps flicker on terminals without
+/// synchronized-update (Terminal.app). Skipping it there removes the blink;
+/// every other state keeps the Hide.
+fn skip_predraw_cursor_hide(live_send_active: bool, has_overlay: bool) -> bool {
+    live_send_active && !has_overlay
+}
+
 impl App {
     /// Is this key event a candidate for paste-burst accumulation?
     /// Printable ASCII Char or Enter, with no modifiers (or shift only).
@@ -324,7 +399,7 @@ impl App {
         let mut home = HomeView::new(active_profile, available_tools, file_watch)?;
 
         // Check if we need to show welcome or changelog dialogs
-        let mut config = Config::load_or_warn();
+        let config = Config::load_or_warn();
 
         // Theme is a global preference: read it from the global config, never
         // profile-merged, so boot matches Settings-close and the web dashboard
@@ -339,18 +414,31 @@ impl App {
             home.show_no_agents();
         } else if suppress_first_run_dialogs {
             // A startup warning will be shown by the caller; skip welcome and
-            // changelog so the warning is what the user sees first, and avoid
-            // overwriting a malformed config.toml with defaults via save_config.
+            // changelog so the warning is what the user sees first.
         } else if !config.app_state.has_seen_welcome {
             home.show_intro(&theme_name);
-            config.app_state.has_seen_welcome = true;
-            config.app_state.last_seen_version = Some(current_version);
-            save_config(&config)?;
+            if let Err(e) = update_app_state(|state| {
+                state.has_seen_welcome = true;
+                state.last_seen_version = Some(current_version.clone());
+            }) {
+                tracing::warn!(
+                    target: "tui.startup",
+                    error = %e,
+                    "failed to persist has_seen_welcome/last_seen_version"
+                );
+            }
         } else if config.app_state.last_seen_version.as_deref() != Some(&current_version) {
             // Cache should already be refreshed by tui::run() before App::new
             home.show_changelog(config.app_state.last_seen_version.clone());
-            config.app_state.last_seen_version = Some(current_version);
-            save_config(&config)?;
+            if let Err(e) = update_app_state(|state| {
+                state.last_seen_version = Some(current_version.clone());
+            }) {
+                tracing::warn!(
+                    target: "tui.startup",
+                    error = %e,
+                    "failed to persist last_seen_version"
+                );
+            }
         } else if !config.app_state.has_responded_to_telemetry {
             // Existing users who finished the walkthrough before telemetry
             // existed get a one-time opt-in popup. Gated behind the changelog
@@ -438,13 +526,26 @@ impl App {
     /// frame's final cursor position is restored. Synchronized update batches
     /// the frame, and hiding the cursor before the batch keeps the only visible
     /// cursor transition at ratatui's final `Frame::set_cursor_position`.
+    ///
+    /// `skip_predraw_cursor_hide` skips that pre-draw Hide specifically in
+    /// live-send with no overlay open: that is the one state that visibly
+    /// flickers on terminals without synchronized-update support (Terminal.app),
+    /// because the only cursor set in that state is the remote live-preview
+    /// pane caret, not a local IME candidate window, so there's nothing for
+    /// the early Hide to protect.
     fn draw(&mut self, terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+        let skip_hide = skip_predraw_cursor_hide(
+            self.home.live_send.is_some(),
+            self.home.has_non_live_send_overlay(),
+        );
         crossterm::execute!(
             terminal.backend_mut(),
             crossterm::terminal::BeginSynchronizedUpdate
         )?;
         let draw_result = (|| -> Result<()> {
-            crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
+            if !skip_hide {
+                crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
+            }
             terminal.draw(|f| self.render(f))?;
             Ok(())
         })();
@@ -493,7 +594,19 @@ impl App {
         // reader thread competes for stdin reads.
         self.event_stream.take();
 
+        // Raw mode is off from here until it's re-enabled below, so the
+        // kernel is delivering Ctrl+C/Ctrl+\ to aoe's own foreground process
+        // group again. Ignore them for the handoff so a Ctrl+C meant for a
+        // hung/dead child pane can't kill aoe out from under every session
+        // it's managing (the tokio SIGINT arm still catches anything that
+        // slips past this window before raw mode is re-enabled).
+        #[cfg(unix)]
+        let _signals_guard = IgnoreSignalsGuard::new();
+
         let result = f();
+
+        #[cfg(unix)]
+        drop(_signals_guard);
 
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(
@@ -622,22 +735,32 @@ impl App {
             self.spawn_image_update_check();
         }
 
-        // SIGHUP/SIGTERM futures so we exit cleanly when the terminal
+        // SIGHUP/SIGTERM/SIGINT futures so we exit cleanly when the terminal
         // emulator is force-quit, preventing PTY slot leaks (#541).
         // These are polled directly inside tokio::select!, which guarantees
-        // they get scheduled even when no terminal events arrive.
+        // they get scheduled even when no terminal events arrive. The SIGINT
+        // arm is belt-and-suspenders: `IgnoreSignalsGuard` (see
+        // `with_raw_mode_disabled`) should absorb a Ctrl+C aimed at a
+        // dead/hung tmux pane during an attach, but any SIGINT that arrives
+        // outside that window (or in a race right at guard install/teardown)
+        // lands here and triggers a clean shutdown instead of the default
+        // terminate-immediately behavior.
         #[cfg(unix)]
-        let (mut sighup, mut sigterm) = {
+        let (mut sighup, mut sigterm, mut sigint) = {
             use tokio::signal::unix::{signal, SignalKind};
             let hup = signal(SignalKind::hangup());
             let term = signal(SignalKind::terminate());
+            let int = signal(SignalKind::interrupt());
             if let Err(ref e) = hup {
                 tracing::warn!(target: "tui.input", "Failed to register SIGHUP handler: {}", e);
             }
             if let Err(ref e) = term {
                 tracing::warn!(target: "tui.input", "Failed to register SIGTERM handler: {}", e);
             }
-            (hup.ok(), term.ok())
+            if let Err(ref e) = int {
+                tracing::warn!(target: "tui.input", "Failed to register SIGINT handler: {}", e);
+            }
+            (hup.ok(), term.ok(), int.ok())
         };
 
         // 33ms ticker (~30fps) is the steady-state refresh in live-send.
@@ -1186,6 +1309,16 @@ impl App {
                                 // cursor leaves the list, even when the new
                                 // position lands on the preview or border.
                                 MouseEventKind::Moved => {
+                                    // Bare motion over the preview is also
+                                    // reported to a hover-capable (any-event
+                                    // tracking) agent so its own hover UI
+                                    // works like a direct attach. It never
+                                    // consumes the event: aoe's hover below
+                                    // still runs, and no aoe redraw is
+                                    // needed (the capture worker picks up
+                                    // the agent's repaint).
+                                    self.home
+                                        .forward_hover_to_preview(mouse.column, mouse.row);
                                     // Route hover to the diff view's
                                     // file list when one is open AND
                                     // the mouse is over it; that's an
@@ -1315,6 +1448,19 @@ impl App {
                     std::future::pending::<()>().await;
                 } => {
                     tracing::info!(target: "tui.input", "Received SIGTERM, exiting");
+                    self.should_quit = true;
+                    break;
+                }
+                _ = async {
+                    #[cfg(unix)]
+                    match sigint {
+                        Some(ref mut s) => { s.recv().await; }
+                        None => { std::future::pending::<()>().await; }
+                    }
+                    #[cfg(not(unix))]
+                    std::future::pending::<()>().await;
+                } => {
+                    tracing::info!(target: "tui.input", "Received SIGINT, exiting");
                     self.should_quit = true;
                     break;
                 }
@@ -2154,9 +2300,10 @@ impl App {
 /// update banner) survives restarts. Errors are logged but never surfaced,
 /// because losing the snooze is not worth pausing the event loop over.
 fn persist_dismissed_update_version(version: Option<String>) {
-    let mut config = Config::load_or_warn();
-    config.app_state.dismissed_update_version = version;
-    if let Err(e) = save_config(&config) {
+    let result = update_app_state(|state| {
+        state.dismissed_update_version = version;
+    });
+    if let Err(e) = result {
         tracing::warn!(
             target: "update.snooze",
             error = %e,
@@ -2169,9 +2316,10 @@ fn persist_dismissed_update_version(version: Option<String>) {
 /// banner (Ctrl+x) survives restarts. Like the update snooze, failures are
 /// logged but never surfaced.
 fn persist_dismissed_image_digest(digest: Option<String>) {
-    let mut config = Config::load_or_warn();
-    config.app_state.dismissed_image_digest = digest;
-    if let Err(e) = save_config(&config) {
+    let result = update_app_state(|state| {
+        state.dismissed_image_digest = digest;
+    });
+    if let Err(e) = result {
         tracing::warn!(
             target: "containers.image_update",
             error = %e,
@@ -2682,6 +2830,9 @@ impl App {
             Action::AttachToolSession(id, tool_name) => {
                 self.attach_tool_session(&id, &tool_name, terminal)?;
             }
+            Action::RunBackgroundToolSession(id, tool_name) => {
+                self.run_background_tool_session(&id, &tool_name);
+            }
             #[cfg(feature = "serve")]
             Action::OpenStructuredView(id) => {
                 // Stash for the async main loop. The acp view needs
@@ -2805,10 +2956,18 @@ impl App {
                         );
                         self.home.pending_attach_after_warning = Some(session_id.to_string());
 
-                        // Persist the "seen" flag so it only shows once
-                        let mut config = config;
-                        config.app_state.has_seen_custom_instruction_warning = true;
-                        save_config(&config)?;
+                        // Persist the "seen" flag so it only shows once. A
+                        // failed write should not kill the interactive
+                        // session; the dialog still shows this run either way.
+                        if let Err(e) = update_app_state(|state| {
+                            state.has_seen_custom_instruction_warning = true;
+                        }) {
+                            tracing::warn!(
+                                target: "tui.input",
+                                error = %e,
+                                "failed to persist has_seen_custom_instruction_warning"
+                            );
+                        }
 
                         return Ok(());
                     }
@@ -3020,6 +3179,16 @@ impl App {
                     .set_instance_error(session_id, Some(e.to_string()));
                 return Ok(());
             }
+            // A misconfigured tool command (bad flag, missing binary) can
+            // exit near-instantly, leaving a `remain-on-exit`-held dead
+            // pane. Catch that here instead of handing a dead pane to
+            // `attach()`: without the SIGINT guard around the attach, the
+            // user's only way out (Ctrl+C) would kill aoe itself.
+            if let Err(e) = tool_session.wait_until_ready() {
+                self.home
+                    .set_instance_error(session_id, Some(e.to_string()));
+                return Ok(());
+            }
         }
 
         let branch = instance
@@ -3054,6 +3223,50 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn run_background_tool_session(&mut self, session_id: &str, tool_name: &str) {
+        let instance = match self.home.get_instance(session_id) {
+            Some(inst) => inst.clone(),
+            None => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Tool '{}' failed: session not found",
+                    tool_name
+                )));
+                return;
+            }
+        };
+
+        let tool_config = match self.home.tool_configs.get(tool_name) {
+            Some(tc) => tc.clone(),
+            None => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Tool '{}' is not configured",
+                    tool_name
+                )));
+                return;
+            }
+        };
+
+        match spawn_background_tool(
+            session_id,
+            tool_name,
+            &instance.project_path,
+            &tool_config.command,
+        ) {
+            Ok(()) => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Started background tool: {}",
+                    tool_name
+                )));
+            }
+            Err(e) => {
+                self.update_status = Some(UpdateStatus::transient(format!(
+                    "Failed to start background tool '{}': {}",
+                    tool_name, e
+                )));
+            }
+        }
     }
 
     fn edit_file(
@@ -3091,9 +3304,14 @@ impl App {
         let path = path.to_owned();
         let editor_clone = editor.clone();
         let status = self.with_raw_mode_disabled(terminal, move || {
-            std::process::Command::new(&editor_clone)
-                .arg(&path)
-                .status()
+            let mut cmd = std::process::Command::new(&editor_clone);
+            cmd.arg(&path);
+            // The editor runs inside `IgnoreSignalsGuard`'s window; reset
+            // SIGINT/SIGQUIT before exec so it doesn't inherit the ignore
+            // (SIG_IGN survives exec, unlike a caught handler).
+            #[cfg(unix)]
+            crate::process::reset_signals_on_exec(&mut cmd);
+            cmd.status()
         })?;
 
         self.needs_redraw = true;
@@ -3112,6 +3330,86 @@ impl App {
 
         Ok(())
     }
+}
+
+fn spawn_background_tool(
+    session_id: &str,
+    tool_name: &str,
+    working_dir: &str,
+    command: &str,
+) -> Result<()> {
+    if command.trim().is_empty() {
+        anyhow::bail!("Tool '{}' has no command configured", tool_name);
+    }
+
+    let shell = crate::session::environment::user_shell();
+    let mut child_command = std::process::Command::new(&shell);
+    child_command
+        .arg("-c")
+        .arg(command)
+        .current_dir(working_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        child_command.process_group(0);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+        child_command.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
+
+    let child = child_command.spawn().with_context(|| {
+        format!(
+            "spawn background tool '{}' with shell '{}'",
+            tool_name, shell
+        )
+    })?;
+    wait_for_background_tool(session_id, tool_name, child);
+    Ok(())
+}
+
+fn wait_for_background_tool(session_id: &str, tool_name: &str, mut child: std::process::Child) {
+    let session_id = session_id.to_string();
+    let tool_name = tool_name.to_string();
+    std::thread::spawn(move || match child.wait() {
+        Ok(status) if status.success() => {
+            tracing::debug!(
+                target: "tui.tools",
+                session_id = %session_id,
+                tool = %tool_name,
+                status = %status,
+                "background tool exited"
+            );
+        }
+        Ok(status) => {
+            tracing::warn!(
+                target: "tui.tools",
+                session_id = %session_id,
+                tool = %tool_name,
+                status = %status,
+                "background tool exited unsuccessfully"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "tui.tools",
+                session_id = %session_id,
+                tool = %tool_name,
+                error = %e,
+                "failed waiting for background tool"
+            );
+        }
+    });
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3149,6 +3447,9 @@ pub enum Action {
     /// Attach to a tool session (lazygit, yazi, etc.) for the given agent
     /// session. The tool_name indexes into Config.tools.
     AttachToolSession(String, String),
+    /// Run a configured tool command without creating or attaching a tmux tool
+    /// session. The command runs in the selected agent session's workdir.
+    RunBackgroundToolSession(String, String),
     /// Open the native acp view for `session_id`. The action handler
     /// stashes the id in `pending_structured_view_open`; the main loop drains it
     /// after `execute_action` returns and runs the async acp loop
@@ -3162,6 +3463,67 @@ mod tests {
     use super::*;
     use crate::telemetry::SendOutcome;
     use std::sync::atomic::Ordering;
+
+    /// Query a signal's current disposition without leaving it changed:
+    /// `sigaction` always both sets and returns the previous value, so we
+    /// immediately set it back to what we just read.
+    #[cfg(unix)]
+    fn current_disposition(signal: nix::sys::signal::Signal) -> nix::sys::signal::SigHandler {
+        use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet};
+
+        let probe = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+        // SAFETY: test-only probe; SIG_DFL is async-signal-safe per POSIX,
+        // the only requirement for sigaction calls outside a signal handler.
+        let prev = unsafe { sigaction(signal, &probe) }.expect("sigaction query");
+        // SAFETY: see above; restoring what was just read is likewise safe.
+        unsafe { sigaction(signal, &prev) }.expect("sigaction restore");
+        prev.handler()
+    }
+
+    #[cfg(unix)]
+    fn same_disposition(a: nix::sys::signal::SigHandler, b: nix::sys::signal::SigHandler) -> bool {
+        use nix::sys::signal::SigHandler;
+        match (a, b) {
+            (SigHandler::SigDfl, SigHandler::SigDfl) => true,
+            (SigHandler::SigIgn, SigHandler::SigIgn) => true,
+            (SigHandler::Handler(f1), SigHandler::Handler(f2)) => f1 as usize == f2 as usize,
+            _ => false,
+        }
+    }
+
+    // Signal disposition is process-global state, so this must not run
+    // concurrently with any other test that installs a handler for
+    // SIGINT/SIGQUIT.
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn ignore_signals_guard_installs_sig_ign_and_restores_prior_disposition() {
+        use nix::sys::signal::{SigHandler, Signal};
+
+        let baseline_sigint = current_disposition(Signal::SIGINT);
+        let baseline_sigquit = current_disposition(Signal::SIGQUIT);
+
+        let guard = IgnoreSignalsGuard::new();
+        assert!(
+            same_disposition(current_disposition(Signal::SIGINT), SigHandler::SigIgn),
+            "SIGINT should be ignored while the guard is alive"
+        );
+        assert!(
+            same_disposition(current_disposition(Signal::SIGQUIT), SigHandler::SigIgn),
+            "SIGQUIT should be ignored while the guard is alive"
+        );
+
+        drop(guard);
+
+        assert!(
+            same_disposition(current_disposition(Signal::SIGINT), baseline_sigint),
+            "SIGINT disposition should be restored after the guard drops"
+        );
+        assert!(
+            same_disposition(current_disposition(Signal::SIGQUIT), baseline_sigquit),
+            "SIGQUIT disposition should be restored after the guard drops"
+        );
+    }
 
     /// The theme idempotency guard must treat both the name AND the palette
     /// mode as part of the theme identity, and report "no change" only when
@@ -3181,6 +3543,30 @@ mod tests {
         assert!(
             theme_apply_needed(("empire", false), ("empire", true)),
             "a different palette mode must re-apply even with the same name"
+        );
+    }
+
+    /// The pre-draw `cursor::Hide` is skipped only in the one state that
+    /// visibly flickers on non-synchronized-update terminals: live-send
+    /// active with no overlay on top of it. Any overlay (IME-relevant local
+    /// input) or a non-live-send state keeps the Hide.
+    #[test]
+    fn skip_predraw_cursor_hide_only_in_live_send_without_overlay() {
+        assert!(
+            skip_predraw_cursor_hide(true, false),
+            "live-send with no overlay must skip the pre-draw Hide (the fix)"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(true, true),
+            "live-send with an overlay open must keep the Hide for IME protection"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(false, false),
+            "outside live-send the Hide must stay unchanged"
+        );
+        assert!(
+            !skip_predraw_cursor_hide(false, true),
+            "outside live-send with an overlay the Hide must stay unchanged"
         );
     }
 

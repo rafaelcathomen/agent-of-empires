@@ -14,7 +14,7 @@ use tui_input::Input;
 
 use super::DialogResult;
 use crate::containers;
-use crate::session::config::{load_config, save_config, DefaultTerminalMode, SandboxConfig};
+use crate::session::config::{load_config, update_app_state, DefaultTerminalMode, SandboxConfig};
 use crate::session::profile_config::resolve_config_or_warn;
 use crate::session::repo_config::HookProgress;
 #[cfg(test)]
@@ -114,6 +114,36 @@ pub struct NewSessionData {
     /// One-shot fork seed carried when this session was opened as a fork of
     /// another. `None` for an ordinary new session.
     pub fork_seed: Option<crate::session::ForkSeed>,
+}
+
+/// Single conversion point for turning wizard output into builder input.
+/// Both creation paths (the synchronous `create_session` and the background
+/// `CreationPoller`) go through this, so a newly added field cannot be
+/// forwarded on one path and silently dropped on the other (the bug class
+/// behind the hardcoded `fork_seed: None` regression). `profile` is the one
+/// field deliberately not carried: builders take it as a separate argument.
+impl From<NewSessionData> for crate::session::builder::InstanceParams {
+    fn from(data: NewSessionData) -> Self {
+        Self {
+            title: data.title,
+            path: data.path,
+            group: data.group,
+            tool: data.tool,
+            worktree_enabled: data.worktree_enabled,
+            worktree_branch: data.worktree_branch,
+            create_new_branch: data.create_new_branch,
+            base_branch: data.base_branch,
+            sandbox: data.sandbox,
+            sandbox_image: data.sandbox_image,
+            yolo_mode: data.yolo_mode,
+            extra_env: data.extra_env,
+            extra_args: data.extra_args,
+            command_override: data.command_override,
+            extra_repo_paths: data.extra_repo_paths,
+            scratch: data.scratch,
+            fork_seed: data.fork_seed,
+        }
+    }
 }
 
 pub struct NewSessionDialog {
@@ -468,9 +498,7 @@ impl NewSessionDialog {
             worktree_config_mode: false,
             worktree_config_focused_field: 0,
             sandbox_enabled,
-            sandbox_image: Input::new(
-                containers::get_container_runtime().effective_default_image(),
-            ),
+            sandbox_image: Input::new(config.sandbox.default_image.clone()),
             docker_available,
             yolo_mode,
             yolo_mode_default: yolo_mode,
@@ -846,9 +874,7 @@ impl NewSessionDialog {
             worktree_config_mode: false,
             worktree_config_focused_field: 0,
             sandbox_enabled: false,
-            sandbox_image: Input::new(
-                containers::get_container_runtime().effective_default_image(),
-            ),
+            sandbox_image: Input::new(config.sandbox.default_image.clone()),
             docker_available: false,
             yolo_mode: false,
             yolo_mode_default: false,
@@ -1994,8 +2020,6 @@ impl NewSessionDialog {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        let sanitized: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
-
         // Route to the active sub-mode input if one is open
         let target: &mut Input = if let Some(ref mut input) = self.env_editing_input {
             input
@@ -2014,9 +2038,7 @@ impl NewSessionDialog {
         } else {
             self.current_input_mut()
         };
-        for ch in sanitized.chars() {
-            target.handle(tui_input::InputRequest::InsertChar(ch));
-        }
+        super::paste_into_input(target, text);
     }
 
     fn build_submit_result(&self) -> DialogResult<NewSessionData> {
@@ -2142,16 +2164,10 @@ fn persist_last_browse_dir(selected: &str) {
     } else {
         return;
     };
-    let mut cfg = match load_config() {
-        Ok(Some(c)) => c,
-        Ok(None) => Default::default(),
-        Err(e) => {
-            tracing::warn!(target: "tui.dialog", "Failed to load config for last_browse_dir: {}", e);
-            return;
-        }
-    };
-    cfg.app_state.last_browse_dir = Some(dir);
-    if let Err(e) = save_config(&cfg) {
+    let result = update_app_state(|state| {
+        state.last_browse_dir = Some(dir);
+    });
+    if let Err(e) = result {
         tracing::warn!(target: "tui.dialog", "Failed to save last_browse_dir: {}", e);
     }
 }

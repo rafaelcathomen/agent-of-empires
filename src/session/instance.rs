@@ -21,7 +21,7 @@ use crate::session::capture::{
     capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
     capture_copilot_session_id, capture_gemini_session_id, capture_hermes_session_id,
     capture_pi_session_id, capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed,
-    codex_poll_fn, codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn,
+    codex_poll_fn, codex_poll_fn_sandboxed, copilot_poll_fn, cursor_poll_fn, gemini_poll_fn,
     gemini_poll_fn_sandboxed, generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed,
     is_valid_session_id, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
     pi_poll_fn_sandboxed, try_capture_codex_session_id_in_container,
@@ -930,6 +930,19 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
     }
 }
 
+/// Whether a tool captures its session id exclusively through the per-instance
+/// hook sidecar (`/tmp/aoe-hooks-<euid>/<instance_id>/session_id`) rather than a
+/// scannable on-disk transcript store. Claude uses the sidecar as its
+/// authoritative fast path (with an mtime disk-scan fallback); Cursor has no
+/// disk store at all, so the sidecar is its sole source. Both want the
+/// sidecar-first promotion (`capture_freshest_session_id`) and the crash-window
+/// reconcile (`reconcile_sidecar_into_disk`). Tools with their own on-disk
+/// stores (codex, gemini, opencode, ...) are captured via
+/// `try_retroactive_capture` instead and are not listed here.
+fn captures_via_sidecar(tool: &str) -> bool {
+    matches!(tool, "claude" | "cursor")
+}
+
 fn build_resume_flags(tool: &str, session_id: &str, is_existing_session: bool) -> String {
     use crate::agents::{get_agent, ResumeStrategy};
 
@@ -957,6 +970,7 @@ fn build_resume_flags(tool: &str, session_id: &str, is_existing_session: bool) -
             format!("{} {}", flag, session_id)
         }
         ResumeStrategy::Subcommand(sub) => format!("{} {}", sub, session_id),
+        ResumeStrategy::FlagEq(flag) => format!("{}={}", flag, session_id),
         ResumeStrategy::Unsupported => String::new(),
     }
 }
@@ -1519,11 +1533,11 @@ impl Instance {
     /// the daemon crashes before the next poll tick persists it: without
     /// this step, the next launch's wipe destroys the fresh sid.
     ///
-    /// Claude-only (sole sidecar tool); `Default` intent only (`Use(X)`
-    /// and `Cleared` override); excluded sids skipped (cascade re-poison
-    /// guard).
+    /// Sidecar-capturing tools only (Claude, Cursor; see
+    /// [`captures_via_sidecar`]); `Default` intent only (`Use(X)` and
+    /// `Cleared` override); excluded sids skipped (cascade re-poison guard).
     fn reconcile_sidecar_into_disk(&mut self) {
-        if self.tool != "claude" {
+        if !captures_via_sidecar(&self.tool) {
             return;
         }
         if !matches!(self.resume_intent, ResumeIntent::Default) {
@@ -2377,9 +2391,14 @@ impl Instance {
     /// contract (mtime, SQLite ordering, exclusion set, host/container)
     /// stays encapsulated in each tool's existing capture function.
     ///
-    /// For Claude the authoritative per-instance sidecar
+    /// For sidecar-capturing tools (Claude, Cursor; see
+    /// [`captures_via_sidecar`]) the authoritative per-instance sidecar
     /// (`/tmp/aoe-hooks-<euid>/<instance_id>/session_id`, written by the
-    /// SessionStart / UserPromptSubmit hooks) is consulted first. It is keyed
+    /// SessionStart / UserPromptSubmit hooks, or Cursor's sessionStart /
+    /// beforeSubmitPrompt hooks) is consulted first. For Cursor it is also the
+    /// only source: `try_retroactive_capture` has no cursor arm, so the sidecar
+    /// read below is what promotes cursor's id into `agent_session_id`. It is
+    /// keyed
     /// by instance id, so it can never name a peer instance's conversation,
     /// unlike the mtime disk scan, which picks the most-recent jsonl in the
     /// shared `~/.claude/projects/<encoded-cwd>/` dir and so can select a
@@ -2401,7 +2420,7 @@ impl Instance {
     /// reads can briefly surface different UUIDs, benign under the existing
     /// eventual-consistency capture model.
     pub(crate) fn capture_freshest_session_id(&self) -> Option<String> {
-        if self.tool == "claude" {
+        if captures_via_sidecar(&self.tool) {
             if let Some(authoritative) = crate::hooks::read_hook_session_id(&self.id) {
                 if self.retroactive_capture_excludes.contains(&authoritative) {
                     return None;
@@ -3029,6 +3048,9 @@ impl Instance {
                         crate::agents::HookFormat::JsonSettings => {
                             self.install_json_host_hooks(hook_cfg, &events)
                         }
+                        crate::agents::HookFormat::CursorHooksJson => {
+                            self.install_json_host_hooks_cursor(hook_cfg, &events)
+                        }
                     }
                 }
                 // Sandboxed sessions install via build_container_config.
@@ -3132,6 +3154,33 @@ impl Instance {
             }
             Err(e) => {
                 tracing::warn!(target: "session.store", "Failed to resolve agent hooks path: {}", e)
+            }
+        }
+    }
+
+    /// Install hooks into Cursor's host `hooks.json`. Mirrors
+    /// [`Self::install_json_host_hooks`] (same path resolution, honoring
+    /// `CURSOR_CONFIG_DIR`), but routes to the flat-shape cursor writer.
+    fn install_json_host_hooks_cursor(
+        &self,
+        hook_cfg: &crate::agents::AgentHookConfig,
+        events: &[crate::agents::ResolvedHookEvent],
+    ) {
+        match crate::hooks::agent_settings_path_for_host_environment(
+            hook_cfg,
+            &self.profile_host_environment(),
+        ) {
+            Ok(settings_path) => {
+                if let Err(e) = crate::hooks::install_cursor_hooks(
+                    &settings_path,
+                    events,
+                    crate::hooks::HookInstallTarget::Host,
+                ) {
+                    tracing::warn!(target: "session.store", "Failed to install cursor hooks: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "session.store", "Failed to resolve cursor hooks path: {}", e)
             }
         }
     }
@@ -3853,6 +3902,19 @@ impl Instance {
                         extra_excludes.clone(),
                     ))
                 }
+            }
+            "cursor" => {
+                // Cursor captures its conversation id via the per-instance hook
+                // sidecar only; it keeps no on-disk transcript store to scan. A
+                // sandboxed session's in-container hook writes to the container's
+                // `/tmp/aoe-hooks/<id>`, which is not bind-mounted onto the host
+                // sidecar path `read_hook_session_id` reads, so it cannot be
+                // captured from the host. Sandboxed cursor therefore starts fresh
+                // on restart (sandbox resume is a follow-up, as for copilot).
+                if self.is_sandboxed() {
+                    return;
+                }
+                Box::new(cursor_poll_fn(instance_id.clone(), extra_excludes.clone()))
             }
             "opencode" => {
                 let launch_time_ms = std::time::SystemTime::now()
@@ -7742,6 +7804,31 @@ mod tests {
     }
 
     #[test]
+    fn test_build_cursor_resume_flags_uses_eq_form() {
+        let session_id = "3ce9c037-1111-2222-3333-444455556666";
+        // Cursor's `--resume` takes an optional argument, so the id must be
+        // joined with `=` (a space form would be read as a positional prompt).
+        let flags = build_resume_flags("cursor", session_id, true);
+        assert_eq!(flags, "--resume=3ce9c037-1111-2222-3333-444455556666");
+        // is_existing_session is irrelevant for FlagEq.
+        let flags_new = build_resume_flags("cursor", session_id, false);
+        assert_eq!(flags_new, "--resume=3ce9c037-1111-2222-3333-444455556666");
+    }
+
+    #[test]
+    fn test_captures_via_sidecar_claude_and_cursor_only() {
+        assert!(captures_via_sidecar("claude"));
+        assert!(captures_via_sidecar("cursor"));
+        // Tools with their own on-disk stores capture via
+        // try_retroactive_capture, not the sidecar fast path.
+        for tool in [
+            "codex", "gemini", "opencode", "copilot", "vibe", "pi", "droid",
+        ] {
+            assert!(!captures_via_sidecar(tool), "{tool} must not be sidecar");
+        }
+    }
+
+    #[test]
     fn test_build_opencode_resume_flags() {
         let session_id = "session-789";
         let flags = build_resume_flags("opencode", session_id, false);
@@ -8688,13 +8775,18 @@ mod tests {
             assert!(should_attempt_resume(Some("uuid-abc-123"), "codex"));
             assert!(should_attempt_resume(Some("uuid-abc-123"), "gemini"));
             assert!(should_attempt_resume(Some("uuid-abc-123"), "copilot"));
+            // Cursor resumes with `agent --resume=<id>` (ResumeStrategy::FlagEq).
+            assert!(should_attempt_resume(
+                Some("11111111-1111-1111-1111-111111111111"),
+                "cursor"
+            ));
         }
 
         #[test]
         fn unsupported_agent_does_not_attempt_resume() {
             assert!(!should_attempt_resume(
                 Some("11111111-1111-1111-1111-111111111111"),
-                "cursor"
+                "droid"
             ));
         }
 

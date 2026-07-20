@@ -46,7 +46,8 @@ impl HooksInstallDialog {
                             ),
                         );
                     }
-                    crate::agents::HookFormat::JsonSettings => {
+                    crate::agents::HookFormat::JsonSettings
+                    | crate::agents::HookFormat::CursorHooksJson => {
                         settings_paths.push(
                             crate::hooks::agent_settings_path_display_for_host_environment(
                                 hook_cfg, &host_env,
@@ -448,7 +449,7 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains(".cursor/settings.json"));
+        assert!(text.contains(".cursor/hooks.json"));
     }
 
     #[test]

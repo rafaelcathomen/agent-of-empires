@@ -1642,6 +1642,13 @@ pub(crate) fn build_container_config(
                                         crate::hooks::HookInstallTarget::Sandbox,
                                     )
                                 }
+                                crate::agents::HookFormat::CursorHooksJson => {
+                                    crate::hooks::install_cursor_hooks(
+                                        &settings_file,
+                                        &events,
+                                        crate::hooks::HookInstallTarget::Sandbox,
+                                    )
+                                }
                             };
                             if let Err(e) = result {
                                 tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e);

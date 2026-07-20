@@ -44,8 +44,9 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use crate::hooks::{
-    has_aoe_marker, install_codex_hooks_with_preserved_state, install_hooks, iter_hook_targets_in,
-    snapshot_codex_hooks_state, HookInstallTarget, HookTarget, HookTargetKind,
+    has_aoe_marker, install_codex_hooks_with_preserved_state, install_cursor_hooks, install_hooks,
+    iter_hook_targets_in, snapshot_codex_hooks_state, HookInstallTarget, HookTarget,
+    HookTargetKind,
 };
 
 /// Path of the legacy world-known hook directory swept by this migration.
@@ -162,6 +163,9 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
     match target.kind {
         HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
             install_hooks(&target.path, &target.events, HookInstallTarget::Host)
+        }
+        HookTargetKind::CursorHooksJson => {
+            install_cursor_hooks(&target.path, &target.events, HookInstallTarget::Host)
         }
         HookTargetKind::CodexToml => {
             let preserved = snapshot_codex_hooks_state(&target.path)?;

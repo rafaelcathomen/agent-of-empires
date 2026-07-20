@@ -704,6 +704,228 @@ pub fn install_hooks(
     })
 }
 
+/// Build the AoE hooks JSON for Cursor's flat `hooks.json` shape.
+///
+/// Reuses the same per-behaviour command builders as [`build_aoe_hooks`]
+/// (`hook_command_session_id`, `hook_command_subagent`, `hook_command_heat`,
+/// `hook_command`), so every emitted command carries the `# aoe-hooks` marker
+/// and resolves `AOE_INSTANCE_ID` at runtime. The difference is the shape:
+/// each event maps directly to an array of `{ "type": "command", "command":
+/// <cmd> }` objects (Cursor's flat form), rather than Claude's
+/// `[{ matcher, hooks: [...] }]` nesting. When an event declares a matcher it
+/// is added to each object. Events with no active behaviour are skipped.
+fn build_cursor_hooks(
+    events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
+    target: HookInstallTarget,
+) -> Value {
+    let mut hooks_obj = serde_json::Map::new();
+    for event in events.as_ref() {
+        let mut commands: Vec<String> = Vec::new();
+        if event.session_id_capture {
+            commands.push(hook_command_session_id(target));
+        }
+        if let Some(delta) = event.subagent_delta {
+            commands.push(hook_command_subagent(delta, target));
+        }
+        if event.heat {
+            commands.push(hook_command_heat(target));
+        }
+        if let Some(status) = event.status {
+            commands.push(hook_command(status.as_str(), target));
+        }
+        if commands.is_empty() {
+            continue;
+        }
+
+        let hook_entries: Vec<Value> = commands
+            .into_iter()
+            .map(|cmd| {
+                let mut obj = serde_json::Map::new();
+                obj.insert("type".to_string(), Value::String("command".to_string()));
+                obj.insert("command".to_string(), Value::String(cmd));
+                if let Some(m) = &event.matcher {
+                    obj.insert("matcher".to_string(), Value::String(m.clone()));
+                }
+                Value::Object(obj)
+            })
+            .collect();
+        match hooks_obj
+            .entry(event.name.clone())
+            .or_insert_with(|| Value::Array(Vec::new()))
+        {
+            Value::Array(arr) => arr.extend(hook_entries),
+            // or_insert_with only ever seeds an Array, so this arm is unreachable.
+            _ => unreachable!("cursor hook event is always a JSON array"),
+        }
+    }
+
+    Value::Object(hooks_obj)
+}
+
+/// Drop the AoE-marked entries from one of Cursor's flat event arrays,
+/// retaining every hook object whose `command` is not AoE-authored. The
+/// contrast with [`remove_aoe_entries`] is the shape: Cursor stores hook
+/// objects directly in the event array (no intermediate matcher block), so we
+/// inspect each object's `command` field rather than a nested `hooks` array.
+fn remove_aoe_entries_flat(arr: &mut Vec<Value>) {
+    arr.retain(|hook| {
+        !hook
+            .get("command")
+            .and_then(|c| c.as_str())
+            .is_some_and(is_aoe_hook_command)
+    });
+}
+
+/// Install AoE status hooks into Cursor's `hooks.json` file.
+///
+/// Same guarantees as [`install_hooks`] (locked, idempotent, atomic, preserves
+/// non-AoE user hooks) but for Cursor's flat structure: a top-level
+/// `"version": 1` and `hooks.<event>[]` arrays of `{type, command}` objects.
+/// An existing user-set `version` is left untouched.
+pub fn install_cursor_hooks(
+    settings_path: &Path,
+    events: impl AsRef<[crate::agents::ResolvedHookEvent]>,
+    target: HookInstallTarget,
+) -> Result<()> {
+    with_config_lock(settings_path, "json.lock", || {
+        let mut settings: Value = if settings_path.exists() {
+            let content = std::fs::read_to_string(settings_path)?;
+            serde_json::from_str(&content).unwrap_or_else(|e| {
+                tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", settings_path.display(), e);
+                serde_json::json!({})
+            })
+        } else {
+            serde_json::json!({})
+        };
+
+        let before = settings.clone();
+
+        let aoe_hooks = build_cursor_hooks(events.as_ref(), target);
+
+        let root = settings
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Settings file root is not a JSON object"))?;
+
+        // Seed a top-level version only when absent; never clobber a version the
+        // user (or a newer Cursor) already wrote.
+        root.entry("version".to_string())
+            .or_insert_with(|| Value::from(1));
+
+        if !root.get("hooks").is_some_and(|h| h.is_object()) {
+            root.insert("hooks".to_string(), serde_json::json!({}));
+        }
+        let settings_hooks = root
+            .get_mut("hooks")
+            .and_then(|h| h.as_object_mut())
+            .ok_or_else(|| anyhow::anyhow!("hooks key is not a JSON object"))?;
+
+        let aoe_hooks_obj = aoe_hooks.as_object().ok_or_else(|| {
+            anyhow::anyhow!("Internal error: built cursor hooks is not a JSON object")
+        })?;
+
+        let empty_events: Vec<String> = settings_hooks
+            .iter_mut()
+            .filter_map(|(event_name, existing)| {
+                let arr = existing.as_array_mut()?;
+                remove_aoe_entries_flat(arr);
+                arr.is_empty().then(|| event_name.clone())
+            })
+            .collect();
+        for event_name in empty_events {
+            settings_hooks.remove(&event_name);
+        }
+
+        for (event_name, aoe_entries) in aoe_hooks_obj {
+            if let Some(existing) = settings_hooks
+                .get_mut(event_name)
+                .and_then(|existing| existing.as_array_mut())
+            {
+                if let Some(new_arr) = aoe_entries.as_array() {
+                    existing.extend(new_arr.iter().cloned());
+                }
+            } else {
+                settings_hooks.insert(event_name.clone(), aoe_entries.clone());
+            }
+        }
+
+        if settings == before {
+            tracing::debug!(target: "hooks.install",
+                "AoE cursor hooks in {} already up to date; skipping write",
+                settings_path.display());
+            return Ok(());
+        }
+
+        if let Some(parent) = settings_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let formatted = serde_json::to_string_pretty(&settings)?;
+        crate::session::atomic_write_following_symlinks(settings_path, formatted.as_bytes())?;
+
+        tracing::info!(target: "hooks.install", "Installed AoE cursor hooks in {}", settings_path.display());
+        Ok(())
+    })
+}
+
+/// Remove AoE status hooks from Cursor's flat `hooks.json`. Mirror of
+/// [`uninstall_hooks`] for the flat shape; returns whether anything changed.
+fn uninstall_cursor_hooks(settings_path: &Path) -> Result<bool> {
+    if !settings_path.exists() {
+        return Ok(false);
+    }
+
+    with_config_lock(settings_path, "json.lock", || {
+        let content = std::fs::read_to_string(settings_path)?;
+        let mut settings: Value = serde_json::from_str(&content).unwrap_or_else(|e| {
+            tracing::warn!(target: "hooks.uninstall", "Failed to parse {}: {}", settings_path.display(), e);
+            serde_json::json!({})
+        });
+
+        let Some(hooks_obj) = settings.get_mut("hooks").and_then(|h| h.as_object_mut()) else {
+            return Ok(false);
+        };
+
+        let mut modified = false;
+        let event_names: Vec<String> = hooks_obj.keys().cloned().collect();
+        for event_name in event_names {
+            if let Some(arr) = hooks_obj
+                .get_mut(&event_name)
+                .and_then(|v| v.as_array_mut())
+            {
+                let before = arr.len();
+                remove_aoe_entries_flat(arr);
+                if arr.len() != before {
+                    modified = true;
+                }
+            }
+        }
+
+        if !modified {
+            return Ok(false);
+        }
+
+        let empty_events: Vec<String> = hooks_obj
+            .iter()
+            .filter(|(_, v)| v.as_array().is_some_and(|a| a.is_empty()))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in empty_events {
+            hooks_obj.remove(&key);
+        }
+
+        if hooks_obj.is_empty() {
+            if let Some(obj) = settings.as_object_mut() {
+                obj.remove("hooks");
+            }
+        }
+
+        let formatted = serde_json::to_string_pretty(&settings)?;
+        crate::session::atomic_write_following_symlinks(settings_path, formatted.as_bytes())?;
+
+        tracing::info!(target: "hooks.uninstall", "Removed AoE cursor hooks from {}", settings_path.display());
+        Ok(true)
+    })
+}
+
 pub(super) const CODEX_HOOK_EVENT_NAMES: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
@@ -1961,6 +2183,7 @@ pub fn uninstall_all_hooks() {
             HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
                 uninstall_hooks(&target.path)
             }
+            HookTargetKind::CursorHooksJson => uninstall_cursor_hooks(&target.path),
             HookTargetKind::CodexToml => uninstall_codex_hooks(&target.path),
             HookTargetKind::Sidecar(sidecar) => (sidecar.uninstall)(&target.path),
         };
@@ -2003,6 +2226,12 @@ mod tests {
 
     fn codex_events() -> Vec<crate::agents::ResolvedHookEvent> {
         let agent = crate::agents::get_agent("codex").unwrap();
+        crate::agents::resolved_hook_events(agent, &crate::session::config::Config::default())
+            .unwrap()
+    }
+
+    fn cursor_events() -> Vec<crate::agents::ResolvedHookEvent> {
+        let agent = crate::agents::get_agent("cursor").unwrap();
         crate::agents::resolved_hook_events(agent, &crate::session::config::Config::default())
             .unwrap()
     }
@@ -2250,6 +2479,106 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(content["apiKey"], "test-key");
         assert_eq!(content["model"], "opus");
+    }
+
+    #[test]
+    fn test_install_cursor_hooks_flat_shape() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("hooks.json");
+
+        install_cursor_hooks(&settings_path, cursor_events(), HookInstallTarget::Host).unwrap();
+
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+
+        // Top-level version:1 and a flat hooks object.
+        assert_eq!(content["version"], Value::from(1));
+        let hooks = content["hooks"].as_object().unwrap();
+
+        for event in ["sessionStart", "beforeSubmitPrompt", "preToolUse", "stop"] {
+            let arr = hooks[event]
+                .as_array()
+                .unwrap_or_else(|| panic!("event {event} should be an array"));
+            assert!(!arr.is_empty(), "event {event} should have commands");
+            for obj in arr {
+                // Flat {type, command} objects, not Claude's nested matcher blocks.
+                assert_eq!(obj["type"], "command");
+                assert!(obj["command"].is_string());
+                assert!(obj.get("hooks").is_none());
+            }
+        }
+
+        // Session-id capture rides sessionStart.
+        let session_start = hooks["sessionStart"].as_array().unwrap();
+        assert!(
+            session_start.iter().any(|o| o["command"]
+                .as_str()
+                .is_some_and(|c| c.contains("__extract-session-id"))),
+            "sessionStart should carry the session-id capture command"
+        );
+    }
+
+    #[test]
+    fn test_install_cursor_hooks_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("hooks.json");
+
+        install_cursor_hooks(&settings_path, cursor_events(), HookInstallTarget::Host).unwrap();
+        install_cursor_hooks(&settings_path, cursor_events(), HookInstallTarget::Host).unwrap();
+
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        // beforeSubmitPrompt emits capture + heat + status = 3 commands; a
+        // second install must not duplicate them.
+        let before_submit = content["hooks"]["beforeSubmitPrompt"].as_array().unwrap();
+        assert_eq!(before_submit.len(), 3, "reinstall should not duplicate");
+    }
+
+    #[test]
+    fn test_install_cursor_hooks_preserves_user_hook() {
+        let tmp = TempDir::new().unwrap();
+        let settings_path = tmp.path().join("hooks.json");
+
+        // A pre-existing non-aoe user hook and a user-chosen version.
+        let existing = serde_json::json!({
+            "version": 1,
+            "hooks": {
+                "stop": [
+                    { "type": "command", "command": "echo user-hook" }
+                ]
+            }
+        });
+        std::fs::write(
+            &settings_path,
+            serde_json::to_string_pretty(&existing).unwrap(),
+        )
+        .unwrap();
+
+        install_cursor_hooks(&settings_path, cursor_events(), HookInstallTarget::Host).unwrap();
+
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let stop = content["hooks"]["stop"].as_array().unwrap();
+        assert!(
+            stop.iter().any(|o| o["command"] == "echo user-hook"),
+            "pre-existing user hook must be preserved"
+        );
+        assert!(
+            stop.iter()
+                .any(|o| o["command"].as_str().is_some_and(is_aoe_hook_command)),
+            "aoe stop hook should be appended alongside the user hook"
+        );
+
+        // Reinstalling must not strip the user hook nor duplicate aoe entries.
+        install_cursor_hooks(&settings_path, cursor_events(), HookInstallTarget::Host).unwrap();
+        let content: Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        let stop = content["hooks"]["stop"].as_array().unwrap();
+        assert_eq!(
+            stop.len(),
+            2,
+            "one user hook + one aoe hook, no duplication"
+        );
     }
 
     #[test]

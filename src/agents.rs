@@ -69,6 +69,10 @@ pub enum ResumeStrategy {
     /// The subcommand + id are inserted right after the binary name so that
     /// other flags land after it.
     Subcommand(&'static str),
+    /// Append a flag joined to the id by `=`, e.g. `--resume=<id>`, for agents
+    /// whose resume flag takes an optional argument and so needs the `=` form
+    /// (a space-separated id would be read as a positional prompt instead).
+    FlagEq(&'static str),
     /// Agent does not support session resume.
     Unsupported,
 }
@@ -161,6 +165,12 @@ pub enum HookFormat {
     /// Codex's `[hooks.state]` trust block lives in `config.toml` and is
     /// untouched by this writer.
     CodexJson,
+    /// Cursor CLI `~/.cursor/hooks.json`. A flatter shape than `JsonSettings`:
+    /// each event maps directly to an array of `{type, command}` objects
+    /// (`hooks.<event>[]`) with no intermediate matcher-block nesting, and the
+    /// root object carries a top-level `"version": 1`. The path is resolved via
+    /// `CURSOR_CONFIG_DIR` → `~/.cursor/hooks.json` (basename `hooks.json`).
+    CursorHooksJson,
 }
 
 /// Configuration for installing status-detection hooks into an agent's settings file.
@@ -465,47 +475,45 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     },
 ];
 
-/// Cursor CLI hook events. No `session_id_capture`: Cursor's session id is
-/// not consumed by AoE pollers, and Cursor's hook payload uses a different
-/// schema, so installing the capture command would do useless work on every
-/// `UserPromptSubmit`.
+/// Cursor CLI hook events, using Cursor's own camelCase event names
+/// (`sessionStart`, `beforeSubmitPrompt`, `preToolUse`, `stop`) as read from
+/// `~/.cursor/hooks.json`.
+///
+/// Cursor's hook payload carries a top-level `session_id` that equals its
+/// `conversation_id` (a stable UUID), so `session_id_capture` on `sessionStart`
+/// and `beforeSubmitPrompt` runs the existing `aoe __extract-session-id`
+/// unchanged. The captured id is what Cursor's `--resume=<id>` consumes (see
+/// [`ResumeStrategy::FlagEq`] on the cursor agent), which is why capture is now
+/// enabled where the old Claude-named events left it off.
 const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
-        name: "PreToolUse",
+        name: "sessionStart",
         matcher: None,
         status: Some(HookStatus::Running),
-        session_id_capture: false,
+        session_id_capture: true,
         subagent_delta: None,
         heat: false,
     },
     HookEvent {
-        name: "UserPromptSubmit",
+        name: "beforeSubmitPrompt",
         matcher: None,
         status: Some(HookStatus::Running),
-        session_id_capture: false,
+        session_id_capture: true,
         subagent_delta: None,
         heat: true,
     },
     HookEvent {
-        name: "Stop",
-        matcher: None,
-        status: Some(HookStatus::Idle),
-        session_id_capture: false,
-        subagent_delta: None,
-        heat: false,
-    },
-    HookEvent {
-        name: "Notification",
-        matcher: Some("permission_prompt|elicitation_dialog"),
-        status: Some(HookStatus::Waiting),
-        session_id_capture: false,
-        subagent_delta: None,
-        heat: false,
-    },
-    HookEvent {
-        name: "ElicitationResult",
+        name: "preToolUse",
         matcher: None,
         status: Some(HookStatus::Running),
+        session_id_capture: false,
+        subagent_delta: None,
+        heat: false,
+    },
+    HookEvent {
+        name: "stop",
+        matcher: None,
+        status: Some(HookStatus::Idle),
         session_id_capture: false,
         subagent_delta: None,
         heat: false,
@@ -861,13 +869,13 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_cursor_status,
         container_env: &[("CURSOR_CONFIG_DIR", "/root/.cursor")],
         hook_config: Some(AgentHookConfig {
-            settings_rel_path: ".cursor/settings.json",
+            settings_rel_path: ".cursor/hooks.json",
             config_dir_env_var: Some("CURSOR_CONFIG_DIR"),
             events: CURSOR_HOOK_EVENTS,
-            format: HookFormat::JsonSettings,
+            format: HookFormat::CursorHooksJson,
         }),
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Unsupported,
+        resume_strategy: ResumeStrategy::FlagEq("--resume"),
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1630,6 +1638,30 @@ mod tests {
     }
 
     #[test]
+    fn test_cursor_agent_definition() {
+        let cursor = get_agent("cursor").unwrap();
+        assert_eq!(cursor.binary, "agent");
+        // Cursor resumes with `agent --resume=<id>`; the `=` form is required
+        // because the flag's argument is optional.
+        assert!(matches!(
+            &cursor.resume_strategy,
+            ResumeStrategy::FlagEq("--resume")
+        ));
+        let hook_cfg = cursor.hook_config.as_ref().expect("cursor has hook_config");
+        assert_eq!(hook_cfg.settings_rel_path, ".cursor/hooks.json");
+        assert_eq!(hook_cfg.format, HookFormat::CursorHooksJson);
+        // Cursor's camelCase event names, with session-id capture on the
+        // lifecycle events that carry the resumable conversation id.
+        let names: Vec<&str> = hook_cfg.events.iter().map(|e| e.name).collect();
+        assert_eq!(
+            names,
+            vec!["sessionStart", "beforeSubmitPrompt", "preToolUse", "stop"]
+        );
+        assert!(hook_cfg.events[0].session_id_capture);
+        assert!(hook_cfg.events[1].session_id_capture);
+    }
+
+    #[test]
     fn test_agent_names() {
         let names = agent_names();
         assert_eq!(
@@ -1942,7 +1974,7 @@ mod tests {
             ("claude", HookFormat::JsonSettings),
             ("codex", HookFormat::CodexJson),
             ("gemini", HookFormat::JsonSettings),
-            ("cursor", HookFormat::JsonSettings),
+            ("cursor", HookFormat::CursorHooksJson),
             ("qwen", HookFormat::JsonSettings),
         ];
         for (name, fmt) in expected {

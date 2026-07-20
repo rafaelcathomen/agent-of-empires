@@ -28,6 +28,12 @@ pub(crate) enum HookTargetKind {
     /// the path is resolved through `codex_hooks_json_path_in`
     /// (`CODEX_HOME` aware).
     CodexJson,
+    /// Cursor `hooks.json`: a flatter shape than `JsonSettings`
+    /// (`hooks.<event>[]` arrays of `{type, command}` objects, top-level
+    /// `version:1`). The path resolves like `JsonSettings` via
+    /// `agent_settings_path_in` (`CURSOR_CONFIG_DIR` aware, basename
+    /// `hooks.json`), but marker detection and uninstall use the flat walkers.
+    CursorHooksJson,
     /// settl/hermes/kiro: a config format the JSON path cannot emit; install
     /// goes through the agent's bundled `SidecarHooks` function pointers.
     Sidecar(&'static crate::agents::SidecarHooks),
@@ -74,7 +80,8 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
             let mut paths: Vec<PathBuf> = Vec::new();
             let resolve = |env: &[String]| -> PathBuf {
                 match hook_cfg.format {
-                    crate::agents::HookFormat::JsonSettings => {
+                    crate::agents::HookFormat::JsonSettings
+                    | crate::agents::HookFormat::CursorHooksJson => {
                         agent_settings_path_in(home, hook_cfg, env)
                     }
                     crate::agents::HookFormat::CodexJson => codex_hooks_json_path_in(home, env),
@@ -86,6 +93,7 @@ pub(crate) fn iter_hook_targets_in(home: &Path, env_lists: &[Vec<String>]) -> Ve
             }
             let kind = match hook_cfg.format {
                 crate::agents::HookFormat::JsonSettings => HookTargetKind::JsonSettings,
+                crate::agents::HookFormat::CursorHooksJson => HookTargetKind::CursorHooksJson,
                 crate::agents::HookFormat::CodexJson => HookTargetKind::CodexJson,
             };
             for path in paths {
@@ -169,6 +177,7 @@ pub(crate) fn has_aoe_marker(target: &HookTarget) -> bool {
         HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
             json_settings_has_aoe_marker(&target.path)
         }
+        HookTargetKind::CursorHooksJson => cursor_hooks_has_aoe_marker(&target.path),
         HookTargetKind::CodexToml => codex_config_has_aoe_marker(&target.path),
         HookTargetKind::Sidecar(sidecar) => match sidecar.format {
             crate::agents::SidecarFormat::SettlToml => settl_config_has_aoe_marker(&target.path),
@@ -201,6 +210,34 @@ fn json_settings_has_aoe_marker(path: &Path) -> bool {
                     if is_aoe_hook_command(cmd) {
                         return true;
                     }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Marker walker for Cursor's flat `hooks.json`: each event maps to an array
+/// of `{type, command}` objects (no matcher-block nesting), so we inspect each
+/// object's `command` directly.
+fn cursor_hooks_has_aoe_marker(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&content) else {
+        return false;
+    };
+    let Some(hooks_obj) = value.get("hooks").and_then(|h| h.as_object()) else {
+        return false;
+    };
+    for entries in hooks_obj.values() {
+        let Some(arr) = entries.as_array() else {
+            continue;
+        };
+        for hook in arr {
+            if let Some(cmd) = hook.get("command").and_then(|c| c.as_str()) {
+                if is_aoe_hook_command(cmd) {
+                    return true;
                 }
             }
         }

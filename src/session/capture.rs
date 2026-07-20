@@ -434,6 +434,34 @@ pub(crate) fn claude_poll_fn_sandboxed(
     }
 }
 
+/// Polling closure for host Cursor session tracking.
+///
+/// Cursor writes its `conversation_id` (which equals its `session_id`) to the
+/// per-instance hook sidecar `/tmp/aoe-hooks-<euid>/<instance_id>/session_id`
+/// via its `sessionStart` / `beforeSubmitPrompt` hooks. That id is what
+/// `agent --resume=<id>` consumes.
+///
+/// Unlike [`claude_poll_fn`] there is no disk-scan fallback: Cursor keeps no
+/// `~/.claude/projects`-style on-disk transcript store, so the sidecar is the
+/// sole source. The tick mirrors the sidecar branch of [`claude_poll_fn`]: the
+/// read is per-instance scoped (the path embeds `instance_id`, so a sibling
+/// instance's hook writes cannot reach it, which is why it skips
+/// `compose_exclusion`), `extra_excludes` is still honored so a value matching
+/// one of this instance's cleared sids does not leak through, and a missing or
+/// excluded sidecar returns `None`.
+pub(crate) fn cursor_poll_fn(
+    instance_id: String,
+    extra_excludes: HashSet<String>,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    move || {
+        let id = crate::hooks::read_hook_session_id(&instance_id)?;
+        if extra_excludes.contains(&id) {
+            return None;
+        }
+        validated_session_id(id)
+    }
+}
+
 pub(crate) fn encode_pi_project_path(cwd: &str) -> String {
     let stripped = cwd
         .strip_prefix('/')
@@ -4655,6 +4683,67 @@ mod tests {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_cursor_poll_fn_promotes_sidecar_id() {
+        use std::os::unix::fs::PermissionsExt;
+        let hook_tmp = tempfile::tempdir().unwrap();
+        let hook_base = hook_tmp.path().join("aoe-hooks");
+        std::fs::create_dir(&hook_base).unwrap();
+        std::fs::set_permissions(&hook_base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::hooks::override_base_for_test(hook_base.clone());
+        crate::hooks::reset_for_test();
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::hooks::clear_base_override_for_test();
+                crate::hooks::reset_for_test();
+            }
+        }
+        let _cleanup = Cleanup;
+
+        let instance_id = "test_cursor_sidecar_promote";
+        let hook_dir = hook_base.join(instance_id);
+        std::fs::create_dir(&hook_dir).unwrap();
+        std::fs::set_permissions(&hook_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let sidecar_uuid = "3ce9c037-1111-2222-3333-444455556666";
+        std::fs::write(hook_dir.join("session_id"), sidecar_uuid).unwrap();
+
+        // Sidecar id is promoted (Cursor is sidecar-only, no disk store).
+        let poll = cursor_poll_fn(instance_id.to_string(), HashSet::new());
+        assert_eq!(poll().as_deref(), Some(sidecar_uuid));
+
+        // An excluded sidecar id yields None (no disk fallback to leak through).
+        let mut excludes = HashSet::new();
+        excludes.insert(sidecar_uuid.to_string());
+        let poll_excluded = cursor_poll_fn(instance_id.to_string(), excludes);
+        assert_eq!(poll_excluded(), None);
+    }
+
+    #[test]
+    #[serial]
+    fn test_cursor_poll_fn_returns_none_without_sidecar() {
+        use std::os::unix::fs::PermissionsExt;
+        let hook_tmp = tempfile::tempdir().unwrap();
+        let hook_base = hook_tmp.path().join("aoe-hooks");
+        std::fs::create_dir(&hook_base).unwrap();
+        std::fs::set_permissions(&hook_base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::hooks::override_base_for_test(hook_base.clone());
+        crate::hooks::reset_for_test();
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::hooks::clear_base_override_for_test();
+                crate::hooks::reset_for_test();
+            }
+        }
+        let _cleanup = Cleanup;
+
+        // No sidecar written: cursor has no disk store, so the tick is None.
+        let poll = cursor_poll_fn("test_cursor_no_sidecar".to_string(), HashSet::new());
+        assert_eq!(poll(), None);
     }
 
     #[test]

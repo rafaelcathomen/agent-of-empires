@@ -93,8 +93,9 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 
 use crate::hooks::{
-    has_aoe_marker, install_codex_hooks_with_preserved_state, install_hooks, iter_hook_targets_in,
-    snapshot_codex_hooks_state, HookInstallTarget, HookTarget, HookTargetKind,
+    has_aoe_marker, install_codex_hooks_with_preserved_state, install_cursor_hooks, install_hooks,
+    iter_hook_targets_in, snapshot_codex_hooks_state, HookInstallTarget, HookTarget,
+    HookTargetKind,
 };
 
 pub fn run() -> Result<()> {
@@ -156,6 +157,9 @@ fn rewrite_one(target: &HookTarget) -> Result<()> {
     match target.kind {
         HookTargetKind::JsonSettings | HookTargetKind::CodexJson => {
             install_hooks(&target.path, &target.events, HookInstallTarget::Host)
+        }
+        HookTargetKind::CursorHooksJson => {
+            install_cursor_hooks(&target.path, &target.events, HookInstallTarget::Host)
         }
         // Defensive: `iter_hook_targets_in` does not emit `CodexToml` for
         // any registered agent (codex declares `CodexJson`). The arm stays

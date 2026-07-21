@@ -30,6 +30,8 @@ pub(crate) const SUBAGENT_SIDECAR_MAX_AGE: Duration = Duration::from_secs(5 * 60
 /// tokens; an attacker-planted larger payload is irrelevant either way.
 const STATUS_FILE_READ_CAP: usize = 64;
 const SESSION_ID_FILE_READ_CAP: usize = 128;
+/// A recorded working directory; generous `PATH_MAX`-sized allowance.
+const SESSION_CWD_FILE_READ_CAP: usize = 4096;
 const ATTENTION_FILE_READ_CAP: usize = 16 * 1024;
 /// The counter is a short decimal integer; anything larger is bogus.
 const SUBAGENT_FILE_READ_CAP: usize = 32;
@@ -103,6 +105,26 @@ pub fn read_hook_session_id(instance_id: &str) -> Option<String> {
         Some(id)
     } else {
         None
+    }
+}
+
+/// Read the per-instance `session_cwd` sidecar (the working directory the hook
+/// payload reported). Mirrors [`read_hook_session_id`]: absent, unreadable, or
+/// older than [`SESSION_ID_SIDECAR_MAX_AGE`] returns `None`.
+pub fn read_hook_session_cwd(instance_id: &str) -> Option<String> {
+    let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
+    let meta = dir_guard::metadata_at(dir.as_fd(), "session_cwd").ok()??;
+    let mtime = meta.modified().ok()?;
+    if mtime.elapsed().ok()? > SESSION_ID_SIDECAR_MAX_AGE {
+        return None;
+    }
+    let bytes =
+        dir_guard::read_file_at(dir.as_fd(), "session_cwd", SESSION_CWD_FILE_READ_CAP).ok()??;
+    let cwd = std::str::from_utf8(&bytes).ok()?.trim().to_string();
+    if cwd.is_empty() {
+        None
+    } else {
+        Some(cwd)
     }
 }
 
@@ -439,6 +461,48 @@ mod tests {
             read_hook_session_id("session_id_trim").as_deref(),
             Some(uuid)
         );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn read_hook_session_cwd_roundtrips_fresh_value() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        dir_guard::write_session_cwd_via_guard("cwd_rt", "/work/proj").unwrap();
+        assert_eq!(
+            read_hook_session_cwd("cwd_rt").as_deref(),
+            Some("/work/proj")
+        );
+        assert_eq!(read_hook_session_cwd("cwd_absent"), None);
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn read_hook_session_cwd_rejects_stale_file() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        dir_guard::write_session_cwd_via_guard("cwd_stale", "/work/proj").unwrap();
+        let old =
+            std::time::SystemTime::now() - (SESSION_ID_SIDECAR_MAX_AGE + Duration::from_secs(10));
+        std::fs::File::options()
+            .write(true)
+            .open(base.join("cwd_stale").join("session_cwd"))
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        assert_eq!(read_hook_session_cwd("cwd_stale"), None);
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn rotate_marker_reads_once_then_consumed() {
+        let (_g, _, _tmp) = BaseGuard::ready();
+        let sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        dir_guard::write_rotate_marker_via_guard("rot", sid, Some("/work/proj")).unwrap();
+        assert_eq!(
+            dir_guard::read_and_consume_rotate("rot"),
+            Some((sid.to_string(), "/work/proj".to_string()))
+        );
+        // Consume-once: a second read finds nothing.
+        assert_eq!(dir_guard::read_and_consume_rotate("rot"), None);
     }
 
     #[test]

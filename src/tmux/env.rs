@@ -11,6 +11,10 @@ use std::time::{Duration, Instant};
 
 pub const AOE_INSTANCE_ID_KEY: &str = "AOE_INSTANCE_ID";
 pub const AOE_CAPTURED_SESSION_ID_KEY: &str = "AOE_CAPTURED_SESSION_ID";
+/// This instance's launch cwd, published so the host session-id hook can
+/// resolve it via `tmux show-environment -h` for the write-boundary cwd reject
+/// (`aoe __extract-session-id`) even on adopted sessions.
+pub const AOE_INSTANCE_CWD_KEY: &str = "AOE_INSTANCE_CWD";
 
 const ENV_CACHE_TTL: Duration = Duration::from_secs(30);
 const ENV_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);

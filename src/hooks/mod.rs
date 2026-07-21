@@ -23,13 +23,15 @@ use serde_json::Value;
 
 pub(crate) use dir_guard::{
     adjust_subagent_counter_via_guard, bump_heat_via_guard, ensure_instance_dir_path,
-    hook_base_path, unlink_session_id_via_guard, write_session_id_via_guard,
+    hook_base_path, read_and_consume_rotate, unlink_session_id_via_guard,
+    write_rotate_marker_via_guard, write_session_cwd_via_guard, write_session_id_via_guard,
 };
 #[cfg(test)]
 pub(crate) use dir_guard::{clear_base_override_for_test, override_base_for_test, reset_for_test};
 pub use status_file::{
-    cleanup_hook_status_dir, hook_status_dir, read_hook_heat, read_hook_session_id,
-    read_hook_status, read_hook_status_age, read_hook_subagent_active, read_hook_urgent,
+    cleanup_hook_status_dir, hook_status_dir, read_hook_heat, read_hook_session_cwd,
+    read_hook_session_id, read_hook_status, read_hook_status_age, read_hook_subagent_active,
+    read_hook_urgent,
 };
 pub(crate) use targets::{
     has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
@@ -406,9 +408,15 @@ fn hook_command_session_id_host() -> String {
     // resolve AOE_INSTANCE_ID from the tmux hidden env when the process env
     // lacks it. `aoe __extract-session-id` reads the id from ITS OWN env, so a
     // value resolved into a shell variable must be exported to reach the child.
+    // AOE_INSTANCE_CWD gets the same tmux-hidden-env fallback so the write-boundary
+    // cwd reject works for adopted sessions too; exported only when non-empty so
+    // an unresolved cwd leaves the check disabled (fail-open) rather than
+    // rejecting every write against an empty string.
     format!(
         "sh -c '[ -n \"$AOE_INSTANCE_ID\" ] || AOE_INSTANCE_ID=$(tmux show-environment -h AOE_INSTANCE_ID 2>/dev/null | grep \"^AOE_INSTANCE_ID=\" | cut -d= -f2-); \
          [ -n \"$AOE_INSTANCE_ID\" ] || {{ cat >/dev/null 2>&1; exit 0; }}; export AOE_INSTANCE_ID; \
+         [ -n \"$AOE_INSTANCE_CWD\" ] || AOE_INSTANCE_CWD=$(tmux show-environment -h AOE_INSTANCE_CWD 2>/dev/null | grep \"^AOE_INSTANCE_CWD=\" | cut -d= -f2-); \
+         [ -n \"$AOE_INSTANCE_CWD\" ] && export AOE_INSTANCE_CWD; \
          command -v aoe >/dev/null 2>&1 || {{ cat >/dev/null 2>&1; exit 0; }}; \
          aoe __extract-session-id 2>/dev/null; exit 0 # {AOE_HOOK_MARKER}'"
     )
@@ -482,10 +490,15 @@ fn hook_command_session_id_sandbox(base: &str) -> String {
          set -- $LS; M=\"$1\"; \
          case \"$M\" in drwx------|drwx------.|drwx------+|drwx------@) ;; *) exit 0 ;; esac; \
          command -v jq >/dev/null 2>&1 || exit 0; \
-         SID=$(jq -r '\\''if (.session_id|type)==\"string\" then .session_id else empty end'\\'' 2>/dev/null); \
+         P=$(cat 2>/dev/null); \
+         SID=$(printf %s \"$P\" | jq -r '\\''if (.session_id|type)==\"string\" then .session_id else empty end'\\'' 2>/dev/null); \
          H=[0-9a-fA-F]; \
          case \"$SID\" in $H$H$H$H$H$H$H$H-$H$H$H$H-$H$H$H$H-$H$H$H$H-$H$H$H$H$H$H$H$H$H$H$H$H) ;; *) exit 0 ;; esac; \
          printf \"%s\" \"$SID\" > \"$D/.session_id.$$.tmp\" 2>/dev/null && mv \"$D/.session_id.$$.tmp\" \"$D/session_id\" 2>/dev/null; \
+         CWD=$(printf %s \"$P\" | jq -r '\\''if (.cwd|type)==\"string\" then .cwd else empty end'\\'' 2>/dev/null); \
+         [ -n \"$CWD\" ] && printf \"%s\" \"$CWD\" > \"$D/.session_cwd.$$.tmp\" 2>/dev/null && mv \"$D/.session_cwd.$$.tmp\" \"$D/session_cwd\" 2>/dev/null; \
+         SRC=$(printf %s \"$P\" | jq -r '\\''if (.source|type)==\"string\" then .source else empty end'\\'' 2>/dev/null); \
+         case \"$SRC\" in clear|compact) printf \"%s\\n%s\" \"$SID\" \"$CWD\" > \"$D/.session_rotate.$$.tmp\" 2>/dev/null && mv \"$D/.session_rotate.$$.tmp\" \"$D/session_rotate\" 2>/dev/null ;; esac; \
          exit 0 # {AOE_HOOK_MARKER}'"
     )
 }

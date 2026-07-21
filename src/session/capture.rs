@@ -151,6 +151,257 @@ pub(crate) fn claude_host_transcript_confirmed_absent(
     !transcript.is_file()
 }
 
+/// Read the first non-empty JSON line of a `.jsonl` transcript.
+fn read_first_line(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    std::io::BufRead::lines(reader)
+        .map_while(Result::ok)
+        .find(|l| !l.trim().is_empty())
+}
+
+/// Read the first record's `cwd` string from a Claude `.jsonl` transcript.
+///
+/// Claude stamps the conversation's working directory as a top-level `cwd`
+/// on its `type:"user"` (and other) records. The first record carrying a
+/// non-empty string `cwd` is authoritative for the conversation's cwd.
+fn read_claude_transcript_cwd(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
+            if !cwd.is_empty() {
+                return Some(cwd.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Authoritative in-file cwd for a Claude sid, scanning
+/// `~/.claude/projects/*/<sid>.jsonl`. `sid` is a globally-unique UUID, so at
+/// most one transcript matches. Returns the first record's `cwd`. `None` on
+/// any IO/parse error or an absent transcript (fail-open to "unknown").
+///
+/// Used by the migration self-heal to detect a foreign-cwd capture (a sid
+/// whose transcript lives under a folder whose in-file cwd differs from the
+/// row's project_path).
+pub(crate) fn claude_transcript_cwd(sid: &str) -> Option<PathBuf> {
+    if Uuid::parse_str(sid).is_err() {
+        return None;
+    }
+    let claude_home = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude").ok()?;
+    let projects = claude_home.join("projects");
+    let file_name = format!("{sid}.jsonl");
+    for entry in resilient_read_dir(&projects).ok()? {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let transcript = path.join(&file_name);
+        if transcript.is_file() {
+            if let Some(cwd) = read_claude_transcript_cwd(&transcript) {
+                return Some(PathBuf::from(cwd));
+            }
+        }
+    }
+    None
+}
+
+/// The single Claude transcript UUID under `encode(project_path)` not claimed
+/// by any instance's `agent_session_id`. `None` when the folder holds zero or
+/// more than one unclaimed transcript (never guess). Used by the v022 migration
+/// and `aoe session heal` to adopt a lost-but-unambiguous local conversation.
+pub(crate) fn claude_unclaimed_transcript(
+    project_path: &str,
+    claimed: &HashSet<String>,
+) -> Option<String> {
+    let claude_home = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude").ok()?;
+    let target = canonicalize_or_raw(project_path);
+    let dir_name = encode_claude_project_path(&target.to_string_lossy());
+    let project_dir = claude_home.join("projects").join(dir_name);
+    if !project_dir.is_dir() {
+        return None;
+    }
+    let mut unclaimed: Option<String> = None;
+    for entry in resilient_read_dir(&project_dir).ok()? {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if Uuid::parse_str(stem).is_err() || claimed.contains(stem) {
+            continue;
+        }
+        if unclaimed.replace(stem.to_string()).is_some() {
+            // More than one unclaimed transcript: ambiguous, never guess.
+            return None;
+        }
+    }
+    unclaimed
+}
+
+/// Does `sid`'s conversation provably belong to `project_path`?
+///
+/// Tool-dispatched, host-side content check.
+/// - claude: the transcript under `encode(project_path)` records an in-file
+///   `cwd == project_path` (survives the encode collision two distinct cwds
+///   can share).
+/// - codex/pi: the rollout header's `cwd == project_path` and it is not a
+///   child/subagent rollout (`parse_codex_rollout_metadata`).
+/// - cursor: the per-instance `session_cwd` sidecar records
+///   `cwd == project_path` (no transcript store, per-instance keyed).
+///
+/// Any uncertainty returns `false`, so an unverifiable id is never treated as
+/// bound. `id` is the AoE instance id, used only for the cursor sidecar lookup.
+pub(crate) fn sid_cwd_matches(id: &str, tool: &str, project_path: &str, sid: &str) -> bool {
+    if !is_valid_session_id(sid) {
+        return false;
+    }
+    let target = canonicalize_or_raw(project_path);
+    match tool {
+        "claude" => claude_sid_cwd_matches(&target, sid),
+        "codex" => codex_sid_cwd_matches(&target, sid),
+        "pi" => pi_sid_cwd_matches(&target, sid),
+        "cursor" => cursor_sid_cwd_matches(id, &target),
+        _ => false,
+    }
+}
+
+fn claude_sid_cwd_matches(target: &Path, sid: &str) -> bool {
+    let Ok(claude_home) = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude") else {
+        return false;
+    };
+    let dir_name = encode_claude_project_path(&target.to_string_lossy());
+    let transcript = claude_home
+        .join("projects")
+        .join(dir_name)
+        .join(format!("{sid}.jsonl"));
+    if !transcript.is_file() {
+        return false;
+    }
+    match read_claude_transcript_cwd(&transcript) {
+        Some(cwd) => canonicalize_or_raw(&cwd) == *target,
+        None => false,
+    }
+}
+
+fn codex_sid_cwd_matches(target: &Path, sid: &str) -> bool {
+    let Ok(codex_home) = resolve_agent_home(Some("CODEX_HOME"), ".codex") else {
+        return false;
+    };
+    let sessions_dir = codex_home.join("sessions");
+    if !sessions_dir.is_dir() {
+        return false;
+    }
+    let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    if collect_codex_sessions(&sessions_dir, &mut entries).is_err() {
+        return false;
+    }
+    for (path, _) in entries {
+        if extract_codex_uuid_from_filename(&path).as_deref() != Some(sid) {
+            continue;
+        }
+        let Some(first_line) = read_first_line(&path) else {
+            return false;
+        };
+        let Some(meta) = parse_codex_rollout_metadata(&first_line) else {
+            return false;
+        };
+        if meta.is_child {
+            return false;
+        }
+        return canonicalize_or_raw(&meta.cwd) == *target;
+    }
+    false
+}
+
+fn pi_sid_cwd_matches(target: &Path, sid: &str) -> bool {
+    let Ok(pi_home) = resolve_agent_home(Some("PI_CODING_AGENT_DIR"), ".pi/agent") else {
+        return false;
+    };
+    let sessions_dir = pi_home.join("sessions");
+    if !sessions_dir.is_dir() {
+        return false;
+    }
+    // Pi partitions by encoded project path; fall back to every project dir so
+    // a header written under an unexpected folder still resolves.
+    let encoded = encode_pi_project_path(&target.to_string_lossy());
+    let preferred = sessions_dir.join(&encoded);
+    let mut scan_dirs: Vec<PathBuf> = Vec::new();
+    if preferred.is_dir() {
+        scan_dirs.push(preferred);
+    } else if let Ok(iter) = resilient_read_dir(&sessions_dir) {
+        scan_dirs.extend(iter.map(|e| e.path()).filter(|p| p.is_dir()));
+    }
+    for dir in scan_dirs {
+        let Ok(iter) = resilient_read_dir(&dir) else {
+            continue;
+        };
+        for entry in iter {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if extract_pi_uuid_from_filename(&path).as_deref() != Some(sid) {
+                continue;
+            }
+            return match extract_pi_header_fields(&path).and_then(|(_, cwd)| cwd) {
+                Some(cwd) => canonicalize_or_raw(&cwd) == *target,
+                None => false,
+            };
+        }
+    }
+    false
+}
+
+fn cursor_sid_cwd_matches(id: &str, target: &Path) -> bool {
+    match crate::hooks::read_hook_session_cwd(id) {
+        Some(cwd) => canonicalize_or_raw(&cwd) == *target,
+        None => false,
+    }
+}
+
+/// Consume-once, per-instance-authenticated `/clear` rotation check
+/// (claude/cursor). True iff this instance's rotate marker names `candidate`
+/// with a recorded cwd == project_path AND (for claude) the new transcript's
+/// own in-file cwd confirms project_path. The marker is consumed (unlinked) on
+/// read, so a replayed observation cannot rotate a verified pin twice. codex/pi
+/// never emit a rotation marker (no `/clear` sidecar), so they are always
+/// `false` here and their pins are only ever CONFIRMED, never rotated.
+pub(crate) fn is_authenticated_rotation(
+    id: &str,
+    tool: &str,
+    project_path: &str,
+    candidate: &str,
+) -> bool {
+    if !is_valid_session_id(candidate) {
+        return false;
+    }
+    let Some((marked_sid, marked_cwd)) = crate::hooks::read_and_consume_rotate(id) else {
+        return false;
+    };
+    if marked_sid != candidate {
+        return false;
+    }
+    if canonicalize_or_raw(&marked_cwd) != canonicalize_or_raw(project_path) {
+        return false;
+    }
+    match tool {
+        "claude" => sid_cwd_matches(id, tool, project_path, candidate),
+        "cursor" => true,
+        _ => false,
+    }
+}
+
 /// Scan `~/.claude/projects/{encoded-path}/` and pick this poller's session.
 ///
 /// Tie-break:
@@ -2481,6 +2732,130 @@ mod tests {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
+    }
+
+    fn write_claude_transcript(home: &Path, project_path: &str, sid: &str, in_file_cwd: &str) {
+        let dir = home
+            .join("projects")
+            .join(encode_claude_project_path(project_path));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{sid}.jsonl")),
+            format!("{{\"type\":\"user\",\"cwd\":\"{in_file_cwd}\",\"message\":{{}}}}\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn sid_cwd_matches_claude_uses_in_file_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let _g = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", home.path().to_path_buf())]);
+
+        let own = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        write_claude_transcript(home.path(), "/work/proj", own, "/work/proj");
+        assert!(sid_cwd_matches("inst", "claude", "/work/proj", own));
+
+        // Encode collision: a transcript under the same folder but with a
+        // different in-file cwd is NOT a match.
+        let foreign = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        write_claude_transcript(home.path(), "/work/proj", foreign, "/work/OTHER");
+        assert!(!sid_cwd_matches("inst", "claude", "/work/proj", foreign));
+        // The scan-based helper still finds its real (foreign) cwd.
+        assert_eq!(
+            claude_transcript_cwd(foreign),
+            Some(PathBuf::from("/work/OTHER"))
+        );
+
+        // Absent transcript is never a match.
+        assert!(!sid_cwd_matches(
+            "inst",
+            "claude",
+            "/work/proj",
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn sid_cwd_matches_codex_header_and_rejects_child() {
+        let home = tempfile::tempdir().unwrap();
+        let _g = EnvGuard::set(&[("CODEX_HOME", home.path().to_path_buf())]);
+        let sessions = home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let top = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        std::fs::write(
+            sessions.join(format!("rollout-2026-01-01T00-00-00-{top}.jsonl")),
+            "{\"payload\":{\"cwd\":\"/work/proj\",\"source\":\"user\"}}\n",
+        )
+        .unwrap();
+        assert!(sid_cwd_matches("inst", "codex", "/work/proj", top));
+        assert!(!sid_cwd_matches("inst", "codex", "/work/other", top));
+
+        // A subagent/child rollout is never a top-level cwd match.
+        let child = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        std::fs::write(
+            sessions.join(format!("rollout-2026-01-01T00-00-01-{child}.jsonl")),
+            "{\"payload\":{\"cwd\":\"/work/proj\",\"source\":\"subagent\"}}\n",
+        )
+        .unwrap();
+        assert!(!sid_cwd_matches("inst", "codex", "/work/proj", child));
+    }
+
+    #[test]
+    #[serial]
+    fn is_authenticated_rotation_consumes_once() {
+        use crate::hooks::test_support::BaseGuard;
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", home.path().to_path_buf())]);
+        let (_bg, _base, _tmp) = BaseGuard::ready();
+
+        let sid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+        // claude requires the new transcript's own cwd to confirm the rotation.
+        write_claude_transcript(home.path(), "/work/proj", sid, "/work/proj");
+        crate::hooks::write_rotate_marker_via_guard("rot_ok", sid, Some("/work/proj")).unwrap();
+
+        assert!(is_authenticated_rotation(
+            "rot_ok",
+            "claude",
+            "/work/proj",
+            sid
+        ));
+        // Consume-once: the marker is gone, so a replay cannot rotate again.
+        assert!(!is_authenticated_rotation(
+            "rot_ok",
+            "claude",
+            "/work/proj",
+            sid
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn is_authenticated_rotation_rejects_mismatch_and_absent() {
+        use crate::hooks::test_support::BaseGuard;
+        let home = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", home.path().to_path_buf())]);
+        let (_bg, _base, _tmp) = BaseGuard::ready();
+
+        let sid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+        // Marker cwd differs from the project => rejected.
+        crate::hooks::write_rotate_marker_via_guard("rot_bad", sid, Some("/work/elsewhere"))
+            .unwrap();
+        assert!(!is_authenticated_rotation(
+            "rot_bad",
+            "claude",
+            "/work/proj",
+            sid
+        ));
+        // No marker at all => rejected.
+        assert!(!is_authenticated_rotation(
+            "rot_none",
+            "claude",
+            "/work/proj",
+            sid
+        ));
     }
 
     #[test]

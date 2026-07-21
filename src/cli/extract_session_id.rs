@@ -58,7 +58,35 @@ fn run_inner<R: Read>(mut stdin: R, instance_id: &str) -> Result<()> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("payload has no top-level string `session_id`"))?;
     uuid::Uuid::parse_str(sid)?;
-    crate::hooks::write_session_id_via_guard(instance_id, sid)
+    let payload_cwd = value.get("cwd").and_then(|v| v.as_str());
+    // Write-boundary ownership: a foreign claude sharing our AOE_INSTANCE_ID but
+    // running in a different cwd is dropped here, before the sidecar is touched.
+    // Exit 0 with no write when the payload cwd fails to match this instance's.
+    if let (Some(pc), Ok(inst_cwd)) = (payload_cwd, std::env::var("AOE_INSTANCE_CWD")) {
+        if canon(pc) != canon(&inst_cwd) {
+            return Ok(());
+        }
+    }
+    crate::hooks::write_session_id_via_guard(instance_id, sid)?;
+    if let Some(pc) = payload_cwd {
+        crate::hooks::write_session_cwd_via_guard(instance_id, pc)?;
+    }
+    // /clear-safe rotation: persist a consume-once marker ONLY on a real
+    // in-session rotation (SessionStart source in {clear,compact}), so a
+    // frequent UserPromptSubmit never clobbers the signal (race-free).
+    if matches!(
+        value.get("source").and_then(|v| v.as_str()),
+        Some("clear" | "compact")
+    ) {
+        crate::hooks::write_rotate_marker_via_guard(instance_id, sid, payload_cwd)?;
+    }
+    Ok(())
+}
+
+/// Canonicalize for a same-path comparison, falling back to the raw path when
+/// it does not resolve (a not-yet-created cwd still compares by string).
+fn canon(path: &str) -> std::path::PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| std::path::PathBuf::from(path))
 }
 
 #[cfg(test)]
@@ -73,6 +101,10 @@ mod tests {
 
     fn read_sidecar(base: &std::path::Path, instance_id: &str) -> Option<String> {
         std::fs::read_to_string(base.join(instance_id).join("session_id")).ok()
+    }
+
+    fn read_leaf(base: &std::path::Path, instance_id: &str, leaf: &str) -> Option<String> {
+        std::fs::read_to_string(base.join(instance_id).join(leaf)).ok()
     }
 
     #[test]
@@ -198,6 +230,60 @@ mod tests {
         let result = run_inner(InfiniteReader, "infinite");
         assert!(result.is_err(), "should reject after the 1 MiB cap");
         assert!(read_sidecar(&base, "infinite").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn write_boundary_rejects_foreign_cwd() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let payload = format!(r#"{{"session_id":"{uuid}","cwd":"/work/b"}}"#);
+        std::env::set_var("AOE_INSTANCE_CWD", "/work/a");
+        let r = extract(&payload, "boundary_reject");
+        std::env::remove_var("AOE_INSTANCE_CWD");
+        r.unwrap();
+        assert!(
+            read_sidecar(&base, "boundary_reject").is_none(),
+            "a foreign-cwd payload must not touch the sidecar"
+        );
+        assert!(read_leaf(&base, "boundary_reject", "session_cwd").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn write_boundary_allows_matching_cwd_and_writes_cwd_sidecar() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let payload = format!(r#"{{"session_id":"{uuid}","cwd":"/work/a"}}"#);
+        std::env::set_var("AOE_INSTANCE_CWD", "/work/a");
+        let r = extract(&payload, "boundary_ok");
+        std::env::remove_var("AOE_INSTANCE_CWD");
+        r.unwrap();
+        assert_eq!(read_sidecar(&base, "boundary_ok").as_deref(), Some(uuid));
+        assert_eq!(
+            read_leaf(&base, "boundary_ok", "session_cwd").as_deref(),
+            Some("/work/a")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn rotate_marker_only_on_clear_or_compact_source() {
+        let (_g, base, _tmp) = BaseGuard::ready();
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        // No AOE_INSTANCE_CWD => boundary check disabled; cwd still recorded.
+        let clear = format!(r#"{{"session_id":"{uuid}","cwd":"/x","source":"clear"}}"#);
+        extract(&clear, "rot_clear").unwrap();
+        let marker = read_leaf(&base, "rot_clear", "session_rotate").unwrap();
+        assert!(marker.starts_with(uuid), "marker names the rotated sid");
+        assert!(marker.contains("/x"), "marker records the cwd");
+
+        let startup = format!(r#"{{"session_id":"{uuid}","cwd":"/x","source":"startup"}}"#);
+        extract(&startup, "rot_startup").unwrap();
+        assert!(
+            read_leaf(&base, "rot_startup", "session_rotate").is_none(),
+            "a non-rotation source must not write a rotation marker"
+        );
     }
 
     #[test]

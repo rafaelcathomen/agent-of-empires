@@ -5048,6 +5048,12 @@ fn apply_post_restart_identity_sync(live: &mut Instance, before: &Instance, star
     let marker_unchanged = live.resume_probe_failed_sid == before.resume_probe_failed_sid;
     if sid_unchanged {
         live.agent_session_id = started.agent_session_id.clone();
+        // `session_id_verified` is a derived attribute of the sid binding, so
+        // it travels with the sid: adopting the launch clone's sid means
+        // adopting its verified flag. Leaving a stale live `false` here would
+        // reopen the drain protect block to a post-crash stub during the
+        // window before the next disk reconcile re-derives the flag.
+        live.session_id_verified = started.session_id_verified;
     }
     if marker_unchanged && live.agent_session_id == started.agent_session_id {
         live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
@@ -7277,6 +7283,52 @@ mod tests {
         assert!(live.last_error_check.is_some());
         assert_eq!(live.agent_session_id.as_deref(), Some("sid-after"));
         assert_eq!(live.resume_probe_failed_sid.as_deref(), Some("sid-after"));
+    }
+
+    #[test]
+    fn apply_post_restart_sync_propagates_session_id_verified() {
+        // The launch clone verified a fresh pin (session_id_verified = true)
+        // while the live state still holds the pre-launch unverified value. The
+        // sid is unchanged from the pre-restart baseline, so the sync must carry
+        // BOTH the sid and its verified flag; a stale live `false` would reopen
+        // the drain protect block to a post-crash stub (Finding 1).
+        let mut live = make_test_instance();
+        live.agent_session_id = Some("pinned-sid".to_string());
+        live.session_id_verified = false;
+        let before = live.clone();
+
+        let mut started = make_test_instance();
+        started.agent_session_id = Some("pinned-sid".to_string());
+        started.session_id_verified = true;
+
+        apply_post_restart_sync(&mut live, &before, &started);
+
+        assert_eq!(live.agent_session_id.as_deref(), Some("pinned-sid"));
+        assert!(live.session_id_verified);
+    }
+
+    #[test]
+    fn apply_post_restart_sync_keeps_peer_verified_on_sid_race() {
+        // A peer wrote a different (verified) sid to live during the blocking
+        // window. The CAS baseline no longer matches, so the launch clone's
+        // identity is discarded wholesale: live keeps the peer's sid and the
+        // peer's verified flag, never started's stale pairing.
+        let mut before = make_test_instance();
+        before.agent_session_id = Some("stale-restart-sid".to_string());
+        before.session_id_verified = false;
+
+        let mut live = make_test_instance();
+        live.agent_session_id = Some("peer-fresh-sid".to_string());
+        live.session_id_verified = true;
+
+        let mut started = make_test_instance();
+        started.agent_session_id = Some("stale-restart-sid".to_string());
+        started.session_id_verified = false;
+
+        apply_post_restart_sync(&mut live, &before, &started);
+
+        assert_eq!(live.agent_session_id.as_deref(), Some("peer-fresh-sid"));
+        assert!(live.session_id_verified);
     }
 
     #[test]

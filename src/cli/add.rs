@@ -844,7 +844,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 parent_agent_session_id,
                 child_session_id,
             } => {
+                // AoE-minted child id: mark the binding verified so it is
+                // protected from a peer poller overwrite before first launch.
                 instance.agent_session_id = Some(child_session_id);
+                instance.session_id_verified = true;
                 instance.resume_intent = crate::session::ResumeIntent::Fork {
                     from: parent_agent_session_id,
                 };

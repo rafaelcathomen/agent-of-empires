@@ -56,6 +56,7 @@ mod resume_fallback;
 mod sandbox;
 mod serve;
 mod settings;
+mod shared_cwd_resume;
 mod tool_sessions;
 mod tui_launch;
 mod unified_view;

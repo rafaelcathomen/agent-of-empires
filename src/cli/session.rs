@@ -3,7 +3,7 @@
 use anyhow::{bail, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::session::{ClaimOp, GroupTree, Instance, ResumeIntent, StartOutcome, Storage};
 
@@ -95,6 +95,13 @@ pub enum SessionCommands {
 
     /// Permanently purge every trashed session in the profile (irreversible).
     EmptyTrash,
+
+    /// Re-run the durable session-binding verify/heal over the profile: mark
+    /// resumable rows whose conversation cwd is proven as verified (so they
+    /// resume directly and are protected from same-cwd drift), adopt an
+    /// unambiguous lost-but-local claude transcript, and list any row that
+    /// still needs a manual `aoe session set-session-id <id>`.
+    Heal,
 }
 
 #[derive(Args)]
@@ -334,6 +341,7 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Import(args) => import_sessions(profile, args).await,
         SessionCommands::ListTrash => list_trash(profile).await,
         SessionCommands::EmptyTrash => empty_trash(profile).await,
+        SessionCommands::Heal => heal_sessions(profile).await,
     }
 }
 
@@ -693,6 +701,147 @@ async fn empty_trash(profile: &str) -> Result<()> {
         parts.join(", "),
         storage.profile()
     );
+    Ok(())
+}
+
+#[derive(Clone)]
+enum HealDecision {
+    Verify,
+    Adopt(String),
+    Flag(String),
+}
+
+/// Eligible for the heal pass: a resumable tool, a Default/Use resume intent,
+/// and a non-empty `agent_session_id`.
+fn heal_eligible(inst: &Instance) -> bool {
+    matches!(inst.tool.as_str(), "claude" | "codex" | "pi" | "cursor")
+        && matches!(
+            inst.resume_intent,
+            ResumeIntent::Default | ResumeIntent::Use(_)
+        )
+        && inst
+            .agent_session_id
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Re-run the durable session-binding verify/heal live (the same classification
+/// the v022 migration applies once at upgrade) and list any row that still
+/// needs a manual `aoe session set-session-id <id>`.
+async fn heal_sessions(profile: &str) -> Result<()> {
+    let storage = Storage::open_unwatched(profile)?;
+    let snapshot = storage.load()?;
+
+    // Every claimed sid (a heal-adopt must not steal one), grown as this pass
+    // adopts so two lost rows in one folder can't claim the same transcript,
+    // plus per-sid collision counts over eligible rows.
+    let mut claimed: HashSet<String> = snapshot
+        .iter()
+        .filter_map(|i| i.agent_session_id.clone())
+        .collect();
+    let mut sid_counts: HashMap<String, usize> = HashMap::new();
+    for i in &snapshot {
+        if heal_eligible(i) {
+            if let Some(sid) = &i.agent_session_id {
+                *sid_counts.entry(sid.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut decisions: HashMap<String, HealDecision> = HashMap::new();
+    for i in &snapshot {
+        if !heal_eligible(i) || i.session_id_verified {
+            continue;
+        }
+        let Some(sid) = i.agent_session_id.clone() else {
+            continue;
+        };
+        // Collision first: a sid claimed by two or more rows is a same-cwd
+        // cross-assignment; verify neither, flag for a manual re-pin.
+        if sid_counts.get(&sid).copied().unwrap_or(0) >= 2 {
+            decisions.insert(i.id.clone(), HealDecision::Flag(sid));
+            continue;
+        }
+        // Explicit pin or a cwd-proven capture verifies the binding.
+        if matches!(i.resume_intent, ResumeIntent::Use(_))
+            || crate::session::capture::sid_cwd_matches(&i.id, &i.tool, &i.project_path, &sid)
+        {
+            decisions.insert(i.id.clone(), HealDecision::Verify);
+            continue;
+        }
+        // Bounded self-heal (claude only).
+        if i.tool == "claude" {
+            if crate::session::capture::claude_transcript_cwd(&sid).is_some() {
+                // A transcript exists but under a foreign cwd (sid_cwd_matches
+                // failed): recovery must not resume it.
+                decisions.insert(i.id.clone(), HealDecision::Flag(sid));
+                continue;
+            }
+            if let Some(adopt) =
+                crate::session::capture::claude_unclaimed_transcript(&i.project_path, &claimed)
+            {
+                // Claim it immediately so a later lost row sharing this project
+                // folder is flagged instead of double-adopting the same
+                // transcript (which would verify two rows onto one conversation).
+                claimed.insert(adopt.clone());
+                decisions.insert(i.id.clone(), HealDecision::Adopt(adopt));
+                continue;
+            }
+        }
+        decisions.insert(i.id.clone(), HealDecision::Flag(sid));
+    }
+
+    let decisions_for_update = decisions.clone();
+    storage.update(|instances, _groups| {
+        for inst in instances.iter_mut() {
+            match decisions_for_update.get(&inst.id) {
+                Some(HealDecision::Verify) => inst.session_id_verified = true,
+                Some(HealDecision::Adopt(sid)) => {
+                    inst.agent_session_id = Some(sid.clone());
+                    inst.session_id_verified = true;
+                    inst.resume_probe_failed_sid = None;
+                }
+                Some(HealDecision::Flag(sid)) => {
+                    inst.resume_probe_failed_sid = Some(sid.clone());
+                }
+                None => {}
+            }
+        }
+        Ok(())
+    })?;
+
+    let verified = decisions
+        .values()
+        .filter(|d| matches!(d, HealDecision::Verify))
+        .count();
+    let adopted = decisions
+        .values()
+        .filter(|d| matches!(d, HealDecision::Adopt(_)))
+        .count();
+    let flagged: Vec<&Instance> = snapshot
+        .iter()
+        .filter(|i| matches!(decisions.get(&i.id), Some(HealDecision::Flag(_))))
+        .collect();
+
+    println!(
+        "Session heal (profile '{}'): verified {}, adopted {}, needs re-pin {}.",
+        storage.profile(),
+        verified,
+        adopted,
+        flagged.len()
+    );
+    if !flagged.is_empty() {
+        println!("\nRows still needing a manual `aoe session set-session-id <id>`:");
+        for inst in flagged {
+            println!(
+                "  {}  {}  ({}, sid {})",
+                inst.id,
+                inst.title,
+                inst.tool,
+                inst.agent_session_id.as_deref().unwrap_or("-")
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2186,6 +2335,118 @@ mod set_session_id_tests {
             ResumeIntent::Use("22222222-2222-2222-2222-222222222222".to_string())
         );
         assert_eq!(inst_disk.resume_probe_failed_sid, None);
+    }
+}
+
+#[cfg(test)]
+mod heal_tests {
+    use super::heal_sessions;
+    use crate::session::capture::encode_claude_project_path;
+    use crate::session::test_support::EnvGuard;
+    use crate::session::{GroupTree, Instance, Storage};
+    use serial_test::serial;
+    use std::fs;
+    use std::path::Path;
+    use tempfile::tempdir;
+
+    fn write_transcript(claude_home: &Path, project_path: &str, sid: &str, in_file_cwd: &str) {
+        let dir = claude_home
+            .join("projects")
+            .join(encode_claude_project_path(project_path));
+        fs::create_dir_all(&dir).unwrap();
+        let line = format!(
+            r#"{{"type":"user","cwd":"{in_file_cwd}","message":{{"role":"user","content":"hi"}}}}"#
+        );
+        fs::write(dir.join(format!("{sid}.jsonl")), format!("{line}\n")).unwrap();
+    }
+
+    fn seed(profile: &str, instances: &[Instance]) -> Storage {
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let owned: Vec<Instance> = instances.to_vec();
+        storage
+            .update(|i, g| {
+                *i = owned.clone();
+                *g = GroupTree::new_with_groups(&owned, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        storage
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_adopts_single_unclaimed_local_transcript() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let claude = temp.path().join(".claude");
+        let _guard = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", claude.clone())]);
+
+        // A lost stub sid, but the project folder holds exactly one unclaimed
+        // local transcript: heal adopts and verifies it (happy path).
+        let stub = "11111111-1111-4111-8111-111111111111";
+        let local = "22222222-2222-4222-8222-222222222222";
+        write_transcript(&claude, "/work/lost", local, "/work/lost");
+
+        let mut inst = Instance::new("lost", "/work/lost");
+        inst.agent_session_id = Some(stub.to_string());
+        let id = inst.id.clone();
+        let storage = seed("heal-single-adopt", std::slice::from_ref(&inst));
+
+        heal_sessions("heal-single-adopt").await.unwrap();
+
+        let loaded = storage.load().unwrap();
+        let disk = loaded.iter().find(|i| i.id == id).unwrap();
+        assert_eq!(disk.agent_session_id.as_deref(), Some(local));
+        assert!(disk.session_id_verified);
+        assert!(disk.resume_probe_failed_sid.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn heal_does_not_double_adopt_shared_folder_transcript() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        let claude = temp.path().join(".claude");
+        let _guard = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", claude.clone())]);
+
+        // Two lost rows in one project folder competing for a single unclaimed
+        // transcript. Exactly one may adopt it; the other must stay unverified
+        // and flagged, never a second verified pin onto one conversation
+        // (Finding 2).
+        let stub_a = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let stub_b = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let orphan = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        write_transcript(&claude, "/work/shared", orphan, "/work/shared");
+
+        let mut a = Instance::new("a_lost", "/work/shared");
+        a.agent_session_id = Some(stub_a.to_string());
+        let mut b = Instance::new("b_lost", "/work/shared");
+        b.agent_session_id = Some(stub_b.to_string());
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        let storage = seed("heal-double-adopt", &[a, b]);
+
+        heal_sessions("heal-double-adopt").await.unwrap();
+
+        let loaded = storage.load().unwrap();
+        let a_disk = loaded.iter().find(|i| i.id == aid).unwrap();
+        let b_disk = loaded.iter().find(|i| i.id == bid).unwrap();
+
+        let a_adopted =
+            a_disk.agent_session_id.as_deref() == Some(orphan) && a_disk.session_id_verified;
+        let b_adopted =
+            b_disk.agent_session_id.as_deref() == Some(orphan) && b_disk.session_id_verified;
+        assert!(
+            a_adopted ^ b_adopted,
+            "exactly one row may adopt the orphan"
+        );
+
+        let loser = if a_adopted { b_disk } else { a_disk };
+        assert!(!loser.session_id_verified);
+        assert!(loser.resume_probe_failed_sid.is_some());
     }
 }
 

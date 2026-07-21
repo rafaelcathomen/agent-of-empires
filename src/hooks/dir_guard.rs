@@ -506,6 +506,55 @@ pub(crate) fn write_session_id_via_guard(instance_id: &str, session_id: &str) ->
     write_atomic(dir.as_fd(), "session_id", session_id.as_bytes())
 }
 
+/// Read cap for the `session_rotate` marker: a UUID plus a newline plus a
+/// path. Anything beyond a generous `PATH_MAX`-sized allowance is bogus.
+const SESSION_ROTATE_READ_CAP: usize = 4160;
+
+/// Sibling of [`write_session_id_via_guard`] for the per-instance `session_cwd`
+/// sidecar. The host `aoe __extract-session-id` subcommand writes the hook
+/// payload's top-level `cwd` here so a later capture can prove a sid's
+/// conversation cwd for the sidecar-only tool (cursor) and cross-check the
+/// claude transcript cwd.
+pub(crate) fn write_session_cwd_via_guard(instance_id: &str, cwd: &str) -> Result<()> {
+    let dir = open_instance_dir(instance_id)?;
+    write_atomic(dir.as_fd(), "session_cwd", cwd.as_bytes())
+}
+
+/// Write a consume-once `/clear` (or `/compact`) rotation marker for this
+/// instance: the new sid and the cwd it was observed in, one per line
+/// (`<sid>\n<cwd>`). [`read_and_consume_rotate`] reads then unlinks it, so a
+/// replayed hook payload cannot rotate a verified pin more than once. Written
+/// only on a real in-session rotation (SessionStart `source` in
+/// {clear,compact}), never on a frequent UserPromptSubmit.
+pub(crate) fn write_rotate_marker_via_guard(
+    instance_id: &str,
+    session_id: &str,
+    cwd: Option<&str>,
+) -> Result<()> {
+    let dir = open_instance_dir(instance_id)?;
+    let body = format!("{session_id}\n{}", cwd.unwrap_or(""));
+    write_atomic(dir.as_fd(), "session_rotate", body.as_bytes())
+}
+
+/// Read and consume (unlink) this instance's `/clear` rotation marker.
+/// Returns `(session_id, cwd)` parsed from the two-line marker, or `None` when
+/// absent/empty. The read and unlink share one verified dirfd so the marker is
+/// consumed exactly once. The unlink runs regardless of parse outcome so a
+/// malformed marker cannot wedge the rotation gate.
+pub(crate) fn read_and_consume_rotate(instance_id: &str) -> Option<(String, String)> {
+    let dir = open_instance_dir_read_only(instance_id).ok()??;
+    let bytes = read_file_at(dir.as_fd(), "session_rotate", SESSION_ROTATE_READ_CAP).ok()??;
+    let _ = unlinkat(dir.as_fd(), "session_rotate", UnlinkatFlags::NoRemoveDir);
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let mut lines = text.splitn(2, '\n');
+    let sid = lines.next()?.trim().to_string();
+    let cwd = lines.next().unwrap_or("").trim().to_string();
+    if sid.is_empty() {
+        return None;
+    }
+    Some((sid, cwd))
+}
+
 /// Atomic read-modify-write of the per-instance `subagent_active` counter.
 ///
 /// Uses an exclusive `flock` for the read-modify-write window rather than

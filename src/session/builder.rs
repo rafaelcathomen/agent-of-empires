@@ -734,8 +734,11 @@ pub fn build_instance(
                 child_session_id,
             } => {
                 // Pre-pin the child id so it is durable on disk before launch,
-                // and carry the parent on the one-shot Fork intent.
+                // and carry the parent on the one-shot Fork intent. The child id
+                // is AoE-minted, so mark the binding verified: no peer poller may
+                // overwrite the pre-pinned child before its first launch.
                 instance.agent_session_id = Some(child_session_id);
+                instance.session_id_verified = true;
                 instance.resume_intent = crate::session::ResumeIntent::Fork {
                     from: parent_agent_session_id,
                 };

@@ -5288,6 +5288,11 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                     if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
                         dst.agent_session_id = src.agent_session_id.clone();
                         dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+                        // `session_id_verified` is set/rolled-back alongside the
+                        // sid by the drain helper; carry it too, or the live
+                        // protect block reads a stale `false` and a post-crash
+                        // stub can overwrite the pin before the next reload.
+                        dst.session_id_verified = src.session_id_verified;
                     }
                 }
             }

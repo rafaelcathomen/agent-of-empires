@@ -46,6 +46,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session import`↴](#aoe-session-import)
 * [`aoe session list-trash`↴](#aoe-session-list-trash)
 * [`aoe session empty-trash`↴](#aoe-session-empty-trash)
+* [`aoe session heal`↴](#aoe-session-heal)
 * [`aoe context`↴](#aoe-context)
 * [`aoe context add`↴](#aoe-context-add)
 * [`aoe context show`↴](#aoe-context-show)
@@ -494,6 +495,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `import` — Import existing Claude Code sessions from disk. Scans the given path(s) (default: current directory) for Claude Code conversations whose working directory is at or under a path, and creates an AoE session for each: a terminal/tmux session that resumes the conversation with `claude --resume <id>` (default), or a structured-view session with `--structured`
 * `list-trash` — List the sessions currently in the trash
 * `empty-trash` — Permanently purge every trashed session in the profile (irreversible)
+* `heal` — Re-run the durable session-binding verify/heal over the profile: mark resumable rows whose conversation cwd is proven as verified (so they resume directly and are protected from same-cwd drift), adopt an unambiguous lost-but-local claude transcript, and list any row that still needs a manual `aoe session set-session-id <id>`
 
 
 
@@ -805,6 +807,14 @@ List the sessions currently in the trash
 Permanently purge every trashed session in the profile (irreversible)
 
 **Usage:** `aoe session empty-trash`
+
+
+
+## `aoe session heal`
+
+Re-run the durable session-binding verify/heal over the profile: mark resumable rows whose conversation cwd is proven as verified (so they resume directly and are protected from same-cwd drift), adopt an unambiguous lost-but-local claude transcript, and list any row that still needs a manual `aoe session set-session-id <id>`
+
+**Usage:** `aoe session heal`
 
 
 

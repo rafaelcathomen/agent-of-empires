@@ -338,15 +338,25 @@ fn default_true() -> bool {
 fn status_hook_env_prefix(
     profile: &str,
     instance_id: &str,
+    project_path: &str,
     agent: Option<&crate::agents::AgentDef>,
 ) -> String {
     let has_hooks = agent.is_some_and(|a| a.hook_config.is_some() || a.sidecar_hooks.is_some());
 
     if has_hooks {
+        // AOE_INSTANCE_CWD lets the host session-id hook enforce the
+        // write-boundary cwd reject: a foreign claude sharing our
+        // AOE_INSTANCE_ID but running elsewhere writes no sidecar. Canonicalized
+        // so it compares equal to claude's own reported cwd; raw fallback keeps
+        // a not-yet-resolvable path usable.
+        let cwd = std::fs::canonicalize(project_path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| project_path.to_string());
         format!(
-            "AOE_PROFILE={} AOE_INSTANCE_ID={} ",
+            "AOE_PROFILE={} AOE_INSTANCE_ID={} AOE_INSTANCE_CWD={} ",
             shell_escape(profile),
-            shell_escape(instance_id)
+            shell_escape(instance_id),
+            shell_escape(&cwd)
         )
     } else {
         String::new()
@@ -718,6 +728,19 @@ pub struct Instance {
     /// Explicit user actions can still retry the preserved sid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resume_probe_failed_sid: Option<String>,
+
+    /// True once `agent_session_id` is bound to THIS session by a per-session
+    /// identity source: AoE minted it (--session-id / fork child / Cleared),
+    /// a user pinned it (ResumeIntent::Use), or a capture proved its
+    /// conversation cwd == project_path through this instance's own
+    /// per-instance sidecar / rollout header. While true, the poller may
+    /// only CONFIRM (equal) the id, never REPLACE it with a different one
+    /// (except a consume-once /clear rotation), and recovery resumes it
+    /// directly without the shared-cwd mtime scan. Unverified rows keep
+    /// today's best-effort capture behavior (no regression for not-yet-bound
+    /// codex/pi/opencode/adopted sessions).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) session_id_verified: bool,
 
     /// User intent gating `acquire_session_id`. See `ResumeIntent` for
     /// semantics. Non-`Default` values (`Use`, `Cleared`) are written only
@@ -1092,6 +1115,7 @@ pub(crate) fn persist_session_to_storage(
     instance_id: &str,
     session_id: &str,
     expected_prior: Option<&str>,
+    verified: bool,
     file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
 ) -> SidWrite {
     if !is_valid_session_id(session_id) {
@@ -1125,6 +1149,7 @@ pub(crate) fn persist_session_to_storage(
             }
             inst.agent_session_id = Some(session_id.to_string());
             inst.resume_probe_failed_sid = None;
+            inst.session_id_verified = verified;
             Ok(SidWrite::Applied)
         } else {
             Ok(SidWrite::Failed)
@@ -1300,6 +1325,7 @@ impl Instance {
             terminal_info: None,
             agent_session_id: None,
             resume_probe_failed_sid: None,
+            session_id_verified: false,
             resume_intent: ResumeIntent::Default,
             force_fresh_next_launch: false,
             source_profile: String::new(),
@@ -1446,6 +1472,7 @@ impl Instance {
         self.merge_post_start(src);
         if self.agent_session_id == src.agent_session_id {
             self.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+            self.session_id_verified = src.session_id_verified;
         }
     }
 
@@ -1460,6 +1487,7 @@ impl Instance {
         if sid_unchanged {
             self.agent_session_id = src.agent_session_id.clone();
             self.session_id_poller = src.session_id_poller.clone();
+            self.session_id_verified = src.session_id_verified;
         }
 
         if marker_unchanged && self.agent_session_id == src.agent_session_id {
@@ -1552,6 +1580,24 @@ impl Instance {
         if self.retroactive_capture_excludes.contains(&fresh) {
             return;
         }
+        // Protect a verified pin: a different sid may replace it only through a
+        // consume-once, per-instance-authenticated `/clear` rotation. Blocks a
+        // post-crash stub or a shared-cwd peer from silently rebinding it.
+        if self.session_id_verified
+            && self.agent_session_id.as_deref() != Some(fresh.as_str())
+            && !super::capture::is_authenticated_rotation(
+                &self.id,
+                &self.tool,
+                &self.project_path,
+                &fresh,
+            )
+        {
+            return;
+        }
+        // Cwd-prove the incoming sid; an already-verified row stays verified.
+        let candidate_verified =
+            super::capture::sid_cwd_matches(&self.id, &self.tool, &self.project_path, &fresh)
+                || self.session_id_verified;
         let profile = self.effective_profile();
         let baseline = self.agent_session_id.as_deref();
         match persist_session_to_storage(
@@ -1559,10 +1605,12 @@ impl Instance {
             &self.id,
             &fresh,
             baseline,
+            candidate_verified,
             &self.resolve_file_watch(),
         ) {
             SidWrite::Applied => {
                 self.agent_session_id = Some(fresh);
+                self.session_id_verified = candidate_verified;
             }
             SidWrite::Skipped => {
                 // Peer wrote between reconcile and CAS; reload to converge.
@@ -2118,17 +2166,22 @@ impl Instance {
             ResumeIntent::Use(sid) => {
                 let sid = sid.clone();
                 self.agent_session_id = Some(sid.clone());
+                // User-authoritative pin: AoE owns this binding.
+                self.session_id_verified = true;
                 return (Some(sid), true);
             }
             ResumeIntent::Cleared => {
                 self.agent_session_id = None;
                 self.resume_probe_failed_sid = None;
+                self.session_id_verified = false;
                 let session_id = match self.tool.as_str() {
                     "claude" => Some(generate_claude_session_id()),
                     _ => None,
                 };
                 if let Some(ref id) = session_id {
                     self.agent_session_id = Some(id.clone());
+                    // AoE minted this UUID (--session-id): it owns the binding.
+                    self.session_id_verified = true;
                 }
                 return (session_id, false);
             }
@@ -2140,12 +2193,31 @@ impl Instance {
                 // emitted by apply_session_flags, which reads the parent off
                 // the Fork intent. Report `false` (not an in-place resume): a
                 // fork starts a new session.
+                self.session_id_verified = true;
                 return (self.agent_session_id.clone(), false);
             }
             ResumeIntent::Default => {}
         }
 
         if let Some(stored) = self.agent_session_id.clone() {
+            if self.session_id_verified {
+                // Bound pin: resume it directly. No `capture_freshest`
+                // (shared-cwd hazard) and no foreign adoption. Keep only the
+                // host empty-thread downgrade, which relaunches OUR OWN id
+                // fresh (`--session-id <own id>`), never a peer/random id.
+                if self.tool == "claude"
+                    && !self.is_sandboxed()
+                    && super::capture::claude_host_transcript_confirmed_absent(
+                        &self.project_path,
+                        &stored,
+                    )
+                {
+                    return (Some(stored), false);
+                }
+                return (Some(stored), true);
+            }
+            // Unverified => TODAY's behavior verbatim (best-effort re-observe
+            // then the transcript-absent downgrade).
             if let Some(fresh) = self.capture_freshest_session_id() {
                 tracing::info!(
                     target: "session.store",
@@ -2210,6 +2282,8 @@ impl Instance {
         if let Some(ref id) = session_id {
             tracing::debug!(target: "session.store", "Session ID for {}: {}", self.tool, id);
             self.agent_session_id = session_id.clone();
+            // AoE minted this Claude UUID (--session-id): it owns the binding.
+            self.session_id_verified = true;
         }
 
         (session_id, false)
@@ -3232,7 +3306,7 @@ impl Instance {
         }
 
         let profile = self.effective_profile();
-        let mut env_prefix = status_hook_env_prefix(&profile, &self.id, agent);
+        let mut env_prefix = status_hook_env_prefix(&profile, &self.id, &self.project_path, agent);
 
         // Profile-scoped host environment entries (KEY=value, KEY=$VAR,
         // KEY=$$literal, or bare KEY for passthrough). Sandboxed sessions
@@ -3313,11 +3387,24 @@ impl Instance {
             None
         };
 
-        let mut entries: Vec<(&str, &str, &str)> = vec![(
-            session_name,
-            crate::tmux::env::AOE_INSTANCE_ID_KEY,
-            &self.id,
-        )];
+        // Publish AOE_INSTANCE_CWD alongside AOE_INSTANCE_ID so the host
+        // session-id hook's `tmux show-environment -h` fallback can resolve the
+        // launch cwd for the write-boundary reject on adopted sessions.
+        let instance_cwd = std::fs::canonicalize(&self.project_path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| self.project_path.clone());
+        let mut entries: Vec<(&str, &str, &str)> = vec![
+            (
+                session_name,
+                crate::tmux::env::AOE_INSTANCE_ID_KEY,
+                &self.id,
+            ),
+            (
+                session_name,
+                crate::tmux::env::AOE_INSTANCE_CWD_KEY,
+                &instance_cwd,
+            ),
+        ];
         if let Some(ref sid) = captured_sid {
             entries.push((
                 session_name,
@@ -3480,6 +3567,10 @@ impl Instance {
             ResumeIntent::Cleared | ResumeIntent::Fork { .. } | ResumeIntent::Use(_)
         );
 
+        // Carry acquire's verification decision (mint/Use/Fork/Cleared set it,
+        // the verified Default resume keeps it) into the durable row so the
+        // pin survives a reboot without waiting for the first post-launch poll.
+        let launch_verified = self.session_id_verified;
         let instance_id = self.id.clone();
         let new_sid_for_closure = new_sid.clone();
         let expected_prior_intent_for_closure = expected_prior_intent.clone();
@@ -3498,6 +3589,15 @@ impl Instance {
                 return Ok(SidWrite::Skipped);
             }
 
+            // On an unchanged sid, only ever UPGRADE verified so a concurrent
+            // poller self-heal is never clobbered back to false. On a changing
+            // sid (mint / Cleared / Fork / Use), the new binding's verification
+            // is acquire's decision outright.
+            if expected_prior_sid == new_sid_for_closure.as_deref() {
+                inst.session_id_verified |= launch_verified;
+            } else {
+                inst.session_id_verified = launch_verified;
+            }
             inst.agent_session_id = new_sid_for_closure.clone();
             inst.resume_probe_failed_sid = None;
 
@@ -3525,6 +3625,7 @@ impl Instance {
                         if let Some(disk) = insts.into_iter().find(|i| i.id == self.id) {
                             self.resume_intent = disk.resume_intent;
                             self.resume_probe_failed_sid = disk.resume_probe_failed_sid;
+                            self.session_id_verified = disk.session_id_verified;
                         }
                     }
                 }
@@ -3536,6 +3637,7 @@ impl Instance {
                         self.agent_session_id = disk.agent_session_id;
                         self.resume_intent = disk.resume_intent;
                         self.resume_probe_failed_sid = disk.resume_probe_failed_sid;
+                        self.session_id_verified = disk.session_id_verified;
                         SidPersistOutcome::Published
                     }
                     None => {
@@ -4318,15 +4420,20 @@ impl Instance {
                 };
                 let resume_capable = should_attempt_resume(Some(&sid), &self.tool);
                 let probe_already_failed = self.resume_probe_failed_sid.as_deref() == Some(&sid);
-                if resume_capable && probe_already_failed {
-                    // Loop-breaker: a sid that already failed a probe is never
-                    // retried automatically, regardless of policy, mirroring
-                    // the check `is_recovery_candidate` already applies to
-                    // the passive startup sweep. Without it, `e`/`Enter`
-                    // retries the identical doomed sid forever.
+                // A verified pin never forces a fresh launch: its resume-probe
+                // failure is transient (an OOM/unrelated crash, not a bad sid),
+                // and minting a fresh random id would let the poller promote that
+                // over the good pin. It re-attempts `--resume`; a persistent
+                // failure still surfaces via the Error chip with the sid
+                // preserved, and `is_recovery_candidate` skips the passive
+                // auto-retry once `resume_probe_failed_sid == agent_session_id`,
+                // so there is no auto-loop. Unverified rows keep the original
+                // loop-breaker (a sid that already failed a probe is never
+                // retried automatically, else `e`/`Enter` retries it forever).
+                if resume_capable && probe_already_failed && !self.session_id_verified {
                     skipped_failed_resume_sid = Some(sid);
                     self.force_fresh_next_launch = true;
-                } else if resume_capable && !resume_allowed_by_policy {
+                } else if resume_capable && !resume_allowed_by_policy && !self.session_id_verified {
                     self.force_fresh_next_launch = true;
                 }
             }
@@ -5348,8 +5455,8 @@ mod tests {
     fn test_codex_gets_status_hook_env_prefix() {
         let agent = crate::agents::get_agent("codex");
         assert_eq!(
-            status_hook_env_prefix("work", "abc123", agent),
-            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
+            status_hook_env_prefix("work", "abc123", "/nonexistent-aoe/proj", agent),
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' AOE_INSTANCE_CWD='/nonexistent-aoe/proj' "
         );
     }
 
@@ -7946,6 +8053,85 @@ mod tests {
     }
 
     #[test]
+    fn acquire_sets_verified_at_aoe_owned_arms() {
+        let pin = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+        // Use pin: user-authoritative binding.
+        let mut u = Instance::new("u", "/tmp/x");
+        u.tool = "claude".to_string();
+        u.resume_intent = ResumeIntent::Use(pin.to_string());
+        let (sid, existing) = u.acquire_session_id();
+        assert_eq!(sid.as_deref(), Some(pin));
+        assert!(existing);
+        assert!(u.session_id_verified);
+
+        // Cleared claude mint: AoE owns the new UUID.
+        let mut c = Instance::new("c", "/tmp/x");
+        c.tool = "claude".to_string();
+        c.resume_intent = ResumeIntent::Cleared;
+        let (sid, existing) = c.acquire_session_id();
+        assert!(sid.is_some());
+        assert!(!existing);
+        assert!(c.session_id_verified);
+
+        // Cleared non-claude: no minted id, so not verified.
+        let mut cn = Instance::new("cn", "/tmp/x");
+        cn.tool = "codex".to_string();
+        cn.resume_intent = ResumeIntent::Cleared;
+        let (sid, _) = cn.acquire_session_id();
+        assert!(sid.is_none());
+        assert!(!cn.session_id_verified);
+
+        // Fork pre-pinned child: AoE-minted child id is verified.
+        let mut f = Instance::new("f", "/tmp/x");
+        f.tool = "claude".to_string();
+        f.agent_session_id = Some(pin.to_string());
+        f.resume_intent = ResumeIntent::Fork {
+            from: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".to_string(),
+        };
+        let (sid, existing) = f.acquire_session_id();
+        assert_eq!(sid.as_deref(), Some(pin));
+        assert!(!existing);
+        assert!(f.session_id_verified);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn acquire_verified_default_resumes_stored_and_skips_capture() {
+        let home = tempfile::tempdir().unwrap();
+        let _g = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", home.path().to_path_buf())]);
+        let project = home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let canonical = std::fs::canonicalize(&project).unwrap();
+        let canonical_str = canonical.to_string_lossy().to_string();
+
+        let pdir =
+            home.path()
+                .join("projects")
+                .join(crate::session::capture::encode_claude_project_path(
+                    &canonical_str,
+                ));
+        std::fs::create_dir_all(&pdir).unwrap();
+        let own = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let peer = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        // `own` has a transcript; `peer` is a newer shared-cwd sibling that an
+        // unverified capture_freshest scan would otherwise adopt.
+        std::fs::write(pdir.join(format!("{own}.jsonl")), "x\n").unwrap();
+        std::fs::write(pdir.join(format!("{peer}.jsonl")), "y\n").unwrap();
+
+        let mut inst = Instance::new("verified-resume", &canonical_str);
+        inst.tool = "claude".to_string();
+        inst.agent_session_id = Some(own.to_string());
+        inst.session_id_verified = true;
+
+        let (sid, is_existing) = inst.acquire_session_id();
+        // Verified pin resumes its own id directly; the newer peer is ignored.
+        assert_eq!(sid.as_deref(), Some(own));
+        assert!(is_existing);
+        assert_eq!(inst.agent_session_id.as_deref(), Some(own));
+    }
+
+    #[test]
     fn test_build_resume_flags_rejects_invalid_id() {
         let flags = build_resume_flags("claude", "$(rm -rf /)", true);
         assert_eq!(flags, "");
@@ -8177,25 +8363,28 @@ mod tests {
 
     #[test]
     fn test_status_hook_env_prefix_includes_hermes() {
+        let cwd = "/nonexistent-aoe/proj";
+        let want =
+            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' AOE_INSTANCE_CWD='/nonexistent-aoe/proj' ";
         assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("hermes")),
-            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
+            status_hook_env_prefix("work", "abc123", cwd, crate::agents::get_agent("hermes")),
+            want
         );
         assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("settl")),
-            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
+            status_hook_env_prefix("work", "abc123", cwd, crate::agents::get_agent("settl")),
+            want
         );
         assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("claude")),
-            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
+            status_hook_env_prefix("work", "abc123", cwd, crate::agents::get_agent("claude")),
+            want
         );
         assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("opencode")),
+            status_hook_env_prefix("work", "abc123", cwd, crate::agents::get_agent("opencode")),
             ""
         );
         assert_eq!(
-            status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kiro")),
-            "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
+            status_hook_env_prefix("work", "abc123", cwd, crate::agents::get_agent("kiro")),
+            want
         );
     }
 
@@ -8832,6 +9021,29 @@ mod tests {
         }
 
         #[test]
+        fn loop_breaker_gates_fresh_launch_on_unverified_pin() {
+            let source = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session/instance.rs"),
+            )
+            .unwrap();
+            let start = source
+                .find("pub(crate) fn start_with_resume_fallback")
+                .unwrap();
+            let end = source.find("pub fn ensure_pane_ready").unwrap();
+            let fallback_source = &source[start..end];
+
+            // A verified pin never forces a fresh launch on a prior probe
+            // failure or an auto-resume-off policy; both loop-breaker arms are
+            // gated on `!self.session_id_verified`.
+            assert!(fallback_source
+                .contains("resume_capable && probe_already_failed && !self.session_id_verified"));
+            assert!(
+                fallback_source.contains("!resume_allowed_by_policy")
+                    && fallback_source.matches("!self.session_id_verified").count() >= 2
+            );
+        }
+
+        #[test]
         fn resume_probe_failure_marks_before_cleanup() {
             let source = std::fs::read_to_string(
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session/instance.rs"),
@@ -8881,6 +9093,7 @@ mod tests {
                 &id,
                 "ours",
                 Some("old"),
+                false,
                 &crate::file_watch::FileWatchService::noop(),
             );
             assert_eq!(outcome, super::SidWrite::Skipped);
@@ -8916,11 +9129,16 @@ mod tests {
                 &id,
                 "new",
                 Some("old"),
+                true,
                 &crate::file_watch::FileWatchService::noop(),
             );
             assert_eq!(outcome, super::SidWrite::Applied);
 
             let loaded = storage.load().unwrap();
+            assert!(
+                loaded[0].session_id_verified,
+                "verified flag persists through the CAS write"
+            );
             assert_eq!(loaded[0].agent_session_id.as_deref(), Some("new"));
         }
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -8974,6 +9192,7 @@ mod tests {
                 &id,
                 "new-sid",
                 Some("old"),
+                false,
                 &svc,
             );
             assert_eq!(outcome, super::SidWrite::Applied);
@@ -9029,6 +9248,7 @@ mod tests {
                 &id,
                 "new-sid",
                 Some("old-sid"),
+                false,
                 &crate::file_watch::FileWatchService::noop(),
             );
 

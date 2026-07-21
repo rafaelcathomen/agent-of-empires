@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::file_watch::FileWatchService;
-use crate::session::capture::validated_session_id;
+use crate::session::capture::{self, validated_session_id};
 use crate::session::storage::Storage;
 use crate::session::{persist_session_to_storage, Instance, ResumeIntent, SidWrite, Status};
 
@@ -52,12 +52,14 @@ struct Update {
     sid: String,
     expected_prior: Option<String>,
     profile: String,
+    set_verified: bool,
 }
 
 struct Rollback {
     id: String,
     disk_sid: Option<String>,
     disk_failed_sid: Option<String>,
+    disk_verified: bool,
 }
 
 /// Drain each instance's poller channel, persist new sids via CAS, reconcile
@@ -148,12 +150,50 @@ pub(crate) fn drain_and_persist_session_ids(
             filtered_ids.insert(inst.id.clone());
             continue;
         }
-        if inst.agent_session_id.as_deref() != Some(sid.as_str()) {
+        let owned = inst.agent_session_id.as_deref();
+        // Cwd-prove the observed sid; an already-verified row stays verified.
+        let candidate_verified =
+            capture::sid_cwd_matches(&inst.id, &inst.tool, &inst.project_path, &sid)
+                || inst.session_id_verified;
+
+        // Protect the pin: a verified id is never replaced by a different one
+        // except through a consume-once, per-instance-authenticated `/clear`
+        // rotation. Blocks a post-crash stub AND a same-cwd peer (a peer writes
+        // its OWN per-instance sidecar/id, never ours). The rotation check runs
+        // only when a verified pin actually faces a different sid (short-circuit),
+        // so it consumes the marker only where a replacement is on the table.
+        if inst.session_id_verified
+            && owned != Some(sid.as_str())
+            && !capture::is_authenticated_rotation(&inst.id, &inst.tool, &inst.project_path, &sid)
+        {
+            tracing::debug!(
+                target: "session.sync",
+                instance = %inst.id,
+                sid = %sid,
+                owned = ?owned,
+                "Ignoring poller-reported sid: contradicts a verified pin (no /clear rotation)",
+            );
+            filtered_ids.insert(inst.id.clone());
+            continue;
+        }
+
+        if owned != Some(sid.as_str()) {
             updates.push(Update {
                 id: inst.id.clone(),
                 sid,
                 expected_prior: inst.agent_session_id.clone(),
                 profile: inst.source_profile.clone(),
+                set_verified: candidate_verified,
+            });
+        } else if candidate_verified && !inst.session_id_verified {
+            // Self-heal: same id, now cwd-proven -> upgrade the unverified row
+            // to verified so a later reboot resumes it directly.
+            updates.push(Update {
+                id: inst.id.clone(),
+                sid: sid.clone(),
+                expected_prior: Some(sid),
+                profile: inst.source_profile.clone(),
+                set_verified: true,
             });
         }
     }
@@ -186,7 +226,7 @@ pub(crate) fn drain_and_persist_session_ids(
         return SessionIdSyncOutcome::default();
     }
 
-    let mut to_apply: Vec<(String, String)> = Vec::with_capacity(updates.len());
+    let mut to_apply: Vec<(String, String, bool)> = Vec::with_capacity(updates.len());
     let mut to_rollback: Vec<Rollback> = Vec::with_capacity(updates.len());
 
     for upd in &updates {
@@ -195,10 +235,11 @@ pub(crate) fn drain_and_persist_session_ids(
             &upd.id,
             &upd.sid,
             upd.expected_prior.as_deref(),
+            upd.set_verified,
             file_watch,
         ) {
             SidWrite::Applied => {
-                to_apply.push((upd.id.clone(), upd.sid.clone()));
+                to_apply.push((upd.id.clone(), upd.sid.clone(), upd.set_verified));
             }
             SidWrite::Skipped => {
                 if let Some(rb) = reload_skipped_from_disk(&upd.profile, &upd.id, file_watch) {
@@ -217,23 +258,25 @@ pub(crate) fn drain_and_persist_session_ids(
         }
     }
 
-    for (id, sid) in &to_apply {
+    for (id, sid, verified) in &to_apply {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == *id) {
             inst.agent_session_id = Some(sid.clone());
             inst.resume_probe_failed_sid = None;
+            inst.session_id_verified = *verified;
         }
     }
     for rb in &to_rollback {
         if let Some(inst) = instances.iter_mut().find(|i| i.id == rb.id) {
             inst.agent_session_id = rb.disk_sid.clone();
             inst.resume_probe_failed_sid = rb.disk_failed_sid.clone();
+            inst.session_id_verified = rb.disk_verified;
         }
     }
 
     publish_tmux_env(instances, &to_apply, &to_rollback, &filtered_ids);
 
     SessionIdSyncOutcome {
-        applied: to_apply.into_iter().map(|(id, _)| id).collect(),
+        applied: to_apply.into_iter().map(|(id, _, _)| id).collect(),
         rolled_back: to_rollback.into_iter().map(|r| r.id).collect(),
         filtered: filtered_ids.into_iter().collect(),
     }
@@ -272,12 +315,13 @@ fn reload_skipped_from_disk(
         id: id.to_string(),
         disk_sid: disk_inst.agent_session_id.clone(),
         disk_failed_sid: disk_inst.resume_probe_failed_sid.clone(),
+        disk_verified: disk_inst.session_id_verified,
     })
 }
 
 fn publish_tmux_env(
     instances: &[Instance],
-    to_apply: &[(String, String)],
+    to_apply: &[(String, String, bool)],
     to_rollback: &[Rollback],
     filtered_ids: &HashSet<String>,
 ) {
@@ -287,7 +331,7 @@ fn publish_tmux_env(
 
     let touched_ids = to_apply
         .iter()
-        .map(|(id, _)| id.as_str())
+        .map(|(id, _, _)| id.as_str())
         .chain(to_rollback.iter().map(|r| r.id.as_str()))
         .chain(filtered_ids.iter().map(|s| s.as_str()));
 
@@ -555,6 +599,76 @@ mod tests {
         assert!(outcome.applied.is_empty());
         assert_eq!(instances[0].agent_session_id.as_deref(), Some(owned));
         assert_eq!(instances[1].agent_session_id, None);
+    }
+
+    #[test]
+    #[serial]
+    fn drain_protects_verified_pin_from_foreign_stub() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        let own = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
+        let stub = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
+        let mut inst = Instance::new("verified-pin", "/tmp/x");
+        inst.source_profile = "sync-verified".to_string();
+        inst.agent_session_id = Some(own.to_string());
+        inst.session_id_verified = true;
+        seed_instances_on_disk("sync-verified", &[&inst]);
+        attach_poller_with_update(&mut inst, stub);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![inst];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        // No consume-once rotation marker exists for this instance, so the
+        // verified pin is protected: the foreign stub is filtered, not adopted.
+        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        assert_eq!(instances[0].agent_session_id.as_deref(), Some(own));
+        assert!(instances[0].session_id_verified);
+    }
+
+    #[test]
+    #[serial]
+    fn drain_self_heals_unverified_row_when_cwd_proven() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        let sid = "019342ab-1234-7def-8901-cccccccccccc";
+        let project = temp.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let canonical = std::fs::canonicalize(&project).unwrap();
+        let canonical_str = canonical.to_string_lossy().to_string();
+
+        // A claude transcript under ~/.claude proving the sid's own cwd.
+        let claude_dir = temp.path().join(".claude").join("projects").join(
+            crate::session::capture::encode_claude_project_path(&canonical_str),
+        );
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join(format!("{sid}.jsonl")),
+            format!("{{\"type\":\"user\",\"cwd\":\"{canonical_str}\"}}\n"),
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("unverified", &canonical_str);
+        inst.source_profile = "sync-heal".to_string();
+        inst.agent_session_id = Some(sid.to_string());
+        inst.session_id_verified = false;
+        seed_instances_on_disk("sync-heal", &[&inst]);
+        attach_poller_with_update(&mut inst, sid);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![inst];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        // Same id, now cwd-proven -> verified upgrade committed.
+        assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
+        assert_eq!(instances[0].agent_session_id.as_deref(), Some(sid));
+        assert!(instances[0].session_id_verified);
+
+        let storage = Storage::new_unwatched("sync-heal").unwrap();
+        assert!(storage.load().unwrap()[0].session_id_verified);
     }
 
     #[test]
